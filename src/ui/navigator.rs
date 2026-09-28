@@ -9,6 +9,7 @@ use super::browser::{Action, Dialog, Hit, Icon, Row, Tool, ToolIcon, View, forma
 use super::form::{self, Field, Form, Key};
 use crate::config::{self, Server};
 use crate::library::{Library, Opened, Path, Request, Response};
+use crate::local;
 use crate::playability::{Assessment, Verdict};
 use crate::smb::SmbUrl;
 use std::collections::HashSet;
@@ -291,7 +292,10 @@ impl Navigator {
             eprintln!("Can't read saved servers: {e:#}");
             Vec::new()
         });
-        self.items = servers.into_iter().map(Item::Server).collect();
+        self.items = std::iter::once(local::server())
+            .chain(servers)
+            .map(Item::Server)
+            .collect();
         self.items.push(Item::AddServer);
         self.restore_scroll();
         self.rebuild_rows();
@@ -344,6 +348,13 @@ impl Navigator {
             .enumerate()
             .map(|(i, item)| {
                 let mut row = match item {
+                    // The headset itself: its lock allows renaming and deleting
+                    // files, but it can't be edited or removed.
+                    Item::Server(s) if local::is_local(s) => Row {
+                        detail: "Videos, Downloads, home folder, SD card and USB drives".into(),
+                        lock: Some(self.unlocked.contains(&s.url)),
+                        ..Row::new(Icon::Server, &s.name)
+                    },
                     Item::Server(s) => {
                         let open = self.unlocked.contains(&s.url);
                         Row {
@@ -1199,6 +1210,19 @@ mod tests {
         let last = nav.view().rows.last().expect("rows");
         assert_eq!(last.icon, Icon::Add);
         assert_eq!(nav.view().crumbs, vec!["Just Video".to_string()]);
+    }
+
+    #[test]
+    fn server_list_starts_with_the_headset() {
+        let mut nav = Navigator::new(Library::start(None));
+        assert_eq!(nav.view().rows[0].label, "This headset");
+        nav.unlocked.insert(local::URL.into());
+        nav.rebuild_rows();
+        assert_eq!(nav.view().rows[0].lock, Some(true));
+        assert!(
+            nav.view().rows[0].actions.is_empty(),
+            "the headset can't be edited or removed"
+        );
     }
 
     #[test]
