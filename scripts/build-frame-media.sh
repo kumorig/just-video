@@ -8,12 +8,16 @@ FFMPEG=8.1.3 DAV1D=1.5.4 ZLIB=1.3.1
 deps=$PWD/.local-deps
 prefix=$deps/frame-media wrap=$deps/zig-wrap src=$deps/src
 zig=$deps/zig/zig
+jobs=$(getconf _NPROCESSORS_ONLN)
 mkdir -p "$src" "$wrap"
 
 # Toolchain: zig as cross compiler, meson in a local venv (dav1d only).
+# zig runs on the build machine: Linux or macOS, x86_64 or arm64.
 if [ ! -x "$zig" ]; then
   mkdir -p "$deps/zig"
-  curl -sL https://ziglang.org/download/0.14.1/zig-x86_64-linux-0.14.1.tar.xz |
+  case "$(uname -s)" in Darwin) host_os=macos ;; *) host_os=linux ;; esac
+  host_arch=$(uname -m); [ "$host_arch" = arm64 ] && host_arch=aarch64
+  curl -sL "https://ziglang.org/download/0.14.1/zig-$host_arch-$host_os-0.14.1.tar.xz" |
     tar xJ -C "$deps/zig" --strip-components=1
 fi
 for tool in cc c++; do
@@ -22,7 +26,13 @@ for tool in cc c++; do
 done
 for tool in ar ranlib; do printf '#!/bin/sh\nexec %s %s "$@"\n' "$zig" "$tool" > "$wrap/aarch64-$tool"; done
 chmod +x "$wrap"/*
-[ -x "$deps/buildtools/bin/meson" ] || { python3 -m venv "$deps/buildtools"; "$deps/buildtools/bin/pip" install -q meson; }
+if [ ! -x "$deps/buildtools/bin/meson" ] || [ ! -x "$deps/buildtools/bin/ninja" ]; then
+  if command -v uv >/dev/null; then
+    uv venv -q --allow-existing "$deps/buildtools" && uv pip install -q --python "$deps/buildtools" meson ninja
+  else
+    python3 -m venv "$deps/buildtools" && "$deps/buildtools/bin/pip" install -q meson ninja
+  fi
+fi
 
 [ -d "$src/dav1d-$DAV1D" ] || curl -sL "https://downloads.videolan.org/pub/videolan/dav1d/$DAV1D/dav1d-$DAV1D.tar.xz" | tar xJ -C "$src"
 [ -d "$src/zlib-$ZLIB" ] || curl -sfL "https://github.com/madler/zlib/releases/download/v$ZLIB/zlib-$ZLIB.tar.gz" | tar xz -C "$src"
@@ -48,13 +58,14 @@ cpu = 'cortex-a720'
 endian = 'little'
 INI
 
-# zlib: Matroska tracks with zlib content compression.
+# zlib: Matroska tracks with zlib content compression. CHOST keeps its
+# configure from switching to Apple's libtool when building on macOS.
 (cd "$src/zlib-$ZLIB" &&
-  CC="$wrap/aarch64-cc" AR="$wrap/aarch64-ar" RANLIB="$wrap/aarch64-ranlib" CFLAGS="-O3 -fPIC" \
-    ./configure --static --prefix="$prefix" && make -j"$(nproc)" libz.a && make install)
+  CHOST=aarch64-linux-gnu CC="$wrap/aarch64-cc" AR="$wrap/aarch64-ar" RANLIB="$wrap/aarch64-ranlib" CFLAGS="-O3 -fPIC" \
+    ./configure --static --prefix="$prefix" && make -j"$jobs" libz.a && make install)
 
-(cd "$src/dav1d-$DAV1D" && rm -rf build &&
-  PATH="$deps/buildtools/bin:$PATH" meson setup build --cross-file "$deps/aarch64-cross.ini" \
+(cd "$src/dav1d-$DAV1D" && rm -rf build && export PATH="$deps/buildtools/bin:$PATH" &&
+  meson setup build --cross-file "$deps/aarch64-cross.ini" \
     --prefix="$prefix" --libdir=lib --buildtype=release --default-library=static \
     -Denable_tools=false -Denable_tests=false -Denable_asm=true &&
   ninja -C build install)
@@ -73,7 +84,7 @@ PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig" PKG_CONFIG_PATH= ./configure --prefix=
   --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb,vp9_superframe_split,extract_extradata,av1_frame_split \
   --extra-cflags="-O3"
 # zig's glibc stubs make configure think sys/sysctl.h exists; glibc removed it.
-sed -i 's/#define HAVE_SYSCTL 1/#define HAVE_SYSCTL 0/' config.h
-make -j"$(nproc)"
+sed -i.orig 's/#define HAVE_SYSCTL 1/#define HAVE_SYSCTL 0/' config.h && rm config.h.orig
+make -j"$jobs"
 make install
 echo "Frame media stack installed in $prefix"

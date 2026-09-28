@@ -10,7 +10,8 @@ A VR video player for Steam Frame that streams straight from SMB shares. (You ma
 
 ## Build
 
-On a Linux PC with Rust, `curl`, `make`, `pkg-config` and `python3`:
+On Linux or macOS with Rust, `curl`, `make`, `pkg-config` and
+`python3` (or [uv](https://docs.astral.sh/uv/), used when present):
 
 ```sh
 rustup target add aarch64-unknown-linux-gnu
