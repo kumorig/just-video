@@ -135,14 +135,21 @@ const BROWSER_PANEL: Panel = Panel {
     pixels: [browser::WIDTH, browser::HEIGHT],
 };
 
-/// Preferred distance of the control bar; it looks as big as 1.2 m wide at 1 m.
-const CONTROLS_DISTANCE: f32 = 1.8;
+/// Preferred distance of the control bar, the browser's; it looks as big as
+/// 1.2 m wide at 1 m.
+const CONTROLS_DISTANCE: f32 = -BROWSER_PANEL.center[2];
 
-/// The control bar ahead of the head, below eye level, tilted towards it:
-/// [`CONTROLS_DISTANCE`] away, but never beyond `max_distance` (in front of
-/// the screen), and scaled with its distance so it always looks the same size.
+/// How far below eye level the control bar sits.
+const CONTROLS_DROP: f32 = 0.756;
+
+/// The control bar ahead of the head, [`CONTROLS_DROP`] below eye level,
+/// tilted towards it: [`CONTROLS_DISTANCE`] away, but never beyond
+/// `max_distance` (in front of the screen), and scaled with its distance so it
+/// always looks the same size. Brought much nearer, it also sits less far
+/// down, so it isn't steeply below the eyes.
 fn controls_panel(head: &xr::Posef, max_distance: f32) -> Panel {
     let d = CONTROLS_DISTANCE.min(max_distance).max(0.5);
+    let drop = CONTROLS_DROP.min(0.42 * d);
     let q = head.orientation;
     // Forward (-Z) of the head, flattened to the horizon.
     let forward = [
@@ -154,7 +161,7 @@ fn controls_panel(head: &xr::Posef, max_distance: f32) -> Panel {
     let (sy, cy) = yaw.sin_cos();
     let p = head.position;
     Panel {
-        center: [p.x - sy * d, p.y - 0.42 * d, p.z - cy * d],
+        center: [p.x - sy * d, p.y - drop, p.z - cy * d],
         yaw,
         tilt: -0.45,
         size: [
