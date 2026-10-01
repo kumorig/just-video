@@ -1322,7 +1322,7 @@ pub fn run(
                 let curved_applies = playback.layout.projection == Projection::Flat;
                 let screen = screen_size(
                     renderer.video_size(),
-                    playback.layout.stereo,
+                    &playback.layout,
                     &options.view,
                     placement.zoom,
                     playback.image.rotation,
@@ -1772,7 +1772,7 @@ pub fn run(
                         // Menu open: also show where the ray meets the video.
                         let screen = screen_size(
                             renderer.video_size(),
-                            playback.layout.stereo,
+                            &playback.layout,
                             &options.view,
                             placement.zoom,
                             playback.image.rotation,
@@ -1816,7 +1816,7 @@ pub fn run(
                 }
                 let screen = screen_size(
                     renderer.video_size(),
-                    playback.layout.stereo,
+                    &playback.layout,
                     &options.view,
                     placement.zoom,
                     playback.image.rotation,
@@ -2446,7 +2446,13 @@ mod tests {
                 offset: 0.0,
                 pivot: [0.0; 3],
             };
-            let screen = screen_size((1920, 1080), crate::vr::Stereo::Mono, &options, zoom, turns);
+            let screen = screen_size(
+                (1920, 1080),
+                &crate::vr::Layout::flat(crate::vr::Stereo::Mono),
+                &options,
+                zoom,
+                turns,
+            );
             let captions = caption_panel(&placement, Projection::Flat, screen, Default::default());
             let bar_panel = screen_controls_panel(&placement, screen);
             render_scene(
@@ -2471,7 +2477,13 @@ mod tests {
                 offset,
                 ..Placement::new(&options)
             };
-            let screen = screen_size((3840, 1920), crate::vr::Stereo::Mono, &options, zoom, 0);
+            let screen = screen_size(
+                (3840, 1920),
+                &crate::vr::Layout::flat(crate::vr::Stereo::Mono),
+                &options,
+                zoom,
+                0,
+            );
             let captions = caption_panel(
                 &placement,
                 Projection::Equirect180,

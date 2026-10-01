@@ -200,7 +200,9 @@ mod tests {
     #[test]
     fn tall_screens_fit_the_same_box_as_wide_ones() {
         let options = ViewOptions::default();
-        let size = |tex, stereo, zoom, turns| screen_size(tex, stereo, &options, zoom, turns);
+        let size = |tex, stereo, zoom, turns| {
+            screen_size(tex, &Layout::flat(stereo), &options, zoom, turns)
+        };
         let close =
             |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).abs() < 1e-3 && (a[1] - b[1]).abs() < 1e-3;
         // Landscape video keeps the configured width.
@@ -1211,22 +1213,17 @@ fn mat_mul_t(a: [[f32; 3]; 3], b: [[f32; 4]; 3]) -> [[f32; 4]; 3] {
 /// side) this high, so zooming can make them small enough to see whole.
 pub const SCREEN_BOX_ASPECT: f32 = 0.75;
 
-/// Flat screen size (metres) for a video of `tex` pixels in `stereo` layout,
+/// Flat screen size (metres) for a video of `tex` pixels in `layout`,
 /// turned `quarter_turns` clockwise.
 pub fn screen_size(
     tex: (u32, u32),
-    stereo: Stereo,
+    layout: &Layout,
     options: &ViewOptions,
     zoom: f32,
     quarter_turns: u8,
 ) -> [f32; 2] {
-    let (w, h) = (tex.0 as f32, tex.1.max(1) as f32);
-    // One eye's part of the frame.
-    let mut aspect = match stereo {
-        Stereo::SideBySide => w / 2.0 / h,
-        Stereo::TopBottom => w / (h / 2.0),
-        Stereo::Mono => w / h,
-    };
+    // One eye's part of the frame (stretched back when half-packed).
+    let mut aspect = crate::vr::eye_aspect(tex.0, tex.1, layout);
     if quarter_turns % 2 == 1 {
         aspect = 1.0 / aspect.max(0.01);
     }
@@ -1246,7 +1243,7 @@ pub fn eye_params(
     quarter_turns: u8,
 ) -> EyeParams {
     let (w, h) = (tex.0 as f32, tex.1 as f32);
-    let screen = screen_size(tex, layout.stereo, options, placement.zoom, quarter_turns);
+    let screen = screen_size(tex, layout, options, placement.zoom, quarter_turns);
     // Express the eye in the placement's frame: the shader's screen/sphere is
     // fixed there, so rotating the placement moves the video around the viewer.
     let placed = placement.rotation();
