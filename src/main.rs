@@ -872,9 +872,9 @@ fn main() -> anyhow::Result<()> {
                         ..row(Icon::File, "notes.txt", "", "2 KB")
                     },
                     row(
-                        Icon::Video(Some(Verdict::Hardware)),
+                        Icon::VideoVr(Some(Verdict::Hardware)),
                         "旅行_180_LR.mp4",
-                        "5.7K 30 fps 8-bit HEVC",
+                        "VR180 3D  ·  5.7K 30 fps 8-bit HEVC",
                         "3.3 GB",
                     ),
                 ],
@@ -906,55 +906,55 @@ fn main() -> anyhow::Result<()> {
                     video(
                         "Movie.2024.2160p.mkv",
                         Some(Verdict::Hardware),
-                        "Plays with hardware decoding (4K 24 fps 8-bit HEVC)",
+                        "4K 24 fps 8-bit HEVC",
                         "18.3 GB",
                     ),
                     video(
                         "Avatar.2009.3D.HSBS.mkv",
                         Some(Verdict::Hardware),
-                        "Plays with hardware decoding (1080p 24 fps 8-bit H.264)",
+                        "1080p 24 fps 8-bit H.264",
                         "9.4 GB",
                     ),
                     video(
                         "Trip_180_LR.mp4",
                         Some(Verdict::Hardware),
-                        "Plays with hardware decoding (5.7K 30 fps 8-bit HEVC)",
+                        "5.7K 30 fps 8-bit HEVC",
                         "3.3 GB",
                     ),
                     video(
                         "dive_360_TB.mkv",
                         Some(Verdict::Software),
-                        "Plays with CPU decoding (6K 30 fps 10-bit HEVC)",
+                        "6K 30 fps 10-bit HEVC",
                         "7.0 GB",
                     ),
                     video(
                         "walk_360.mp4",
                         Some(Verdict::SoftwareMarginal),
-                        "May stutter (8K 30 fps 10-bit HEVC)",
+                        "8K 30 fps 10-bit HEVC",
                         "4.1 GB",
                     ),
                     video(
                         "concert_8k_180_sbs.mp4",
                         Some(Verdict::Unplayable),
-                        "Can't play smoothly on Steam Frame (8K 60 fps 10-bit HEVC)",
+                        "8K 60 fps 10-bit HEVC",
                         "12.6 GB",
                     ),
                     video(
                         "scene_FISHEYE190_LR.mp4",
                         Some(Verdict::Hardware),
-                        "Plays with hardware decoding (4K 60 fps 8-bit HEVC)",
+                        "4K 60 fps 8-bit HEVC",
                         "2.2 GB",
                     ),
                     video(
                         "Concert_film_TB.mkv",
                         Some(Verdict::Software),
-                        "Plays with CPU decoding (1080p 60 fps 10-bit HEVC)",
+                        "1080p 60 fps 10-bit HEVC",
                         "2.9 GB",
                     ),
                     video(
                         "A very long name for a VR video shot on the beach at sunset_180_LR.mp4",
                         Some(Verdict::Hardware),
-                        "Plays with hardware decoding (5.7K 60 fps 8-bit HEVC)",
+                        "5.7K 60 fps 8-bit HEVC",
                         "6.8 GB",
                     ),
                     video("short_clip.mp4", None, "", "88.4 MB"),
@@ -1055,6 +1055,26 @@ fn main() -> anyhow::Result<()> {
             just_video::ui::save_png(
                 &render(&adding, &mut fonts, Some((700.0, 700.0)), true),
                 &dir.join("form.png"),
+            )?;
+            // Editing a saved server: an empty password keeps the saved one.
+            let mut editing_server = servers.clone();
+            editing_server.form = Some(Form::new(
+                "Edit NAS",
+                ["Address", "User", "Password", "Name"]
+                    .iter()
+                    .zip(["192.168.1.10:445", "WORKGROUP;user", "", "NAS"])
+                    .map(|(label, value)| Field {
+                        label: label.to_string(),
+                        value: value.into(),
+                        secret: *label == "Password",
+                        placeholder: "leave empty to keep the saved one".into(),
+                    })
+                    .collect(),
+                "Save",
+            ));
+            just_video::ui::save_png(
+                &render(&editing_server, &mut fonts, None, false),
+                &dir.join("form-edit.png"),
             )?;
             just_video::ui::save_png(
                 &render(&servers, &mut fonts, None, false),
