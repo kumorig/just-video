@@ -294,11 +294,28 @@ fn parse_subtitles(bytes: &[u8]) -> anyhow::Result<Vec<crate::subtitles::Cue>> {
     Ok(cues)
 }
 
-/// Judges how well the file at `path` will play, from its headers.
-fn probe(path: &Path, reader: impl crate::media::Source + 'static) -> Result<Assessment, String> {
-    Media::open(path.last().map_or("", String::as_str), reader)
-        .map(|m| playability::assess(Platform::current(), m.info().video.as_ref()))
-        .map_err(|e| crate::smb::explain(&e))
+/// Judges how well the file at `path` will play, from its headers, and
+/// detects its layout (a format the user picked for it wins).
+fn probe(
+    server: &Server,
+    share: &str,
+    path: &Path,
+    reader: impl crate::media::Source + 'static,
+) -> Result<Probed, String> {
+    let name = path.last().map_or("", String::as_str);
+    let media = Media::open(name, reader).map_err(|e| crate::smb::explain(&e))?;
+    let video = media.info().video.as_ref();
+    let mut layout = vr::detect(name, video);
+    if let Some(saved) = config::layout_override(&file_key(server, share, path))
+        .ok()
+        .flatten()
+    {
+        saved.apply(&mut layout);
+    }
+    Ok(Probed {
+        assessment: playability::assess(Platform::current(), video),
+        layout,
+    })
 }
 
 /// Opens the video at `path` for playback, with its saved layout, picture
@@ -396,7 +413,7 @@ pub enum Response {
     Probe {
         generation: u64,
         name: String,
-        result: Result<Assessment, String>,
+        result: Result<Probed, String>,
     },
     Opened {
         id: u64,
@@ -419,6 +436,14 @@ pub enum Response {
         id: u64,
         result: Result<Vec<crate::subtitles::Cue>, String>,
     },
+}
+
+/// What a folder listing shows about a video before it is opened.
+#[derive(Clone, Debug)]
+pub struct Probed {
+    pub assessment: Assessment,
+    /// Detected, or as the user last set it for this file.
+    pub layout: Layout,
 }
 
 pub struct Library {
@@ -656,7 +681,7 @@ fn run(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
             };
             let result = with_session(sessions, &server, Purpose::Probe, |s| {
                 let reader = s.open_in(&share, &smb_path(&path), probe).map_err(err)?;
-                self::probe(&path, reader)
+                self::probe(&server, &share, &path, reader)
             });
             Response::Probe {
                 generation,
@@ -787,15 +812,15 @@ fn run_local(request: Request, hw: Option<&str>) -> Response {
         }
         Request::Probe {
             generation,
+            server,
             share,
             path,
-            ..
         } => Response::Probe {
             generation,
             name: path.last().cloned().unwrap_or_default(),
             result: local::open(&share, &path)
                 .map_err(err)
-                .and_then(|reader| probe(&path, reader)),
+                .and_then(|reader| probe(&server, &share, &path, reader)),
         },
         Request::Open {
             id,

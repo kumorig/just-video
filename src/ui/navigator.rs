@@ -9,10 +9,11 @@
 use super::browser::{Action, Dialog, Hit, Icon, Row, Tool, View, format_size};
 use super::form::{self, Field, Form, Key};
 use crate::config::{self, Server};
-use crate::library::{Library, Listing, MoveSelection, Opened, Path, Request, Response};
+use crate::library::{Library, Listing, MoveSelection, Opened, Path, Request, Response, file_key};
 use crate::local;
 use crate::playability::{Assessment, Verdict};
 use crate::smb::SmbUrl;
+use crate::vr::Layout;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 
@@ -69,6 +70,8 @@ enum Item {
         name: String,
         size: u64,
         assessment: Option<Assessment>,
+        /// How it will be shown (once probed).
+        layout: Option<Layout>,
         broken: Option<String>,
         /// Where it was left (seconds) and its length, if remembered.
         resume: Option<(f64, Option<f64>)>,
@@ -570,17 +573,24 @@ impl Navigator {
                         name,
                         size,
                         assessment,
+                        layout,
                         broken,
                         resume,
                     } => Row {
                         icon: match (assessment, broken) {
                             (_, Some(_)) => Icon::Broken,
-                            (Some(a), None) => Icon::Video(Some(a.verdict)),
-                            (None, None) => Icon::Video(None),
+                            (a, None) => {
+                                Icon::video(a.as_ref().map(|a| a.verdict), layout.as_ref())
+                            }
                         },
                         detail: match (assessment, broken) {
                             (_, Some(_)) => "Can't read this file".into(),
-                            (Some(a), None) => a.summary.clone(),
+                            (Some(a), None) => {
+                                match layout.as_ref().and_then(Layout::short_label) {
+                                    Some(format) => format!("{format}  ·  {}", a.summary),
+                                    None => a.summary.clone(),
+                                }
+                            }
                             (None, None) => "Checking…".into(),
                         },
                         right: format_size(*size),
@@ -726,6 +736,7 @@ impl Navigator {
                                             name: e.name,
                                             size: e.size,
                                             assessment: None,
+                                            layout: None,
                                             broken: None,
                                             resume: None,
                                         }
@@ -769,13 +780,17 @@ impl Navigator {
                         if let Item::Video {
                             name: n,
                             assessment,
+                            layout,
                             broken,
                             ..
                         } = item
                             && *n == name
                         {
                             match &result {
-                                Ok(a) => *assessment = Some(a.clone()),
+                                Ok(p) => {
+                                    *assessment = Some(p.assessment.clone());
+                                    *layout = Some(p.layout);
+                                }
                                 Err(e) => *broken = Some(e.clone()),
                             }
                         }
@@ -1198,6 +1213,26 @@ impl Navigator {
             .playing
             .and_then(|i| self.items.get(i))
             .map(|item| item.trail_name().to_string());
+        // Its format may have been changed while it played.
+        if let (
+            Some(i),
+            Location::Folder {
+                server,
+                share,
+                path,
+            },
+        ) = (self.playing, &self.location)
+            && let Some(Item::Video {
+                name,
+                layout: Some(layout),
+                ..
+            }) = self.items.get_mut(i)
+        {
+            let file: Path = path.iter().chain([&*name]).cloned().collect();
+            if let Ok(Some(saved)) = config::layout_override(&file_key(server, share, &file)) {
+                saved.apply(layout);
+            }
+        }
         self.restore_scroll();
         self.rebuild_rows();
     }
@@ -2091,6 +2126,7 @@ mod tests {
             name: "clip.mp4".into(),
             size: 1,
             assessment: None,
+            layout: None,
             broken: None,
             resume: Some((600.0, Some(2400.0))),
         });
@@ -2145,6 +2181,44 @@ mod tests {
     }
 
     #[test]
+    fn videos_are_marked_by_format() {
+        let mut nav = Navigator::new(Library::start(None));
+        let server = Server {
+            name: "NAS".into(),
+            url: "smb://u@nas".into(),
+        };
+        nav.show_entries_for_test(server, &[]);
+        let a = crate::playability::assess(crate::playability::Platform::SteamFrame, None);
+        nav.items = ["film.mkv", "film_sbs.mkv", "trip_180_LR.mp4", "new_360.mp4"]
+            .into_iter()
+            .map(|name| Item::Video {
+                name: name.into(),
+                size: 1,
+                assessment: Some(a.clone()),
+                layout: Some(crate::vr::detect(name, None)),
+                broken: None,
+                resume: None,
+            })
+            .collect();
+        if let Some(Item::Video {
+            assessment, layout, ..
+        }) = nav.items.last_mut()
+        {
+            (*assessment, *layout) = (None, None); // not probed yet
+        }
+        nav.rebuild_rows();
+        let rows = &nav.view().rows;
+        let v = Some(a.verdict);
+        assert_eq!(rows[0].icon, Icon::Video(v));
+        assert_eq!(rows[0].detail, a.summary);
+        assert_eq!(rows[1].icon, Icon::Video3d(v));
+        assert_eq!(rows[1].detail, format!("3D  ·  {}", a.summary));
+        assert_eq!(rows[2].icon, Icon::VideoVr(v));
+        assert_eq!(rows[2].detail, format!("VR180 3D  ·  {}", a.summary));
+        assert_eq!(rows[3].icon, Icon::Video(None));
+    }
+
+    #[test]
     fn going_up_returns_to_the_folder_left() {
         let mut nav = Navigator::new(Library::start(None));
         let server = Server {
@@ -2180,6 +2254,7 @@ mod tests {
             name: name.into(),
             size: 1,
             assessment: None,
+            layout: None,
             broken: broken.then(|| "bad".to_string()),
             resume: None,
         };
