@@ -309,6 +309,18 @@ impl SmbSession {
 
     /// Lists `path` (backslash separated, empty for the root) inside `share`.
     pub fn list_in(&self, share: &str, path: &str) -> anyhow::Result<Vec<Entry>> {
+        self.list_in_watched(share, path, &mut |_| true)
+    }
+
+    /// [`SmbSession::list_in`], calling `watch` with the count so far after
+    /// every entry; returning false stops the listing (between directory
+    /// batches, so no request is abandoned mid-flight) with an error.
+    pub fn list_in_watched(
+        &self,
+        share: &str,
+        path: &str,
+        watch: &mut dyn FnMut(usize) -> bool,
+    ) -> anyhow::Result<Vec<Entry>> {
         self.ensure_share(share)?;
         let unc = self.url.unc(share, path)?;
         run_with_deadline(&self.runtime, "list folder", async {
@@ -335,6 +347,11 @@ impl SmbSession {
                         is_dir: item.file_attributes.directory(),
                         size: item.end_of_file,
                     });
+                    if !watch(entries.len()) {
+                        drop(stream);
+                        directory.close().await?;
+                        anyhow::bail!("Cancelled");
+                    }
                 }
             }
             directory.close().await?;

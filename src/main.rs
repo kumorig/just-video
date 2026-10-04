@@ -570,6 +570,7 @@ fn main() -> anyhow::Result<()> {
                 server: index.clone(),
                 share: share.clone(),
                 path: path.clone(),
+                watch: Default::default(),
             });
             let Response::List { result, .. } = wait("list")? else {
                 anyhow::bail!("unexpected")
@@ -653,6 +654,7 @@ fn main() -> anyhow::Result<()> {
                     server: index.clone(),
                     share: share.clone(),
                     path: path.clone(),
+                    watch: Default::default(),
                 });
                 loop {
                     if let Response::List { .. } = wait("list after stop")? {

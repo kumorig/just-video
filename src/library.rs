@@ -13,12 +13,20 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
 };
 
 pub type Path = Vec<String>;
+
+/// Watches a listing in progress: entries received so far, and a flag that
+/// stops it early (the browser left the folder).
+#[derive(Clone, Debug, Default)]
+pub struct Listing {
+    pub count: Arc<AtomicUsize>,
+    pub cancel: Arc<AtomicBool>,
+}
 
 /// Stable source paths retained while browsing for a move destination.
 #[derive(Clone, Debug)]
@@ -69,6 +77,7 @@ pub enum Request {
         server: Server,
         share: String,
         path: Path,
+        watch: Listing,
     },
     Probe {
         generation: u64,
@@ -349,10 +358,16 @@ fn run(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
             server,
             share,
             path,
+            watch,
         } => Response::List {
             id,
-            result: session(sessions, &server, Purpose::Browse)
-                .and_then(|s| s.list_in(&share, &smb_path(&path)).map_err(err)),
+            result: session(sessions, &server, Purpose::Browse).and_then(|s| {
+                s.list_in_watched(&share, &smb_path(&path), &mut |n| {
+                    watch.count.store(n, Ordering::Relaxed);
+                    !watch.cancel.load(Ordering::Relaxed)
+                })
+                .map_err(err)
+            }),
         },
         Request::Probe {
             generation,

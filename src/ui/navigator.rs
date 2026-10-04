@@ -10,10 +10,11 @@
 use super::browser::{Action, Dialog, Hit, Icon, Row, Tool, ToolIcon, View, format_size};
 use super::form::{self, Field, Form, Key};
 use crate::config::{self, Server};
-use crate::library::{Library, MoveSelection, Opened, Path, Request, Response};
+use crate::library::{Library, Listing, MoveSelection, Opened, Path, Request, Response};
 use crate::playability::{Assessment, Verdict};
 use crate::smb::SmbUrl;
 use std::collections::HashSet;
+use std::sync::atomic::Ordering;
 
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "m4v", "mkv", "mov", "webm", "avi", "ts", "m2ts"];
 
@@ -103,7 +104,18 @@ enum ToolAction {
     MoveSelected,
     RenameSelected,
     CancelMove,
+    /// Stop loading this folder and go back up.
+    CancelLoad,
     MoveHere,
+}
+
+/// Work in progress behind the browser, for a progress bar.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Progress {
+    /// Connecting, listing or opening: no known end.
+    Busy,
+    /// Videos checked so far, as a fraction.
+    Fraction(f32),
 }
 
 /// What the open form or dialog is for.
@@ -139,6 +151,10 @@ pub struct Navigator {
     playing: Option<usize>,
     /// Navigation request whose answer we wait for.
     pending: Option<u64>,
+    /// The folder listing in progress, and the count last shown.
+    listing: Option<(Listing, usize)>,
+    /// Playability probes answered and sent for this folder.
+    probes: (usize, usize),
     /// Rename/delete/add requests whose answers we wait for.
     pending_changes: HashSet<u64>,
     change_errors: Vec<String>,
@@ -169,6 +185,8 @@ impl Navigator {
             tool_actions: Vec::new(),
             playing: None,
             pending: None,
+            listing: None,
+            probes: (0, 0),
             pending_changes: HashSet::new(),
             change_errors: Vec::new(),
             scrolls: Default::default(),
@@ -293,11 +311,29 @@ impl Navigator {
         }
     }
 
+    /// Stops a folder listing we no longer wait for.
+    fn cancel_listing(&mut self) {
+        if let Some((listing, _)) = self.listing.take() {
+            listing.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// What is going on in the background, if anything.
+    pub fn progress(&self) -> Option<Progress> {
+        if self.pending.is_some() {
+            return Some(Progress::Busy);
+        }
+        let (done, total) = self.probes;
+        (done < total).then(|| Progress::Fraction(done as f32 / total as f32))
+    }
+
     fn show_servers(&mut self) {
         self.leave(&Location::Servers);
         self.location = Location::Servers;
         self.folder_loaded = false;
         self.pending = None;
+        self.cancel_listing();
+        self.probes = (0, 0);
         self.reset_view();
         let servers = config::servers().unwrap_or_else(|e| {
             eprintln!("Can't read saved servers: {e:#}");
@@ -316,6 +352,8 @@ impl Navigator {
         self.items.clear();
         self.generation += 1;
         self.library.set_probe_generation(self.generation);
+        self.cancel_listing();
+        self.probes = (0, 0);
         self.reset_view();
         let id = self.id();
         self.pending = Some(id);
@@ -331,11 +369,14 @@ impl Navigator {
                 path,
             } => {
                 self.set_status("Loading…");
+                let watch = Listing::default();
+                self.listing = Some((watch.clone(), 0));
                 self.library.send(Request::List {
                     id,
                     server,
                     share,
                     path,
+                    watch,
                 });
             }
         }
@@ -414,6 +455,8 @@ impl Navigator {
         let has_entries = self.items.iter().any(Item::is_entry);
         let tools: Vec<(Tool, ToolAction)> = if self.move_request.is_some() {
             Vec::new()
+        } else if self.listing.is_some() && self.pending.is_some() {
+            vec![(Tool::text("Cancel", false), ToolAction::CancelLoad)]
         } else if self.moving.is_some() {
             let mut tools = vec![(Tool::text("Cancel", false), ToolAction::CancelMove)];
             if editing && self.folder_loaded {
@@ -465,6 +508,17 @@ impl Navigator {
 
     /// Handles worker results; returns a video ready to play.
     pub fn poll(&mut self) -> Option<Box<Opened>> {
+        // A long listing shows how far it has come.
+        if let Some((listing, shown)) = &mut self.listing
+            && self.pending.is_some()
+        {
+            let count = listing.count.load(Ordering::Relaxed);
+            if count != *shown {
+                *shown = count;
+                self.view.status = Some(format!("Loading… {count} entries"));
+                self.dirty = true;
+            }
+        }
         while let Some(response) = self.library.try_recv() {
             match response {
                 Response::Shares { id, result } if Some(id) == self.pending => {
@@ -484,6 +538,7 @@ impl Navigator {
                 }
                 Response::List { id, result } if Some(id) == self.pending => {
                     self.pending = None;
+                    self.listing = None;
                     let Location::Folder {
                         server,
                         share,
@@ -516,6 +571,7 @@ impl Navigator {
                                     }
                                 })
                                 .collect();
+                            let mut sent = 0;
                             for item in &self.items {
                                 if let Item::Video { name, .. } = item {
                                     let mut file = path.clone();
@@ -526,8 +582,10 @@ impl Navigator {
                                         share: share.clone(),
                                         path: file,
                                     });
+                                    sent += 1;
                                 }
                             }
+                            self.probes = (0, sent);
                             self.view.status = if self.items.is_empty() {
                                 Some("This folder is empty.".into())
                             } else {
@@ -546,6 +604,7 @@ impl Navigator {
                     name,
                     result,
                 } if generation == self.generation => {
+                    self.probes.0 = (self.probes.0 + 1).min(self.probes.1);
                     for item in &mut self.items {
                         if let Item::Video {
                             name: n,
@@ -693,6 +752,9 @@ impl Navigator {
             }
             Some(ToolAction::CancelMove) => self.moving = None,
             Some(ToolAction::MoveHere) => self.move_here(),
+            Some(ToolAction::CancelLoad) => {
+                self.back();
+            }
             None => {}
         }
         self.rebuild_rows();
@@ -1446,6 +1508,79 @@ mod tests {
         nav.move_here();
         assert!(nav.move_request.is_none());
         assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn loading_shows_progress_and_can_be_cancelled() {
+        let (library, requests, responses) = Library::for_test();
+        let mut nav = Navigator::new(library);
+        let server = Server {
+            name: "NAS".into(),
+            url: "smb://u@nas".into(),
+        };
+        nav.show_entries_for_test(server, &["sub"]);
+        assert_eq!(nav.progress(), None);
+        nav.select(0);
+        assert_eq!(nav.progress(), Some(Progress::Busy));
+        let Request::List { id, watch, .. } = requests.try_recv().unwrap() else {
+            panic!("expected listing")
+        };
+        watch.count.store(120, Ordering::Relaxed);
+        nav.poll();
+        assert_eq!(nav.view().status.as_deref(), Some("Loading… 120 entries"));
+        assert_eq!(nav.view().tools[0].label, "Cancel");
+        nav.click(Hit::Tool(0));
+        assert!(watch.cancel.load(Ordering::Relaxed), "the listing stops");
+        assert!(matches!(&nav.location, Location::Folder { path, .. } if path.is_empty()));
+        // The cancelled listing's answer is ignored; the parent's is used.
+        responses
+            .send(Response::List {
+                id,
+                result: Err("Cancelled".into()),
+            })
+            .unwrap();
+        let Request::List { id, .. } = requests.try_recv().unwrap() else {
+            panic!("expected the parent listing")
+        };
+        let video = |name: &str| crate::smb::Entry {
+            name: name.into(),
+            is_dir: false,
+            size: 1,
+        };
+        responses
+            .send(Response::List {
+                id,
+                result: Ok(vec![video("a.mp4"), video("b.mp4")]),
+            })
+            .unwrap();
+        nav.poll();
+        assert_eq!(nav.view().rows.len(), 2);
+        assert_eq!(
+            nav.progress(),
+            Some(Progress::Fraction(0.0)),
+            "probes pending"
+        );
+        let Request::Probe { generation, .. } = requests.try_recv().unwrap() else {
+            panic!("expected a probe")
+        };
+        responses
+            .send(Response::Probe {
+                generation,
+                name: "a.mp4".into(),
+                result: Err("bad".into()),
+            })
+            .unwrap();
+        nav.poll();
+        assert_eq!(nav.progress(), Some(Progress::Fraction(0.5)));
+        responses
+            .send(Response::Probe {
+                generation,
+                name: "b.mp4".into(),
+                result: Err("bad".into()),
+            })
+            .unwrap();
+        nav.poll();
+        assert_eq!(nav.progress(), None);
     }
 
     #[test]

@@ -638,6 +638,10 @@ pub fn run(
     renderer.upload_quad(&mut screen_line, &solid_image([0xff, 0xff, 0xff], 0.7))?;
     let mut caption_line = renderer.create_quad(&ctx, 4, 4)?;
     renderer.upload_quad(&mut caption_line, &solid_image([0xff, 0xcc, 0x00], 0.9))?;
+    // The browser's progress bar.
+    let mut progress_line = renderer.create_quad(&ctx, 4, 4)?;
+    renderer.upload_quad(&mut progress_line, &solid_image([0x4f, 0x8c, 0xff], 1.0))?;
+    let mut progress_at: Option<(xr::Posef, [f32; 2])> = None;
     let mut outlines: Vec<(bool, Line)> = Vec::new();
     let mut dialog_target =
         renderer.create_quad(&ctx, controls::DIALOG_WIDTH, controls::DIALOG_HEIGHT)?;
@@ -911,6 +915,31 @@ pub fn run(
                 if let Some((x, y)) = point {
                     cursor_at = Some((BROWSER_PANEL, x, y));
                 }
+                // A thin bar under the header: filling as videos are checked,
+                // or sweeping while something with no known end runs.
+                progress_at = nav.progress().map(|progress| {
+                    let (from, to) = match progress {
+                        crate::ui::navigator::Progress::Fraction(f) => (0.0, f),
+                        crate::ui::navigator::Progress::Busy => {
+                            let t = (now as f64 / 1.4e9).fract() as f32 * 1.3 - 0.3;
+                            (t, t + 0.3)
+                        }
+                    };
+                    let (x, y, w, h) = browser::progress_rect(from, to);
+                    let p = BROWSER_PANEL.point(x + w / 2.0, y + h / 2.0, 0.003);
+                    let scale = BROWSER_PANEL.size[0] / BROWSER_PANEL.pixels[0] as f32;
+                    (
+                        xr::Posef {
+                            orientation: BROWSER_PANEL.orientation(),
+                            position: xr::Vector3f {
+                                x: p[0],
+                                y: p[1],
+                                z: p[2],
+                            },
+                        },
+                        [w * scale, h * scale],
+                    )
+                });
                 set_phase(6);
                 renderer.begin_frame(None)?;
                 for (eye, _) in views.iter().enumerate() {
@@ -1362,6 +1391,9 @@ pub fn run(
             Mode::Browser => {
                 if let Some(target) = browser_target.as_ref().filter(|t| t.ready) {
                     quads.push((target, BROWSER_PANEL.pose(), BROWSER_PANEL.size, false));
+                }
+                if let Some((pose, size)) = progress_at.filter(|(_, s)| s[0] > 0.0) {
+                    quads.push((&progress_line, pose, size, true));
                 }
             }
             Mode::Playing(_) => {

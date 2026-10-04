@@ -205,6 +205,15 @@ pub enum Hit {
     Nothing,
 }
 
+/// The thin progress bar under the header line, from `from` to `to`
+/// (fractions of its full width): (x, y, w, h) in canvas pixels. The app
+/// shows it as its own layer, so it can move without redrawing the panel.
+pub fn progress_rect(from: f32, to: f32) -> (f32, f32, f32, f32) {
+    let full = WIDTH as f32 - 2.0 * PAD;
+    let (from, to) = (from.clamp(0.0, 1.0), to.clamp(0.0, 1.0));
+    (PAD + full * from, HEADER - 8.0, full * (to - from), 3.0)
+}
+
 pub fn visible_rows() -> f32 {
     (HEIGHT as f32 - HEADER - BOTTOM) / ROW
 }
