@@ -3,7 +3,9 @@
 
 use super::context::{VIEW_TYPE, XrContext};
 use super::input::{Input, InputState, Ray};
-use super::player::{Placement, PlayOptions, PlayStats, Playback, ViewOptions, eye_params};
+use super::player::{
+    Placement, PlayOptions, PlayStats, Playback, ViewOptions, eye_params, screen_size,
+};
 use super::renderer::{QuadTarget, Renderer};
 use crate::ui::canvas::Fonts;
 use crate::ui::navigator::Navigator;
@@ -125,10 +127,12 @@ impl Panel {
     }
 }
 
+const BROWSER_DISTANCE: f32 = 2.2;
+
 /// The browser 2.2 m ahead: far enough that pointing needs only small hand
 /// movements, and scaled to look as big as 1.6 × 1.0 m at 1.5 m.
 const BROWSER_PANEL: Panel = Panel {
-    center: [0.0, -0.147, -2.2],
+    center: [0.0, -0.147, -BROWSER_DISTANCE],
     yaw: 0.0,
     tilt: 0.0,
     size: [2.347, 1.467],
@@ -138,11 +142,10 @@ const BROWSER_PANEL: Panel = Panel {
 /// Preferred distance of the control bar; it looks as big as 1.2 m wide at 1 m.
 const CONTROLS_DISTANCE: f32 = 1.8;
 
-/// The control bar ahead of the head, below eye level, tilted towards it:
-/// [`CONTROLS_DISTANCE`] away, but never beyond `max_distance` (in front of
-/// the screen), and scaled with its distance so it always looks the same size.
-fn controls_panel(head: &xr::Posef, max_distance: f32) -> Panel {
-    let d = CONTROLS_DISTANCE.min(max_distance).max(0.5);
+/// The control bar for VR180/360: [`CONTROLS_DISTANCE`] ahead of the head,
+/// below eye level, tilted towards it.
+fn controls_panel(head: &xr::Posef) -> Panel {
+    let d = CONTROLS_DISTANCE;
     let q = head.orientation;
     // Forward (-Z) of the head, flattened to the horizon.
     let forward = [
@@ -162,6 +165,39 @@ fn controls_panel(head: &xr::Posef, max_distance: f32) -> Panel {
             1.2 * d * controls::HEIGHT as f32 / controls::WIDTH as f32,
         ],
         pixels: [controls::WIDTH, controls::HEIGHT],
+    }
+}
+
+/// The control bar under a flat or curved screen, so the eyes needn't refocus
+/// between the two: just below its bottom edge, at the screen's depth, tilted
+/// to face the viewer. As wide as the screen, within a comfortable range of
+/// apparent sizes, and it follows the screen when moved or zoomed.
+fn screen_controls_panel(placement: &Placement, screen: [f32; 2]) -> Panel {
+    let d = placement.distance;
+    // A curved screen's arc is wider than the straight line across it.
+    let across = if placement.curved {
+        2.0 * d * (screen[0] / (2.0 * d)).min(std::f32::consts::PI).sin()
+    } else {
+        screen[0]
+    };
+    let width = across.clamp(0.8 * d, 1.2 * d);
+    let height = width * controls::HEIGHT as f32 / controls::WIDTH as f32;
+    let y = -screen[1] / 2.0 - 0.03 * width - height / 2.0;
+    // A little in front of the screen, which is drawn behind every panel anyway.
+    let depth = d - 0.02;
+    let base = Panel {
+        center: [0.0; 3],
+        yaw: placement.yaw,
+        tilt: placement.pitch,
+        size: [width, height],
+        pixels: [controls::WIDTH, controls::HEIGHT],
+    };
+    let [_, up, normal] = base.basis();
+    Panel {
+        center: [0, 1, 2].map(|i| up[i] * y - normal[i] * depth),
+        // Turned up (down above eye level) to face the viewer.
+        tilt: placement.pitch + y.atan2(depth),
+        ..base
     }
 }
 
@@ -324,28 +360,6 @@ const DRAG_THRESHOLD: f32 = 0.035;
 /// Longest press (ns) that still counts as a click.
 const CLICK_NS: i64 = 400_000_000;
 
-/// Where `ray` meets the video (flat or curved screen, or a point 5 m out
-/// for spherical video), for showing the cursor on it.
-/// Flat screen size (metres) for a `width`-wide screen showing a video of
-/// `video` pixels in `stereo` layout.
-fn screen_size(
-    video: (u32, u32),
-    stereo: crate::vr::Stereo,
-    width: f32,
-    quarter_turns: u8,
-) -> [f32; 2] {
-    let (w, h) = video;
-    let mut aspect = match stereo {
-        crate::vr::Stereo::SideBySide => w as f32 / 2.0 / h.max(1) as f32,
-        crate::vr::Stereo::TopBottom => w as f32 / (h as f32 / 2.0).max(1.0),
-        crate::vr::Stereo::Mono => w as f32 / h.max(1) as f32,
-    };
-    if quarter_turns % 2 == 1 {
-        aspect = 1.0 / aspect.max(0.01);
-    }
-    [width, width / aspect.max(0.1)]
-}
-
 /// Where subtitles go: over the bottom of a flat screen, just in front of it;
 /// for VR180/360, 2 m ahead in the view's direction, below its centre.
 fn caption_panel(
@@ -355,10 +369,12 @@ fn caption_panel(
     settings: crate::config::CaptionSettings,
 ) -> Panel {
     let flat = projection == Projection::Flat;
-    // The layer grows with the chosen size; its bottom edge stays put.
+    // The layer grows with the chosen size; its bottom edge stays put. On a
+    // tall screen it is as wide as on a 4:3 one of the same height, so the
+    // text stays readable.
     let quad_w = settings.scale
         * if flat {
-            screen[0] * captions::SCREEN_SHARE
+            screen[0].max(screen[1] / super::player::SCREEN_BOX_ASPECT) * captions::SCREEN_SHARE
         } else {
             1.5
         };
@@ -493,6 +509,8 @@ fn screen_outline(placement: &Placement, screen: [f32; 2], t: f32) -> Vec<Line> 
     lines
 }
 
+/// Where `ray` meets the video (flat or curved screen, or a point 5 m out
+/// for spherical video), for showing the cursor on it.
 fn video_hit(
     ray: &Ray,
     placement: &Placement,
@@ -918,6 +936,17 @@ pub fn run(
                     save_resume(playing_key.as_ref(), playback);
                 }
                 let curved_applies = playback.layout.projection == Projection::Flat;
+                let screen = screen_size(
+                    renderer.video_size(),
+                    playback.layout.stereo,
+                    &options.view,
+                    placement.zoom,
+                    playback.image.rotation,
+                );
+                // A screen's control bar moves with it (dragged, zoomed, curved).
+                if curved_applies && controls_panel_at.is_some() {
+                    controls_panel_at = Some(screen_controls_panel(&placement, screen));
+                }
                 let ui_state = controls::State {
                     paused: playback.paused(),
                     position: playback.position().floor(),
@@ -1027,16 +1056,12 @@ pub fn run(
                             if !p.dragging && now - p.since < CLICK_NS {
                                 controls_panel_at = match controls_panel_at {
                                     Some(_) => None,
-                                    None => {
-                                        // In front of a flat screen; VR180/360 surround us.
-                                        let limit =
-                                            if playback.layout.projection == Projection::Flat {
-                                                placement.distance - 0.4
-                                            } else {
-                                                f32::INFINITY
-                                            };
-                                        views.first().map(|v| controls_panel(&v.pose, limit))
+                                    // Under a flat screen; VR180/360 surround us, so
+                                    // ahead of the head instead.
+                                    None if curved_applies => {
+                                        Some(screen_controls_panel(&placement, screen))
                                     }
+                                    None => views.first().map(|v| controls_panel(&v.pose)),
                                 };
                                 dialog = None;
                                 caption_edit = false;
@@ -1196,8 +1221,11 @@ pub fn run(
                 // The stick zooms (screen size / magnification), except while
                 // dragging, when it moves the screen nearer or farther.
                 if !dragging && buttons.scroll.abs() > 0.2 {
+                    // A screen can shrink to a quarter (0.8 m wide by default);
+                    // VR180/360 below 0.4× would be mostly black.
+                    let min = if curved_applies { 0.25 } else { 0.4 };
                     placement.zoom =
-                        (placement.zoom * (buttons.scroll * 1.2 * dt).exp()).clamp(0.4, 3.0);
+                        (placement.zoom * (buttons.scroll * 1.2 * dt).exp()).clamp(min, 3.0);
                 }
 
                 if controls_panel_at.is_some() {
@@ -1220,7 +1248,8 @@ pub fn run(
                         let screen = screen_size(
                             renderer.video_size(),
                             playback.layout.stereo,
-                            options.view.screen_width * placement.zoom,
+                            &options.view,
+                            placement.zoom,
                             playback.image.rotation,
                         );
                         if let Some(point) =
@@ -1252,7 +1281,8 @@ pub fn run(
                 let screen = screen_size(
                     renderer.video_size(),
                     playback.layout.stereo,
-                    options.view.screen_width * placement.zoom,
+                    &options.view,
+                    placement.zoom,
                     playback.image.rotation,
                 );
                 let flat = playback.layout.projection == Projection::Flat;
@@ -1360,8 +1390,18 @@ pub fn run(
             }
         }
         if let Some((panel, x, y)) = cursor_at {
-            // Lifted a few millimetres so the cursor sits in front of the panel.
+            // Lifted a few millimetres so the cursor sits in front of the panel,
+            // and as big as on the browser at any distance.
             let p = panel.point(x, y, 0.005);
+            let distance = views.first().map_or(BROWSER_DISTANCE, |v| {
+                let e = v.pose.position;
+                dot(
+                    [p[0] - e.x, p[1] - e.y, p[2] - e.z],
+                    [p[0] - e.x, p[1] - e.y, p[2] - e.z],
+                )
+                .sqrt()
+            });
+            let size = CURSOR_SIZE * (distance / BROWSER_DISTANCE).max(0.5);
             let pose = xr::Posef {
                 orientation: panel.orientation(),
                 position: xr::Vector3f {
@@ -1370,7 +1410,7 @@ pub fn run(
                     z: p[2],
                 },
             };
-            quads.push((&cursor, pose, [CURSOR_SIZE, CURSOR_SIZE], true));
+            quads.push((&cursor, pose, [size, size], true));
         }
 
         if let Some((p, yaw, pitch, distance)) = video_cursor {
@@ -1516,6 +1556,188 @@ mod tests {
             let n = rotate_z(pose.orientation);
             let towards = [-p[0] / horizontal, 0.0, -p[2] / horizontal];
             assert!(dot(n, towards) > 0.999, "{n:?} vs {towards:?}");
+        }
+    }
+
+    #[test]
+    fn control_bar_hangs_under_the_screen_facing_the_viewer() {
+        for (yaw, pitch, curved, zoom) in [
+            (0.0, 0.0, false, 1.0),
+            (0.6, 0.3, false, 2.0),
+            (-0.4, -0.2, true, 1.0),
+            (0.0, 0.0, false, 0.4),
+        ] {
+            let placement = Placement {
+                yaw,
+                pitch,
+                distance: 3.0,
+                curved,
+                zoom,
+            };
+            let screen = [3.2 * zoom, 1.8 * zoom];
+            let bar = screen_controls_panel(&placement, screen);
+            // Its top edge is below the screen's bottom edge, at the screen's depth.
+            let top = bar.point(bar.pixels[0] as f32 / 2.0, 0.0, 0.0);
+            let r = placement.rotation();
+            let local = [0, 1, 2].map(|i| (0..3).map(|k| r[i][k] * top[k]).sum::<f32>());
+            assert!(local[1] < -screen[1] / 2.0, "{local:?}");
+            assert!((local[2] + 3.0).abs() < 0.3, "{local:?}");
+            // It faces the viewer at the origin.
+            let normal = bar.basis()[2];
+            let len = dot(bar.center, bar.center).sqrt();
+            let towards = scale(bar.center, -1.0 / len);
+            assert!(dot(normal, towards) > 0.999, "{normal:?} vs {towards:?}");
+            // Readable but never huge.
+            assert!((2.39..=3.61).contains(&bar.size[0]), "{:?}", bar.size);
+        }
+    }
+
+    /// What the viewer sees: the screen (a checkerboard) and the panels on
+    /// top of it, ray-cast from the eye at the origin, looking along `look`
+    /// (yaw, pitch). Writes a PNG.
+    fn render_scene(
+        path: &std::path::Path,
+        look: (f32, f32),
+        placement: &Placement,
+        screen: [f32; 2],
+        panels: &[(Panel, &crate::ui::canvas::Canvas, bool)],
+    ) {
+        let (w, h) = (1000u32, 750u32);
+        let half = (100f32.to_radians() / 2.0).tan();
+        let view = Panel {
+            center: [0.0; 3],
+            yaw: look.0,
+            tilt: look.1,
+            size: [1.0, 1.0],
+            pixels: [1, 1],
+        };
+        let [right, up, normal] = view.basis();
+        let r = placement.rotation();
+        let mut pixels = vec![0u8; (w * h * 4) as usize];
+        for py in 0..h {
+            for px in 0..w {
+                let sx = (px as f32 + 0.5) / w as f32 * 2.0 - 1.0;
+                let sy = 1.0 - (py as f32 + 0.5) / h as f32 * 2.0;
+                let d = add(
+                    add(
+                        scale(right, sx * half),
+                        scale(up, sy * half * h as f32 / w as f32),
+                    ),
+                    scale(normal, -1.0),
+                );
+                let d = scale(d, 1.0 / dot(d, d).sqrt());
+                let ray = Ray {
+                    origin: [0.0; 3],
+                    direction: d,
+                };
+                // Sky above the horizon, floor below.
+                let mut c = if d[1] > 0.0 {
+                    [20.0, 24.0, 34.0]
+                } else {
+                    [40.0, 38.0, 36.0]
+                };
+                if let Some(p) = video_hit(&ray, placement, Projection::Flat, screen) {
+                    let local = [0, 1, 2].map(|i| (0..3).map(|k| r[i][k] * p[k]).sum::<f32>());
+                    let u = if placement.curved {
+                        local[0].atan2(-local[2]) * placement.distance
+                    } else {
+                        local[0]
+                    };
+                    let checker = ((u / 0.2).floor() + (local[1] / 0.2).floor()) as i32 & 1;
+                    c = if checker == 0 {
+                        [90.0, 110.0, 140.0]
+                    } else {
+                        [70.0, 85.0, 110.0]
+                    };
+                }
+                for (panel, canvas, blend) in panels {
+                    let Some((x, y)) = panel.hit(&ray) else {
+                        continue;
+                    };
+                    let (x, y) = (
+                        (x as u32).min(canvas.width - 1),
+                        (y as u32).min(canvas.height - 1),
+                    );
+                    let i = ((y * canvas.width + x) * 4) as usize;
+                    let src = &canvas.pixels[i..i + 4];
+                    let a = if *blend { src[3] as f32 / 255.0 } else { 1.0 };
+                    for k in 0..3 {
+                        c[k] = src[k] as f32 + c[k] * (1.0 - a);
+                    }
+                }
+                let i = ((py * w + px) * 4) as usize;
+                pixels[i..i + 4].copy_from_slice(&[c[0] as u8, c[1] as u8, c[2] as u8, 255]);
+            }
+        }
+        let file = std::io::BufWriter::new(std::fs::File::create(path).expect("png"));
+        let mut encoder = png::Encoder::new(file, w, h);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().expect("png header");
+        writer.write_image_data(&pixels).expect("png data");
+    }
+
+    /// Scene previews for checking layout by eye:
+    /// `JUST_VIDEO_SCENE_DIR=/tmp/x cargo test scene_previews -- --ignored`
+    #[test]
+    #[ignore]
+    fn scene_previews() {
+        let Ok(dir) = std::env::var("JUST_VIDEO_SCENE_DIR") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let mut fonts = Fonts::load().expect("fonts");
+        let state = controls::State {
+            paused: false,
+            position: 754.0,
+            duration: 5530.0,
+            has_previous: true,
+            has_next: true,
+            curved: Some(false),
+            format: controls::FORMATS[0],
+            favourites: vec![controls::FORMATS[0]],
+            swap_eyes: false,
+            subtitle_tracks: vec!["English".into()],
+            subtitle: Some(0),
+            audio_tracks: vec!["English 5.1".into()],
+            audio: Some(0),
+            list_page: 0,
+            image: Default::default(),
+            dialog: None,
+            caption_edit: false,
+        };
+        let bar = controls::render(&state, &mut fonts, controls::Hit::Nothing);
+        let caption =
+            captions::render(&crate::subtitles::Caption::text(SAMPLE_CAPTION), &mut fonts);
+        let options = ViewOptions::default();
+        for (name, yaw, pitch, curved, zoom, turns, look) in [
+            ("flat", 0.0, 0.0, false, 1.0, 0, (0.0, -0.2)),
+            ("flat-zoomed", 0.0, 0.0, false, 2.0, 0, (0.0, -0.3)),
+            ("flat-small", 0.0, 0.0, false, 0.5, 0, (0.0, -0.1)),
+            ("curved", 0.0, 0.0, true, 1.0, 0, (0.0, -0.2)),
+            ("curved-wide", 0.0, 0.0, true, 2.0, 0, (0.0, -0.3)),
+            ("raised", 0.3, 0.5, false, 1.0, 0, (0.3, 0.3)),
+            ("rotated", 0.0, 0.0, false, 1.0, 1, (0.0, -0.2)),
+            ("rotated-smallest", 0.0, 0.0, false, 0.25, 1, (0.0, -0.1)),
+        ] {
+            let placement = Placement {
+                yaw,
+                pitch,
+                distance: options.screen_distance,
+                curved,
+                zoom,
+            };
+            let screen = screen_size((1920, 1080), crate::vr::Stereo::Mono, &options, zoom, turns);
+            let captions = caption_panel(&placement, Projection::Flat, screen, Default::default());
+            let bar_panel = screen_controls_panel(&placement, screen);
+            render_scene(
+                &dir.join(format!("{name}.png")),
+                look,
+                &placement,
+                screen,
+                &[(captions, &caption, true), (bar_panel, &bar, false)],
+            );
         }
     }
 

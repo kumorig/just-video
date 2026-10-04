@@ -96,6 +96,28 @@ mod tests {
     }
 
     #[test]
+    fn tall_screens_fit_the_same_box_as_wide_ones() {
+        let options = ViewOptions::default();
+        let size = |tex, stereo, zoom, turns| screen_size(tex, stereo, &options, zoom, turns);
+        let close =
+            |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).abs() < 1e-3 && (a[1] - b[1]).abs() < 1e-3;
+        // Landscape video keeps the configured width.
+        assert!(close(size((1920, 1080), Stereo::Mono, 1.0, 0), [3.2, 1.8]));
+        assert!(close(size((1440, 1080), Stereo::Mono, 1.0, 0), [3.2, 2.4]));
+        assert!(close(
+            size((3840, 1080), Stereo::SideBySide, 1.0, 0),
+            [3.2, 1.8]
+        ));
+        // Turned on its side, or shot upright: as tall as a 4:3 screen, not 5.7 m.
+        let turned = size((1920, 1080), Stereo::Mono, 1.0, 1);
+        assert!(close(turned, [2.4 * 1080.0 / 1920.0, 2.4]), "{turned:?}");
+        assert!(close(size((1080, 1920), Stereo::Mono, 1.0, 0), turned));
+        // And zooming out shrinks it further.
+        let small = size((1080, 1920), Stereo::Mono, 0.25, 0);
+        assert!((small[1] - 0.6).abs() < 1e-3, "{small:?}");
+    }
+
+    #[test]
     fn placement_turns_the_screen_direction() {
         let mut p = Placement {
             yaw: std::f32::consts::FRAC_PI_2,
@@ -904,6 +926,35 @@ fn mat_mul_t(a: [[f32; 3]; 3], b: [[f32; 4]; 3]) -> [[f32; 4]; 3] {
     out
 }
 
+/// Tallest flat screen at zoom 1, as a share of its width: 4:3 and wider
+/// videos are `screen_width` wide, taller ones (portrait, or turned on their
+/// side) this high, so zooming can make them small enough to see whole.
+pub const SCREEN_BOX_ASPECT: f32 = 0.75;
+
+/// Flat screen size (metres) for a video of `tex` pixels in `stereo` layout,
+/// turned `quarter_turns` clockwise.
+pub fn screen_size(
+    tex: (u32, u32),
+    stereo: Stereo,
+    options: &ViewOptions,
+    zoom: f32,
+    quarter_turns: u8,
+) -> [f32; 2] {
+    let (w, h) = (tex.0 as f32, tex.1.max(1) as f32);
+    // One eye's part of the frame.
+    let mut aspect = match stereo {
+        Stereo::SideBySide => w / 2.0 / h,
+        Stereo::TopBottom => w / (h / 2.0),
+        Stereo::Mono => w / h,
+    };
+    if quarter_turns % 2 == 1 {
+        aspect = 1.0 / aspect.max(0.01);
+    }
+    let aspect = aspect.max(0.1);
+    let width = options.screen_width * zoom * (aspect * SCREEN_BOX_ASPECT).min(1.0);
+    [width, width / aspect]
+}
+
 /// Shader parameters for one eye.
 pub fn eye_params(
     view: &xr::View,
@@ -915,16 +966,7 @@ pub fn eye_params(
     quarter_turns: u8,
 ) -> EyeParams {
     let (w, h) = (tex.0 as f32, tex.1 as f32);
-    // Flat screen aspect from one eye's part of the frame (turned on its side
-    // when the picture is rotated a quarter).
-    let mut aspect = match layout.stereo {
-        Stereo::SideBySide => w / 2.0 / h,
-        Stereo::TopBottom => w / (h / 2.0),
-        Stereo::Mono => w / h,
-    };
-    if quarter_turns % 2 == 1 {
-        aspect = 1.0 / aspect.max(0.01);
-    }
+    let screen = screen_size(tex, layout.stereo, options, placement.zoom, quarter_turns);
     // Express the eye in the placement's frame: the shader's screen/sphere is
     // fixed there, so rotating the placement moves the video around the viewer.
     let placed = placement.rotation();
@@ -956,12 +998,7 @@ pub fn eye_params(
             if layout.swap_eyes { 1.0 } else { 0.0 },
             options.fisheye_fov.to_radians(),
         ],
-        screen: [
-            options.screen_width * placement.zoom,
-            options.screen_width * placement.zoom / aspect.max(0.1),
-            placement.distance,
-            0.0,
-        ],
+        screen: [screen[0], screen[1], placement.distance, 0.0],
         tex: [w, h, options.debug_view as f32, placement.zoom],
     }
 }
