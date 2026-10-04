@@ -54,36 +54,33 @@ fn vs_main(@builtin(vertex_index) i: u32) -> VsOut {
     return out;
 }
 
-// Maps a direction/ray to video UV in [0,1]^2 for one eye's image; returns
-// (uv, inside) packed as vec3 (z = 1 when the video covers this ray).
+// Maps a direction/ray to video UV in [0,1]^2 for one eye's image. Returns
+// (uv, inside): `inside` is a signed distance in UV units (positive inside
+// the video), continuous across the edge so it can be anti-aliased. No
+// per-pixel early returns: the caller takes screen-space derivatives.
 fn project(origin: vec3<f32>, d: vec3<f32>) -> vec3<f32> {
     let kind = u32(eye.mode.x);
     if kind == 0u {
         // Flat screen facing +Z at distance `screen.z`; rays start at the eye.
-        if d.z > -1e-4 {
-            return vec3<f32>(0.0);
-        }
-        let t = (-eye.screen.z - origin.z) / d.z;
+        let dz = min(d.z, -1e-4);
+        let t = (-eye.screen.z - origin.z) / dz;
         let p = origin + t * d;
         let uv = vec2<f32>(p.x / eye.screen.x + 0.5, 0.5 - (p.y - eye.screen.w) / eye.screen.y);
-        return vec3<f32>(uv, 1.0);
+        return vec3<f32>(uv, select(-1.0, rect_inside(uv), d.z < -1e-4));
     }
     if kind == 4u {
         // Curved screen: a cylinder of radius `screen.z` around the viewer,
         // `screen.x` metres of arc wide. Rays start inside it: take the far hit.
         let r = eye.screen.z;
-        let a = d.x * d.x + d.z * d.z;
+        let a = max(d.x * d.x + d.z * d.z, 1e-6);
         let b = 2.0 * (origin.x * d.x + origin.z * d.z);
         let c = origin.x * origin.x + origin.z * origin.z - r * r;
-        let disc = b * b - 4.0 * a * c;
-        if a < 1e-6 || disc < 0.0 {
-            return vec3<f32>(0.0);
-        }
+        let disc = max(b * b - 4.0 * a * c, 0.0);
         let t = (-b + sqrt(disc)) / (2.0 * a);
         let p = origin + t * d;
         let arc = atan2(p.x, -p.z) * r;
         let uv = vec2<f32>(arc / eye.screen.x + 0.5, 0.5 - (p.y - eye.screen.w) / eye.screen.y);
-        return vec3<f32>(uv, select(0.0, 1.0, p.z < 0.0));
+        return vec3<f32>(uv, select(-1.0, rect_inside(uv), p.z < 0.0));
     }
     // Zooming a spherical video magnifies it around the view centre.
     let zoom = select(eye.tex.w, 1.0, eye.tex.w <= 0.0);
@@ -92,15 +89,37 @@ fn project(origin: vec3<f32>, d: vec3<f32>) -> vec3<f32> {
         let theta = acos(clamp(-d.z, -1.0, 1.0)) / zoom;
         let r = theta / (eye.mode.w * 0.5) * 0.5;
         let phi = atan2(d.y, d.x);
-        return vec3<f32>(0.5 + r * cos(phi), 0.5 - r * sin(phi), select(0.0, 1.0, r <= 0.5));
+        return vec3<f32>(0.5 + r * cos(phi), 0.5 - r * sin(phi), 0.5 - r);
     }
     let lon = atan2(d.x, -d.z) / zoom;
     let lat = asin(clamp(d.y, -1.0, 1.0)) / zoom;
     let v = 0.5 - lat / PI;
     if kind == 1u {
-        return vec3<f32>(lon / PI + 0.5, v, select(0.0, 1.0, abs(lon) <= PI * 0.5));
+        let uv = vec2<f32>(lon / PI + 0.5, v);
+        return vec3<f32>(uv, rect_inside(uv));
     }
     return vec3<f32>(lon / (2.0 * PI) + 0.5, v, 1.0);
+}
+
+// Signed distance (UV units) inside the unit square.
+fn rect_inside(uv: vec2<f32>) -> f32 {
+    let e = vec2<f32>(0.5) - abs(uv - vec2<f32>(0.5));
+    return min(e.x, e.y);
+}
+
+// One bilinear YUV sample.
+fn sample_yuv(uv: vec2<f32>) -> vec3<f32> {
+    let scale = color.params.x;
+    let y = textureSampleLevel(tex_y, samp, uv, 0.0).r * scale;
+    if color.params.y > 0.5 {
+        let c = textureSampleLevel(tex_u, samp, uv, 0.0).rg * scale;
+        return vec3<f32>(y, c.x, c.y);
+    }
+    return vec3<f32>(
+        y,
+        textureSampleLevel(tex_u, samp, uv, 0.0).r * scale,
+        textureSampleLevel(tex_v, samp, uv, 0.0).r * scale,
+    );
 }
 
 fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
@@ -140,13 +159,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let rot = mat3x3<f32>(eye.rot0.xyz, eye.rot1.xyz, eye.rot2.xyz);
     let d = normalize(rot * vec3<f32>(tx, ty, -1.0));
     let hit = project(eye.origin.xyz, d);
+    // Derivatives come first, while control flow is still uniform: the
+    // video's edge fades over one output pixel instead of stair-stepping.
+    let coverage = clamp(hit.z / max(fwidth(hit.z), 1e-6) + 0.5, 0.0, 1.0);
     let debug = u32(eye.tex.z);
     if debug == 1u {
         // Red/green = projected UV, blue = inside the video, dim grey = view direction.
-        return vec4<f32>(hit.x * hit.z, hit.y * hit.z, hit.z, 1.0) * 0.8 + vec4<f32>(abs(d) * 0.2, 0.0);
-    }
-    if hit.z < 0.5 || any(hit.xy < vec2<f32>(0.0)) || any(hit.xy > vec2<f32>(1.0)) {
-        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        let inside = step(0.0, hit.z);
+        return vec4<f32>(hit.x * inside, hit.y * inside, inside, 1.0) * 0.8 + vec4<f32>(abs(d) * 0.2, 0.0);
     }
 
     // Select this eye's part of the frame; stay half a chroma texel inside it
@@ -156,7 +176,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         index = 1.0 - index;
     }
     // Rotated video: turn the eye's image within its part of the frame.
-    var st = hit.xy;
+    var st = clamp(hit.xy, vec2<f32>(0.0), vec2<f32>(1.0));
     let turns = u32(color.adjust.w + 0.5) % 4u;
     if turns == 1u {
         st = vec2<f32>(st.y, 1.0 - st.x);
@@ -173,24 +193,34 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         rect = vec4<f32>(0.0, index * 0.5, 1.0, index * 0.5 + 0.5);
     }
     let margin = vec2<f32>(1.0) / eye.tex.xy;
-    let uv = clamp(mix(rect.xy, rect.zw, st), rect.xy + margin, rect.zw - margin);
-
-    let scale = color.params.x;
-    let y = textureSampleLevel(tex_y, samp, uv, 0.0).r * scale;
-    var cb: f32;
-    var cr: f32;
-    if color.params.y > 0.5 {
-        let c = textureSampleLevel(tex_u, samp, uv, 0.0).rg * scale;
-        cb = c.x;
-        cr = c.y;
-    } else {
-        cb = textureSampleLevel(tex_u, samp, uv, 0.0).r * scale;
-        cr = textureSampleLevel(tex_v, samp, uv, 0.0).r * scale;
+    let lo = rect.xy + margin;
+    let hi = rect.zw - margin;
+    let uv = clamp(mix(rect.xy, rect.zw, st), lo, hi);
+    // Texels covered by this output pixel (still uniform control flow).
+    let duv = fwidth(uv);
+    let footprint = max(duv.x * eye.tex.x, duv.y * eye.tex.y);
+    if coverage <= 0.0 {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
     }
+
+    // Minified video (8K on a 2K eye) shimmers with one bilinear sample per
+    // pixel; four samples spread over the pixel's footprint average it out.
+    var yuv: vec3<f32>;
+    if footprint > 1.3 {
+        let o = duv * 0.25;
+        yuv = (sample_yuv(clamp(uv + vec2<f32>(-o.x, -o.y), lo, hi))
+            + sample_yuv(clamp(uv + vec2<f32>(o.x, -o.y), lo, hi))
+            + sample_yuv(clamp(uv + vec2<f32>(-o.x, o.y), lo, hi))
+            + sample_yuv(clamp(uv + vec2<f32>(o.x, o.y), lo, hi))) * 0.25;
+    } else {
+        yuv = sample_yuv(uv);
+    }
+    let y = yuv.x;
+    let cb = yuv.y;
+    let cr = yuv.z;
     if debug == 2u {
         return vec4<f32>(y, cb, cr, 1.0);
     }
-    let yuv = vec3<f32>(y, cb, cr);
     var encoded = clamp(
         vec3<f32>(dot(color.m0.xyz, yuv) + color.m0.w, dot(color.m1.xyz, yuv) + color.m1.w, dot(color.m2.xyz, yuv) + color.m2.w),
         vec3<f32>(0.0),
@@ -217,6 +247,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             vec3<f32>(-0.0728, -0.0083, 1.1187),
         ) * linear;
     }
-    // The swapchain is sRGB: the hardware encodes this linear value.
-    return vec4<f32>(clamp(linear, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+    // The swapchain is sRGB: the hardware encodes this linear value. The
+    // edge fades to the black surround.
+    return vec4<f32>(clamp(linear, vec3<f32>(0.0), vec3<f32>(1.0)) * coverage, 1.0);
 }
