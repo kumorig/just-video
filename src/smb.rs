@@ -138,6 +138,41 @@ pub struct SmbSession {
 /// drops this session and reconnects.
 const REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Share-relative destination for a move, keeping the original name.
+pub(crate) fn move_target(path: &str, destination: &str) -> anyhow::Result<String> {
+    let valid = |path: &str| {
+        path.split('\\').all(|part| {
+            !part.is_empty() && part != "." && part != ".." && !part.contains(['/', '\0'])
+        })
+    };
+    ensure!(valid(path), "Invalid source path");
+    ensure!(
+        destination.is_empty() || valid(destination),
+        "Invalid destination path"
+    );
+    let source_parts: Vec<_> = path.split('\\').collect();
+    let destination_parts: Vec<_> = destination.split('\\').filter(|p| !p.is_empty()).collect();
+    ensure!(
+        destination_parts.len() < source_parts.len()
+            || !source_parts
+                .iter()
+                .zip(&destination_parts)
+                .all(|(a, b)| a.eq_ignore_ascii_case(b)),
+        "Can't move a folder into itself"
+    );
+    let name = source_parts.last().expect("validated source");
+    let target = if destination.is_empty() {
+        name.to_string()
+    } else {
+        format!("{destination}\\{name}")
+    };
+    ensure!(
+        !path.eq_ignore_ascii_case(&target),
+        "Already in this folder"
+    );
+    Ok(target)
+}
+
 fn run_with_deadline<T>(
     runtime: &Runtime,
     what: &str,
@@ -367,7 +402,19 @@ impl SmbSession {
             Some((parent, _)) => format!("{parent}\\{new_name}"),
             None => new_name.to_string(),
         };
-        self.modify(share, path, "rename", |handle| {
+        self.rename_to(share, path, target, "rename")
+    }
+
+    /// Moves a file or folder within one share, without replacing an existing
+    /// entry. SMB rename is relative to the source tree: other shares/servers
+    /// require a separate copy-and-delete operation.
+    pub fn move_in(&self, share: &str, path: &str, destination: &str) -> anyhow::Result<()> {
+        let target = move_target(path, destination)?;
+        self.rename_to(share, path, target, "move")
+    }
+
+    fn rename_to(&self, share: &str, path: &str, target: String, what: &str) -> anyhow::Result<()> {
+        self.modify(share, path, what, |handle| {
             Box::pin(async move {
                 handle
                     .set_info(smb::FileRenameInformation {
@@ -455,6 +502,8 @@ fn explain_write_error(message: &str) -> anyhow::Error {
         "The server doesn't allow changing this (you have no write permission here)."
     } else if m.contains("0xc0000035") {
         "Something with that name already exists."
+    } else if m.contains("0xc00000d4") {
+        "Choose a folder on the same filesystem"
     } else if m.contains("0xc0000101") {
         "The folder isn't empty. Only empty folders can be deleted."
     } else if m.contains("0xc0000043") {
@@ -510,6 +559,38 @@ pub type SmbReader = ReadAheadReader<SmbFile>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn move_paths_keep_names_and_allow_the_share_root() {
+        assert_eq!(
+            move_target("old\\movie.mp4", "new\\nested").unwrap(),
+            "new\\nested\\movie.mp4"
+        );
+        assert_eq!(move_target("old\\folder", "").unwrap(), "folder");
+        assert_eq!(move_target("movie.mp4", "new").unwrap(), "new\\movie.mp4");
+        assert!(move_target("folder", "folderish").is_ok());
+    }
+
+    #[test]
+    fn move_paths_reject_noops_descendants_and_traversal() {
+        for (source, destination) in [
+            ("old\\movie.mp4", "OLD"),
+            ("movie.mp4", ""),
+            ("old\\folder", "OLD\\Folder"),
+            ("old\\folder", "old\\folder\\nested"),
+            ("", "new"),
+            ("..\\movie.mp4", "new"),
+            ("movie.mp4", ".."),
+            ("movie.mp4", "new/other"),
+            ("movie.mp4", "new\\\\other"),
+            ("movie.mp4", "new\0other"),
+        ] {
+            assert!(
+                move_target(source, destination).is_err(),
+                "{source:?} -> {destination:?}"
+            );
+        }
+    }
 
     #[test]
     fn parses_full_url() {

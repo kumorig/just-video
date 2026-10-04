@@ -3,12 +3,12 @@
 //!
 //! Changing things is opt-in per server: its lock (on the server list)
 //! reveals Edit/Remove for the server and, inside it, Rename on every entry
-//! and a "Select" tool for deleting several entries at once.
+//! and a "Select" tool for moving or deleting several entries at once.
 
 use super::browser::{Action, Dialog, Hit, Icon, Row, Tool, ToolIcon, View, format_size};
 use super::form::{self, Field, Form, Key};
 use crate::config::{self, Server};
-use crate::library::{Library, Opened, Path, Request, Response};
+use crate::library::{Library, MoveSelection, Opened, Path, Request, Response};
 use crate::playability::{Assessment, Verdict};
 use crate::smb::SmbUrl;
 use std::collections::HashSet;
@@ -98,6 +98,9 @@ enum ToolAction {
     StartSelect,
     CancelSelect,
     DeleteSelected,
+    MoveSelected,
+    CancelMove,
+    MoveHere,
 }
 
 /// What the open form or dialog is for.
@@ -120,8 +123,12 @@ pub struct Navigator {
     purpose: Option<Purpose>,
     /// URLs of servers whose lock is open (this session only).
     unlocked: HashSet<String>,
-    /// Selecting entries to delete: their indexes.
+    /// Selecting entries to move or delete: their indexes.
     selecting: Option<HashSet<usize>>,
+    /// Sources survive navigation until a destination is chosen or cancelled.
+    moving: Option<MoveSelection>,
+    move_request: Option<u64>,
+    folder_loaded: bool,
     /// Edit mode (inside an unlocked server): rename/delete on each row.
     edit_mode: bool,
     /// What each header tool does.
@@ -154,6 +161,9 @@ impl Navigator {
             purpose: None,
             unlocked: HashSet::new(),
             selecting: None,
+            moving: None,
+            move_request: None,
+            folder_loaded: false,
             edit_mode: false,
             tool_actions: Vec::new(),
             playing: None,
@@ -285,6 +295,7 @@ impl Navigator {
     fn show_servers(&mut self) {
         self.leave(&Location::Servers);
         self.location = Location::Servers;
+        self.folder_loaded = false;
         self.pending = None;
         self.reset_view();
         let servers = config::servers().unwrap_or_else(|e| {
@@ -300,6 +311,7 @@ impl Navigator {
     fn navigate(&mut self, location: Location) {
         self.leave(&location);
         self.location = location.clone();
+        self.folder_loaded = false;
         self.items.clear();
         self.generation += 1;
         self.library.set_probe_generation(self.generation);
@@ -326,6 +338,7 @@ impl Navigator {
                 });
             }
         }
+        self.rebuild_rows();
     }
 
     fn refresh(&mut self) {
@@ -349,7 +362,7 @@ impl Navigator {
                         Row {
                             detail: s.url.clone(),
                             lock: Some(open),
-                            actions: if open {
+                            actions: if open && self.moving.is_none() {
                                 vec![Action::Edit, Action::Remove]
                             } else {
                                 Vec::new()
@@ -392,7 +405,7 @@ impl Navigator {
                 if item.is_entry() {
                     match selecting {
                         Some(selected) => row.checked = Some(selected.contains(&i)),
-                        None if editing && self.edit_mode => {
+                        None if editing && self.edit_mode && self.moving.is_none() => {
                             row.actions = vec![Action::Rename, Action::Delete]
                         }
                         None => {}
@@ -402,23 +415,37 @@ impl Navigator {
             })
             .collect();
         let has_entries = self.items.iter().any(Item::is_entry);
-        let tools: Vec<(Tool, ToolAction)> = match &self.selecting {
-            Some(selected) => {
-                let mut tools = vec![(Tool::text("Cancel", false), ToolAction::CancelSelect)];
-                if !selected.is_empty() {
-                    let delete = Tool::text(format!("Delete {}", selected.len()), true);
-                    tools.push((delete, ToolAction::DeleteSelected));
+        let tools: Vec<(Tool, ToolAction)> = if self.move_request.is_some() {
+            Vec::new()
+        } else if self.moving.is_some() {
+            let mut tools = vec![(Tool::text("Cancel", false), ToolAction::CancelMove)];
+            if editing && self.folder_loaded {
+                tools.push((Tool::text("Move here", false), ToolAction::MoveHere));
+            }
+            tools
+        } else {
+            match &self.selecting {
+                Some(selected) => {
+                    let mut tools = vec![(Tool::text("Cancel", false), ToolAction::CancelSelect)];
+                    if !selected.is_empty() {
+                        let delete = Tool::text(format!("Delete {}", selected.len()), true);
+                        tools.push((delete, ToolAction::DeleteSelected));
+                        tools.push((
+                            Tool::text(format!("Move {}", selected.len()), false),
+                            ToolAction::MoveSelected,
+                        ));
+                    }
+                    tools
                 }
-                tools
+                None if editing && has_entries && self.edit_mode => vec![
+                    (Tool::icon(ToolIcon::Select, false), ToolAction::StartSelect),
+                    (Tool::icon(ToolIcon::Edit, true), ToolAction::ToggleEdit),
+                ],
+                None if editing && has_entries => {
+                    vec![(Tool::icon(ToolIcon::Edit, false), ToolAction::ToggleEdit)]
+                }
+                None => Vec::new(),
             }
-            None if editing && has_entries && self.edit_mode => vec![
-                (Tool::icon(ToolIcon::Select, false), ToolAction::StartSelect),
-                (Tool::icon(ToolIcon::Edit, true), ToolAction::ToggleEdit),
-            ],
-            None if editing && has_entries => {
-                vec![(Tool::icon(ToolIcon::Edit, false), ToolAction::ToggleEdit)]
-            }
-            None => Vec::new(),
         };
         (self.view.tools, self.tool_actions) = tools.into_iter().unzip();
         self.view.clamp_scroll();
@@ -467,6 +494,7 @@ impl Navigator {
                     };
                     match result {
                         Ok(entries) => {
+                            self.folder_loaded = true;
                             self.items = entries
                                 .into_iter()
                                 .filter(|e| !e.name.starts_with('.'))
@@ -560,6 +588,20 @@ impl Navigator {
                         self.changes_done();
                     }
                 }
+                Response::Moved { id, result } if self.move_request == Some(id) => {
+                    self.move_request = None;
+                    if let Some(selection) = &mut self.moving {
+                        selection.paths = result.failed;
+                        if selection.paths.is_empty() {
+                            self.moving = None;
+                        }
+                    }
+                    self.view.notice = None;
+                    self.refresh();
+                    if !result.errors.is_empty() {
+                        self.dialog("Couldn't move some items", result.errors);
+                    }
+                }
                 Response::ServerAdded { id, result } if self.pending_changes.remove(&id) => {
                     match result {
                         Ok(saved) => {
@@ -619,6 +661,9 @@ impl Navigator {
 
     /// Reacts to a click (trigger or A) on the panel.
     pub fn click(&mut self, hit: Hit) {
+        if self.move_request.is_some() {
+            return;
+        }
         match hit {
             Hit::Form(h) => self.click_form(h),
             Hit::DialogButton(i) => self.click_dialog(i),
@@ -651,9 +696,78 @@ impl Navigator {
                 indices.sort_unstable();
                 self.confirm_delete(indices);
             }
+            Some(ToolAction::MoveSelected) => self.start_move(),
+            Some(ToolAction::CancelMove) => self.moving = None,
+            Some(ToolAction::MoveHere) => self.move_here(),
             None => {}
         }
         self.rebuild_rows();
+    }
+
+    fn start_move(&mut self) {
+        if !self.editing() || !self.pending_changes.is_empty() {
+            return;
+        }
+        let Location::Folder {
+            server,
+            share,
+            path,
+        } = &self.location
+        else {
+            return;
+        };
+        let mut indices: Vec<_> = self.selecting.iter().flatten().copied().collect();
+        indices.sort_unstable();
+        let paths: Vec<_> = indices
+            .into_iter()
+            .filter_map(|i| {
+                let item = self.items.get(i).filter(|item| item.is_entry())?;
+                let mut source = path.clone();
+                source.push(item.name().to_string());
+                Some(source)
+            })
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        self.moving = Some(MoveSelection {
+            server: server.clone(),
+            share: share.clone(),
+            paths,
+        });
+        self.selecting = None;
+        self.edit_mode = false;
+    }
+
+    fn move_here(&mut self) {
+        if !self.editing() || !self.folder_loaded || !self.pending_changes.is_empty() {
+            return;
+        }
+        let (
+            Some(selection),
+            Location::Folder {
+                server,
+                share,
+                path,
+            },
+        ) = (&self.moving, &self.location)
+        else {
+            return;
+        };
+        if let Err(e) = selection.targets(server, share, path) {
+            self.dialog("Can't move here", vec![e]);
+            return;
+        }
+        let selection = selection.clone();
+        let destination = path.clone();
+        self.view.notice = Some(format!("Moving {} items…", selection.paths.len()));
+        let id = self.id();
+        self.move_request = Some(id);
+        self.library.send(Request::Move {
+            id,
+            selection,
+            destination,
+        });
     }
 
     /// Asks before deleting these entries.
@@ -698,8 +812,11 @@ impl Navigator {
         self.dirty = true;
     }
 
-    /// A long press on a row: edit mode with that entry selected for deleting.
+    /// A long press on a row: edit mode with that entry selected.
     pub fn long_press(&mut self, index: usize) {
+        if self.moving.is_some() || !self.pending_changes.is_empty() {
+            return;
+        }
         if !self.items.get(index).is_some_and(Item::is_entry) {
             return;
         }
@@ -1128,6 +1245,9 @@ impl Navigator {
     /// Goes up one level (or closes a dialog, form or selection). False at the top.
     pub fn back(&mut self) -> bool {
         self.dirty = true;
+        if self.move_request.is_some() {
+            return true;
+        }
         if self.view.form.is_some() && self.pending_changes.is_empty() {
             self.view.form = None;
             self.purpose = None;
@@ -1176,6 +1296,7 @@ impl Navigator {
             path: Vec::new(),
         };
         self.reset_view();
+        self.folder_loaded = true;
         self.items = names.iter().map(|n| Item::Dir(n.to_string())).collect();
         self.rebuild_rows();
     }
@@ -1184,6 +1305,151 @@ impl Navigator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn move_navigator() -> (
+        Navigator,
+        std::sync::mpsc::Receiver<Request>,
+        std::sync::mpsc::Sender<Response>,
+    ) {
+        let (library, requests, responses) = Library::for_test();
+        let mut nav = Navigator::new(library);
+        let server = Server {
+            name: "NAS".into(),
+            url: "smb://u@nas".into(),
+        };
+        nav.unlocked.insert(server.url.clone());
+        nav.show_entries_for_test(server, &["a", "b", "destination"]);
+        if let Location::Folder { path, .. } = &mut nav.location {
+            path.push("old".into());
+        }
+        nav.long_press(0);
+        nav.click(Hit::Row(1));
+        nav.click(Hit::Tool(2));
+        (nav, requests, responses)
+    }
+
+    #[test]
+    fn moving_keeps_source_paths_through_navigation_and_partial_failure() {
+        let (mut nav, requests, responses) = move_navigator();
+        let sources = vec![
+            vec!["old".to_string(), "a".to_string()],
+            vec!["old".to_string(), "b".to_string()],
+        ];
+        assert_eq!(nav.moving.as_ref().unwrap().paths, sources);
+        assert!(nav.selecting.is_none());
+        nav.click(Hit::Row(2));
+        assert_eq!(nav.view().tools.len(), 1, "only cancel while loading");
+        let Request::List { id, path, .. } = requests.try_recv().unwrap() else {
+            panic!("expected listing")
+        };
+        assert_eq!(path, vec!["old", "destination"]);
+        responses
+            .send(Response::List {
+                id,
+                result: Ok(vec![]),
+            })
+            .unwrap();
+        nav.poll();
+        assert_eq!(
+            nav.view().tools[1].label,
+            "Move here",
+            "empty folders accept moves"
+        );
+        nav.click(Hit::Tool(1));
+        let Request::Move {
+            id,
+            selection,
+            destination,
+        } = requests.try_recv().unwrap()
+        else {
+            panic!("expected move")
+        };
+        assert_eq!(selection.paths, sources);
+        assert_eq!(destination, vec!["old", "destination"]);
+        let location = nav.location.clone();
+        nav.click(Hit::Crumb(0));
+        nav.long_press(0);
+        assert!(nav.back());
+        assert_eq!(
+            nav.location, location,
+            "in-flight moves block duplicate actions"
+        );
+        assert!(requests.try_recv().is_err());
+
+        responses
+            .send(Response::Moved {
+                id,
+                result: crate::library::MoveResult {
+                    failed: vec![sources[1].clone()],
+                    errors: vec!["b: Name exists".into()],
+                },
+            })
+            .unwrap();
+        nav.poll();
+        assert_eq!(nav.moving.as_ref().unwrap().paths, vec![sources[1].clone()]);
+        assert!(nav.dialog_open());
+        let Request::List { id, .. } = requests.try_recv().unwrap() else {
+            panic!("expected refresh")
+        };
+        responses
+            .send(Response::List {
+                id,
+                result: Ok(vec![]),
+            })
+            .unwrap();
+        nav.poll();
+        nav.back();
+        nav.click(Hit::Tool(1));
+        let Request::Move { id, selection, .. } = requests.try_recv().unwrap() else {
+            panic!("expected retry")
+        };
+        assert_eq!(
+            selection.paths,
+            vec![sources[1].clone()],
+            "never retry successful moves"
+        );
+        responses
+            .send(Response::Moved {
+                id,
+                result: Default::default(),
+            })
+            .unwrap();
+        nav.poll();
+        assert!(nav.moving.is_none(), "all done");
+        assert!(nav.move_request.is_none());
+    }
+
+    #[test]
+    fn invalid_destinations_and_cancel_leave_sources_untouched() {
+        let (mut nav, requests, _) = move_navigator();
+        nav.click(Hit::Tool(1));
+        assert!(nav.dialog_open(), "source folder is a no-op");
+        assert!(requests.try_recv().is_err());
+        nav.back();
+        if let Location::Folder { share, .. } = &mut nav.location {
+            *share = "other".into();
+        }
+        nav.rebuild_rows();
+        nav.click(Hit::Tool(1));
+        assert!(nav.dialog_open(), "other shares need copy-and-delete");
+        assert!(requests.try_recv().is_err());
+        assert!(nav.moving.is_some());
+        nav.back();
+        nav.click(Hit::Tool(0));
+        assert!(nav.moving.is_none());
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn locked_destinations_cannot_start_a_move() {
+        let (mut nav, requests, _) = move_navigator();
+        nav.unlocked.clear();
+        nav.rebuild_rows();
+        assert_eq!(nav.view().tools.len(), 1, "cancel only");
+        nav.move_here();
+        assert!(nav.move_request.is_none());
+        assert!(requests.try_recv().is_err());
+    }
 
     #[test]
     fn video_extensions() {

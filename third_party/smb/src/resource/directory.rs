@@ -728,8 +728,9 @@ pub mod iter_stream {
                     }
                 }
 
-                // Notify the stream that a new batch is available
-                notify_fetch_next.notify_waiters();
+                // The channel wakes the stream when entries arrive. This
+                // notification goes only from the consumer to the fetch loop;
+                // notify_one retains it if the batch was drained before we wait.
                 notify_fetch_next.notified().await;
             }
         }
@@ -746,13 +747,79 @@ pub mod iter_stream {
             match this.receiver.poll_recv(cx) {
                 Poll::Ready(Some(value)) => {
                     if this.receiver.is_empty() {
-                        this.notify_fetch_next.notify_waiters() // Notify that batch is done
+                        this.notify_fetch_next.notify_one() // Notify that batch is done
                     }
                     Poll::Ready(Some(value))
                 }
                 Poll::Ready(None) => Poll::Ready(None), // Stream is closed!
                 Poll::Pending => Poll::Pending,
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use futures_util::{FutureExt, StreamExt};
+
+        fn entry(name: &str) -> FileNamesInformation {
+            FileNamesInformation {
+                file_index: 0,
+                file_name: name.into(),
+            }
+        }
+
+        #[tokio::test]
+        async fn drained_batch_wakes_fetcher_that_has_not_started_waiting() {
+            let query_lock = Mutex::new(());
+            let (sender, receiver) = mpsc::channel(1024);
+            let notify_fetch_next = Arc::new(tokio::sync::Notify::new());
+            let mut stream = QueryDirectoryStream {
+                receiver,
+                notify_fetch_next: notify_fetch_next.clone(),
+                _lock_guard: query_lock.lock().await.unwrap(),
+            };
+
+            for name in ["first", "second", "third"] {
+                sender.send(Ok(entry(name))).await.unwrap();
+                assert_eq!(
+                    stream.next().await.unwrap().unwrap().file_name.to_string(),
+                    name
+                );
+
+                // Force the consumer to drain the batch before the fetch loop
+                // creates its wait future, as can happen on another runtime thread.
+                tokio::time::timeout(Duration::from_millis(100), notify_fetch_next.notified())
+                    .await
+                    .expect("the next directory batch must not lose its wakeup");
+            }
+            drop(sender);
+            assert!(stream.next().await.is_none());
+        }
+
+        #[tokio::test]
+        async fn buffered_entries_do_not_request_another_batch() {
+            let query_lock = Mutex::new(());
+            let (sender, receiver) = mpsc::channel(1024);
+            let notify_fetch_next = Arc::new(tokio::sync::Notify::new());
+            let mut stream = QueryDirectoryStream {
+                receiver,
+                notify_fetch_next: notify_fetch_next.clone(),
+                _lock_guard: query_lock.lock().await.unwrap(),
+            };
+            sender.send(Ok(entry("first"))).await.unwrap();
+            sender.send(Ok(entry("second"))).await.unwrap();
+
+            stream.next().await.unwrap().unwrap();
+            assert!(notify_fetch_next.notified().now_or_never().is_none());
+
+            // The usual order (fetch loop waits before the batch drains) must
+            // still work, and only the last buffered entry should wake it.
+            let notified = notify_fetch_next.notified();
+            stream.next().await.unwrap().unwrap();
+            tokio::time::timeout(Duration::from_millis(100), notified)
+                .await
+                .expect("draining the last entry must wake the fetch loop");
         }
     }
 }

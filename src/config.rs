@@ -208,6 +208,41 @@ pub fn move_resume_position(from: &str, to: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Carries saved video settings with a moved file or an entire folder tree.
+pub fn move_file_state(from: &str, to: &str) -> anyhow::Result<()> {
+    let mut layouts: BTreeMap<String, LayoutOverride> = read_json("layouts.json")?;
+    if remap_file_keys(&mut layouts, from, to) {
+        write_json("layouts.json", &layouts, false)?;
+    }
+    let _guard = RESUME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut resumes: BTreeMap<String, Resume> = read_json("resume.json")?;
+    if remap_file_keys(&mut resumes, from, to) {
+        write_json("resume.json", &resumes, false)?;
+    }
+    Ok(())
+}
+
+fn remap_file_keys<T>(entries: &mut BTreeMap<String, T>, from: &str, to: &str) -> bool {
+    if from == to {
+        return false;
+    }
+    let keys: Vec<_> = entries
+        .keys()
+        .filter_map(|key| {
+            let suffix = key.strip_prefix(from)?;
+            (suffix.is_empty() || suffix.starts_with('/'))
+                .then(|| (key.clone(), format!("{to}{suffix}")))
+        })
+        .collect();
+    let changed = !keys.is_empty();
+    for (old, new) in keys {
+        if let Some(value) = entries.remove(&old) {
+            entries.insert(new, value);
+        }
+    }
+    changed
+}
+
 /// The place worth remembering for a video stopped at `position`: none near
 /// its start (nothing to skip) or its end (watched).
 pub fn resume_point(position: f64, duration: f64) -> Option<f64> {
@@ -291,6 +326,27 @@ pub fn save_favourite_formats(formats: &[Format]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moved_folder_keeps_descendant_settings_without_matching_sibling_prefixes() {
+        let mut entries = BTreeMap::from([
+            ("server/share/old".into(), 1),
+            ("server/share/old/nested/movie.mp4".into(), 2),
+            ("server/share/older/movie.mp4".into(), 3),
+            ("server/other/old/movie.mp4".into(), 4),
+        ]);
+        assert!(remap_file_keys(
+            &mut entries,
+            "server/share/old",
+            "server/share/new/old"
+        ));
+        assert_eq!(entries["server/share/new/old"], 1);
+        assert_eq!(entries["server/share/new/old/nested/movie.mp4"], 2);
+        assert_eq!(entries["server/share/older/movie.mp4"], 3);
+        assert_eq!(entries["server/other/old/movie.mp4"], 4);
+        assert!(!entries.contains_key("server/share/old"));
+        assert!(!remap_file_keys(&mut entries, "missing", "new"));
+    }
 
     #[test]
     fn resume_skips_start_and_end() {
