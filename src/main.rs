@@ -253,15 +253,31 @@ fn open_input(
     input: &str,
     read_ahead: ReadAhead,
 ) -> anyhow::Result<(Box<dyn Source>, Option<SmbSession>)> {
+    let (source, session, _) = open_input_watched(input, read_ahead)?;
+    Ok((source, session))
+}
+
+/// An opened input: the source, the SMB session keeping it alive, and the
+/// network reader's buffer state (none for local files).
+type Input = (
+    Box<dyn Source>,
+    Option<SmbSession>,
+    Option<just_video::readahead::BufferWatch>,
+);
+
+/// [`open_input`], plus the reader's buffer state.
+fn open_input_watched(input: &str, read_ahead: ReadAhead) -> anyhow::Result<Input> {
     if input.starts_with("smb://") {
         let session = connect(input)?;
         let path = session.url().path.clone();
         let reader = session.open(&path, read_ahead)?;
-        Ok((Box::new(reader), Some(session)))
+        let watch = reader.watch();
+        Ok((Box::new(reader), Some(session), Some(watch)))
     } else {
         let file = std::fs::File::open(input).with_context(|| format!("Open {input}"))?;
         Ok((
             Box::new(std::io::BufReader::with_capacity(1 << 20, file)),
+            None,
             None,
         ))
     }
@@ -463,7 +479,7 @@ fn main() -> anyhow::Result<()> {
             debug_view,
             read_ahead,
         } => {
-            let (source, _session) = open_input(&input, read_ahead.get())?;
+            let (source, _session, buffer) = open_input_watched(&input, read_ahead.get())?;
             let media = Media::open(file_name(&input), source)?;
             let video = media.info().video.clone();
             let assessment = playability::assess(platform, video.as_ref());
@@ -507,7 +523,10 @@ fn main() -> anyhow::Result<()> {
             } else {
                 eprintln!("Decoder: {}", decoder.stats().decoder);
             }
-            let playback = just_video::xr::player::Playback::start(decoder, layout, start, 0.7);
+            let mut playback = just_video::xr::player::Playback::start(decoder, layout, start, 0.7);
+            if let Some(buffer) = buffer {
+                playback.set_buffer(buffer);
+            }
             let stats = just_video::xr::app::run(
                 None,
                 Some(playback),
@@ -927,6 +946,7 @@ fn main() -> anyhow::Result<()> {
                 paused: true,
                 position: 754.0,
                 duration: 5530.0,
+                buffered: vec![(754.0, 790.0), (2400.0, 2460.0)],
                 has_previous: true,
                 has_next: false,
                 curved: Some(true),

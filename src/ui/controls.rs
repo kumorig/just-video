@@ -33,6 +33,7 @@ const SUBTLE: Rgb = [0x9a, 0xa0, 0xa6];
 const FAINT: Rgb = [0x4a, 0x4f, 0x58];
 const ACCENT: Rgb = [0x4f, 0x8c, 0xff];
 const TRACK: Rgb = [0x3a, 0x40, 0x4c];
+const BUFFERED: Rgb = [0x5c, 0x66, 0x78];
 const STAR: Rgb = [0xff, 0xcc, 0x00];
 
 pub type Format = (Projection, Stereo);
@@ -143,6 +144,8 @@ pub struct State {
     pub paused: bool,
     pub position: f64,
     pub duration: f64,
+    /// Stretches already fetched from the network, in seconds.
+    pub buffered: Vec<(f64, f64)>,
     pub has_previous: bool,
     pub has_next: bool,
     /// None when the curve toggle does not apply (VR180/360).
@@ -573,6 +576,20 @@ pub fn render(state: &State, fonts: &mut Fonts, hover: Hit) -> Canvas {
     } else {
         0.0
     };
+    // What is fetched already. A 32 MiB window is a sliver of a long video,
+    // so a stretch at the playhead always peeks out past the knob.
+    if state.duration > 0.0 {
+        let knob = sx + sw * fraction;
+        for &(from, to) in &state.buffered {
+            let x0 = sx + sw * (from / state.duration).clamp(0.0, 1.0) as f32;
+            let mut x1 = sx + sw * (to / state.duration).clamp(0.0, 1.0) as f32;
+            if x0 <= knob + 14.0 && x1 >= knob - 14.0 {
+                x1 = x1.max(knob + 14.0 + 8.0);
+            }
+            let w = (x1 - x0).max(6.0).min(sx + sw - x0);
+            c.rect(x0, track_y - 6.0, w, 12.0, 6.0, BUFFERED);
+        }
+    }
     c.rect(sx, track_y - 6.0, sw * fraction, 12.0, 6.0, ACCENT);
     if let Hit::Seek(f) = hover {
         c.rect(sx + sw * f - 2.0, track_y - 22.0, 4.0, 44.0, 2.0, SUBTLE);
@@ -724,6 +741,7 @@ mod tests {
             paused: false,
             position: 30.0,
             duration: 120.0,
+            buffered: vec![(30.0, 34.0)],
             has_previous: true,
             has_next: false,
             curved: Some(false),

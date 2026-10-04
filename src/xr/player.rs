@@ -96,6 +96,23 @@ mod tests {
     }
 
     #[test]
+    fn buffered_ranges_follow_the_playhead() {
+        let state = crate::readahead::Buffered {
+            position: 1_000_000,
+            len: 10_000_000,
+            ranges: vec![
+                (1_000_000, 1_500_000),
+                (1_500_000, 2_000_000),
+                (5_000_000, 5_200_000),
+            ],
+        };
+        // 100 s video: 100 000 bytes per second; playing at 12.5 s.
+        let ranges = buffered_seconds(&state, 12.5, 100.0);
+        assert_eq!(ranges, vec![(12.0, 23.0), (52.0, 55.0)]);
+        assert!(buffered_seconds(&state, 12.5, 0.0).is_empty());
+    }
+
+    #[test]
     fn tall_screens_fit_the_same_box_as_wide_ones() {
         let options = ViewOptions::default();
         let size = |tex, stereo, zoom, turns| screen_size(tex, stereo, &options, zoom, turns);
@@ -134,6 +151,33 @@ mod tests {
         let f = apply(p.rotation(), [0.0, 0.0, -1.0]);
         assert!(f[1] > 0.2, "pitch up raises the screen: {f:?}");
     }
+}
+
+/// See [`Playback::buffered`].
+fn buffered_seconds(
+    state: &crate::readahead::Buffered,
+    position: f64,
+    duration: f64,
+) -> Vec<(f64, f64)> {
+    if state.len == 0 || duration <= 0.0 {
+        return Vec::new();
+    }
+    let per_byte = duration / state.len as f64;
+    let at = |byte: u64| {
+        (position + (byte as f64 - state.position as f64) * per_byte).clamp(0.0, duration)
+    };
+    let mut out: Vec<(f64, f64)> = Vec::new();
+    for &(a, b) in &state.ranges {
+        let (from, to) = (at(a).floor(), at(b).ceil().min(duration));
+        if to <= from {
+            continue;
+        }
+        match out.last_mut() {
+            Some(last) if last.1 >= from => last.1 = last.1.max(to),
+            _ => out.push((from, to)),
+        }
+    }
+    out
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -491,6 +535,8 @@ pub struct Playback {
     clock_start: Option<i64>,
     paused_at: Option<i64>,
     pub stats: PlayStats,
+    /// The network reader's buffer, when playing from a share.
+    buffer: Option<crate::readahead::BufferWatch>,
 }
 
 impl Playback {
@@ -590,7 +636,28 @@ impl Playback {
             clock_start: None,
             paused_at: None,
             stats: PlayStats::default(),
+            buffer: None,
         }
+    }
+
+    /// Shows the network reader's buffer on the seek bar.
+    pub fn set_buffer(&mut self, buffer: crate::readahead::BufferWatch) {
+        self.buffer = Some(buffer);
+    }
+
+    /// Stretches of the video already fetched, in seconds (sorted). Bytes
+    /// map to time at the file's average rate, anchored at the playhead
+    /// (so the fetched window always starts where playback is), in whole
+    /// seconds so the bar needn't redraw for every block.
+    pub fn buffered(&self) -> Vec<(f64, f64)> {
+        let Some(buffer) = &self.buffer else {
+            return Vec::new();
+        };
+        let state = match buffer.lock() {
+            Ok(state) => state.clone(),
+            Err(_) => return Vec::new(),
+        };
+        buffered_seconds(&state, self.position(), self.duration)
     }
 
     /// Adds subtitle files found next to the video; the first one is shown

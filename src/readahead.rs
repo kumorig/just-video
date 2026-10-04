@@ -9,7 +9,7 @@ use std::{
     io::{self, Read, Seek, SeekFrom},
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -61,6 +61,18 @@ enum Block {
     Ready(Vec<u8>),
 }
 
+/// What the reader holds, for a buffer indicator: the read position, the
+/// file length and the byte ranges already fetched (sorted, disjoint).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Buffered {
+    pub position: u64,
+    pub len: u64,
+    pub ranges: Vec<(u64, u64)>,
+}
+
+/// A live view of a reader's [`Buffered`] state, shared with the UI.
+pub type BufferWatch = Arc<Mutex<Buffered>>;
+
 /// How often a read waiting for its block logs (the request itself keeps
 /// running: cancelling it would leak SMB credits).
 const BLOCK_WAIT: Duration = Duration::from_secs(10);
@@ -85,6 +97,7 @@ pub struct ReadAheadReader<S: BlockSource> {
     detached: Vec<JoinHandle<io::Result<Vec<u8>>>>,
     in_flight: Arc<AtomicUsize>,
     stats: ReadStats,
+    watch: BufferWatch,
 }
 
 impl<S: BlockSource> ReadAheadReader<S> {
@@ -100,6 +113,42 @@ impl<S: BlockSource> ReadAheadReader<S> {
             detached: Vec::new(),
             in_flight: Arc::new(AtomicUsize::new(0)),
             stats: ReadStats::default(),
+            watch: Arc::new(Mutex::new(Buffered {
+                position: 0,
+                len,
+                ranges: Vec::new(),
+            })),
+        }
+    }
+
+    /// The reader's buffer state, kept up to date as it reads.
+    pub fn watch(&self) -> BufferWatch {
+        self.watch.clone()
+    }
+
+    /// Publishes the fetched ranges (contiguous runs of ready blocks).
+    fn publish(&self) {
+        let size = self.options.block_size as u64;
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        for (&index, block) in &self.blocks {
+            if !matches!(block, Block::Ready(_)) {
+                continue;
+            }
+            let (start, end) = (index * size, ((index + 1) * size).min(self.len));
+            match ranges.last_mut() {
+                Some(last) if last.1 == start => last.1 = end,
+                _ => ranges.push((start, end)),
+            }
+        }
+        let state = Buffered {
+            position: self.pos,
+            len: self.len,
+            ranges,
+        };
+        if let Ok(mut shared) = self.watch.lock()
+            && *shared != state
+        {
+            *shared = state;
         }
     }
 
@@ -229,6 +278,7 @@ impl<S: BlockSource> Read for ReadAheadReader<S> {
         out[..n].copy_from_slice(&data[start..start + n]);
         self.pos += n as u64;
         self.stats.bytes_delivered += n as u64;
+        self.publish();
         Ok(n)
     }
 }
@@ -314,6 +364,34 @@ mod tests {
             ReadAheadReader::new(runtime, source, len as u64, options),
             data,
         )
+    }
+
+    #[test]
+    fn watch_reports_fetched_ranges() {
+        let (mut reader, _) = reader(
+            10 * 1024,
+            1,
+            ReadAhead {
+                block_size: 1024,
+                blocks_ahead: 4,
+            },
+        );
+        let watch = reader.watch();
+        assert_eq!(watch.lock().unwrap().len, 10 * 1024);
+        let mut buf = [0u8; 100];
+        reader.read_exact(&mut buf).unwrap();
+        let state = watch.lock().unwrap().clone();
+        assert_eq!(state.position, 100);
+        assert_eq!(state.ranges.first().map(|r| r.0), Some(0));
+        // Reading on waits for the rest of the window, which becomes one run.
+        std::thread::sleep(Duration::from_millis(30));
+        reader.seek(SeekFrom::Start(3000)).unwrap();
+        reader.read_exact(&mut buf).unwrap();
+        let state = watch.lock().unwrap().clone();
+        assert!(
+            state.ranges.iter().any(|&(a, b)| a <= 3000 && b >= 4096),
+            "{state:?}"
+        );
     }
 
     #[test]

@@ -834,6 +834,7 @@ pub fn run(
                         );
                     }
                     resume_saved_at = Instant::now();
+                    playback.set_buffer(opened.buffer);
                     playback.add_external_subtitles(opened.external_subtitles);
                     playback.image = opened.image;
                     renderer.set_adjust(&playback.image);
@@ -976,6 +977,7 @@ pub fn run(
                     paused: playback.paused(),
                     position: playback.position().floor(),
                     duration: playback.duration,
+                    buffered: playback.buffered(),
                     has_previous: navigator.as_ref().is_some_and(|n| n.has_adjacent(-1)),
                     has_next: navigator.as_ref().is_some_and(|n| n.has_adjacent(1)),
                     curved: curved_applies.then_some(placement.curved),
@@ -1720,6 +1722,7 @@ mod tests {
             paused: false,
             position: 754.0,
             duration: 5530.0,
+            buffered: vec![(754.0, 760.0)],
             has_previous: true,
             has_next: true,
             curved: Some(false),

@@ -130,6 +130,8 @@ pub struct Opened {
     pub image: config::ImageAdjust,
     /// Where this file was left last time (seconds), to continue from.
     pub resume: Option<f64>,
+    /// The network reader's buffer, for the seek bar.
+    pub buffer: crate::readahead::BufferWatch,
 }
 
 pub struct ExternalSubtitles {
@@ -406,6 +408,7 @@ fn run(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
                 let reader = s
                     .open_owned(&share, &smb_path(&path), ReadAhead::default())
                     .map_err(err)?;
+                let buffer = reader.watch();
                 let media =
                     Media::open(path.last().map_or("", String::as_str), reader).map_err(err)?;
                 let name = path.last().cloned().unwrap_or_default();
@@ -433,6 +436,7 @@ fn run(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
                     external_subtitles,
                     image,
                     resume,
+                    buffer,
                 }))
             });
             Response::Opened { id, result }
