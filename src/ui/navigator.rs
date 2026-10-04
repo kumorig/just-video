@@ -1,9 +1,11 @@
 //! Browser state: servers → shares → folders → videos. Talks to the
 //! [`Library`] workers and turns their results into a [`View`].
 //!
-//! Changing things is opt-in per server: its lock (on the server list)
-//! reveals Edit/Remove for the server and, inside it, Rename on every entry
-//! and a "Select" tool for moving or deleting several entries at once.
+//! Holding select on an entry enters edit mode with it selected: the header
+//! then offers Delete, Move and (for one entry) Rename, and other entries
+//! can be ticked. The pencil tool enters edit mode too, with Rename and
+//! Delete on every row. Holding select on a server reveals its Settings
+//! and Remove buttons.
 
 use super::browser::{Action, Dialog, Hit, Icon, Row, Tool, ToolIcon, View, format_size};
 use super::form::{self, Field, Form, Key};
@@ -99,6 +101,7 @@ enum ToolAction {
     CancelSelect,
     DeleteSelected,
     MoveSelected,
+    RenameSelected,
     CancelMove,
     MoveHere,
 }
@@ -121,9 +124,8 @@ pub struct Navigator {
     items: Vec<Item>,
     view: View,
     purpose: Option<Purpose>,
-    /// URLs of servers whose lock is open (this session only).
-    unlocked: HashSet<String>,
-    /// Selecting entries to move or delete: their indexes.
+    /// Selecting entries to move or delete: their indexes. On the server
+    /// list, the one server showing its Settings and Remove buttons.
     selecting: Option<HashSet<usize>>,
     /// Sources survive navigation until a destination is chosen or cancelled.
     moving: Option<MoveSelection>,
@@ -159,7 +161,6 @@ impl Navigator {
             items: Vec::new(),
             view: View::default(),
             purpose: None,
-            unlocked: HashSet::new(),
             selecting: None,
             moving: None,
             move_request: None,
@@ -219,9 +220,9 @@ impl Navigator {
         self.next_id
     }
 
-    /// Changes are allowed here (the server's lock is open, inside a share).
+    /// Files can be changed here (inside a share).
     fn editing(&self) -> bool {
-        matches!(&self.location, Location::Folder { server, .. } if self.unlocked.contains(&server.url))
+        matches!(&self.location, Location::Folder { .. })
     }
 
     fn crumbs(&self) -> Vec<String> {
@@ -357,19 +358,15 @@ impl Navigator {
             .enumerate()
             .map(|(i, item)| {
                 let mut row = match item {
-                    Item::Server(s) => {
-                        let open = self.unlocked.contains(&s.url);
-                        Row {
-                            detail: s.url.clone(),
-                            lock: Some(open),
-                            actions: if open && self.moving.is_none() {
-                                vec![Action::Edit, Action::Remove]
-                            } else {
-                                Vec::new()
-                            },
-                            ..Row::new(Icon::Server, &s.name)
-                        }
-                    }
+                    Item::Server(s) => Row {
+                        detail: s.url.clone(),
+                        actions: if selecting.is_some_and(|sel| sel.contains(&i)) {
+                            vec![Action::Settings, Action::Remove]
+                        } else {
+                            Vec::new()
+                        },
+                        ..Row::new(Icon::Server, &s.name)
+                    },
                     Item::AddServer => Row {
                         detail: "A Windows PC, NAS or Samba server on your network".into(),
                         ..Row::new(Icon::Add, "Add server")
@@ -427,13 +424,16 @@ impl Navigator {
             match &self.selecting {
                 Some(selected) => {
                     let mut tools = vec![(Tool::text("Cancel", false), ToolAction::CancelSelect)];
-                    if !selected.is_empty() {
+                    if !selected.is_empty() && editing {
                         let delete = Tool::text(format!("Delete {}", selected.len()), true);
                         tools.push((delete, ToolAction::DeleteSelected));
                         tools.push((
                             Tool::text(format!("Move {}", selected.len()), false),
                             ToolAction::MoveSelected,
                         ));
+                        if selected.len() == 1 {
+                            tools.push((Tool::text("Rename", false), ToolAction::RenameSelected));
+                        }
                     }
                     tools
                 }
@@ -610,9 +610,6 @@ impl Navigator {
                                 && *old != saved.url
                             {
                                 let _ = config::remove_server(old);
-                                if self.unlocked.remove(old) {
-                                    self.unlocked.insert(saved.url.clone());
-                                }
                             }
                             self.show_servers();
                         }
@@ -668,18 +665,10 @@ impl Navigator {
             Hit::Form(h) => self.click_form(h),
             Hit::DialogButton(i) => self.click_dialog(i),
             Hit::Crumb(i) => self.go_to_crumb(i),
-            Hit::Lock(i) => {
-                if let Some(Item::Server(s)) = self.items.get(i)
-                    && !self.unlocked.remove(&s.url)
-                {
-                    self.unlocked.insert(s.url.clone());
-                }
-                self.rebuild_rows();
-            }
             Hit::Tool(k) => self.click_tool(k),
             Hit::RowAction(i, Action::Rename) => self.start_rename(i),
             Hit::RowAction(i, Action::Delete) => self.confirm_delete(vec![i]),
-            Hit::RowAction(i, Action::Edit) => self.start_edit_server(i),
+            Hit::RowAction(i, Action::Settings) => self.start_edit_server(i),
             Hit::RowAction(i, Action::Remove) => self.confirm_remove_server(i),
             Hit::Row(i) => self.select(i),
             Hit::ScrollBar | Hit::Nothing => {}
@@ -697,6 +686,11 @@ impl Navigator {
                 self.confirm_delete(indices);
             }
             Some(ToolAction::MoveSelected) => self.start_move(),
+            Some(ToolAction::RenameSelected) => {
+                if let Some(&i) = self.selecting.iter().flatten().next() {
+                    self.start_rename(i);
+                }
+            }
             Some(ToolAction::CancelMove) => self.moving = None,
             Some(ToolAction::MoveHere) => self.move_here(),
             None => {}
@@ -812,24 +806,24 @@ impl Navigator {
         self.dirty = true;
     }
 
-    /// A long press on a row: edit mode with that entry selected.
+    /// A long press on a row: edit mode with that entry selected (a server
+    /// shows its Settings and Remove buttons).
     pub fn long_press(&mut self, index: usize) {
         if self.moving.is_some() || !self.pending_changes.is_empty() {
             return;
         }
-        if !self.items.get(index).is_some_and(Item::is_entry) {
-            return;
+        match self.items.get(index) {
+            Some(Item::Server(_)) => {
+                self.selecting = Some(HashSet::from([index]));
+            }
+            Some(item) if item.is_entry() => {
+                self.edit_mode = true;
+                self.selecting
+                    .get_or_insert_with(HashSet::new)
+                    .insert(index);
+            }
+            _ => return,
         }
-        if !self.editing() {
-            self.view.notice =
-                Some("To change files, unlock this server on the server list first.".into());
-            self.dirty = true;
-            return;
-        }
-        self.edit_mode = true;
-        self.selecting
-            .get_or_insert_with(HashSet::new)
-            .insert(index);
         self.rebuild_rows();
     }
 
@@ -902,11 +896,16 @@ impl Navigator {
 
     fn select(&mut self, index: usize) {
         if let Some(selected) = &mut self.selecting {
-            if self.items.get(index).is_some_and(Item::is_entry) && !selected.remove(&index) {
-                selected.insert(index);
+            if self.items.get(index).is_some_and(Item::is_entry) {
+                if !selected.remove(&index) {
+                    selected.insert(index);
+                }
+                self.rebuild_rows();
+                return;
             }
+            // A server's buttons close when something else is opened.
+            self.selecting = None;
             self.rebuild_rows();
-            return;
         }
         if self.pending.is_some() && !matches!(self.location, Location::Folder { .. }) {
             return;
@@ -1081,7 +1080,6 @@ impl Navigator {
             Some(Purpose::RemoveServer(index)) => {
                 if let Some(Item::Server(s)) = self.items.get(index) {
                     let url = s.url.clone();
-                    self.unlocked.remove(&url);
                     match config::remove_server(&url) {
                         Ok(_) => self.show_servers(),
                         Err(e) => self.dialog("Couldn't remove the server", vec![format!("{e:#}")]),
@@ -1317,7 +1315,6 @@ mod tests {
             name: "NAS".into(),
             url: "smb://u@nas".into(),
         };
-        nav.unlocked.insert(server.url.clone());
         nav.show_entries_for_test(server, &["a", "b", "destination"]);
         if let Location::Folder { path, .. } = &mut nav.location {
             path.push("old".into());
@@ -1441,9 +1438,9 @@ mod tests {
     }
 
     #[test]
-    fn locked_destinations_cannot_start_a_move() {
+    fn unloaded_destinations_cannot_start_a_move() {
         let (mut nav, requests, _) = move_navigator();
-        nav.unlocked.clear();
+        nav.folder_loaded = false;
         nav.rebuild_rows();
         assert_eq!(nav.view().tools.len(), 1, "cancel only");
         nav.move_here();
@@ -1468,21 +1465,13 @@ mod tests {
     }
 
     #[test]
-    fn server_lock_enables_rename_and_multi_delete() {
+    fn edit_mode_enables_rename_and_multi_delete() {
         let mut nav = Navigator::new(Library::start(None));
         let server = Server {
             name: "NAS".into(),
             url: "smb://u@nas".into(),
         };
         nav.show_entries_for_test(server.clone(), &["a", "b", "c"]);
-        assert!(
-            nav.view().rows.iter().all(|r| r.actions.is_empty()),
-            "locked: read only"
-        );
-        assert!(nav.view().tools.is_empty());
-
-        nav.unlocked.insert(server.url.clone());
-        nav.rebuild_rows();
         assert!(
             nav.view().rows[0].actions.is_empty(),
             "rename/delete wait for edit mode"
@@ -1513,6 +1502,45 @@ mod tests {
 
         nav.long_press(1);
         assert_eq!(nav.view().rows[1].checked, Some(true), "long press selects");
+        let labels: Vec<&str> = nav.view().tools.iter().map(|t| t.label.as_str()).collect();
+        assert_eq!(labels, ["Cancel", "Delete 1", "Move 1", "Rename"]);
+        nav.click(Hit::Tool(3));
+        assert!(matches!(nav.purpose, Some(Purpose::Rename(1))));
+        assert_eq!(nav.view().form.as_ref().map(|f| f.value(0)), Some("b"));
+    }
+
+    #[test]
+    fn holding_a_server_reveals_its_buttons() {
+        let mut nav = Navigator::new(Library::start(None));
+        nav.items = vec![
+            Item::Server(Server {
+                name: "NAS".into(),
+                url: "smb://u@nas".into(),
+            }),
+            Item::Server(Server {
+                name: "PC".into(),
+                url: "smb://u@pc".into(),
+            }),
+            Item::AddServer,
+        ];
+        nav.rebuild_rows();
+        assert!(nav.view().rows.iter().all(|r| r.actions.is_empty()));
+        nav.long_press(1);
+        assert_eq!(
+            nav.view().rows[1].actions,
+            vec![Action::Settings, Action::Remove]
+        );
+        assert!(nav.view().rows[0].actions.is_empty());
+        assert!(nav.view().rows.iter().all(|r| r.checked.is_none()));
+        assert_eq!(nav.view().tools.len(), 1, "cancel");
+        nav.click(Hit::RowAction(1, Action::Settings));
+        assert!(matches!(nav.purpose, Some(Purpose::EditServer(ref u)) if u == "smb://u@pc"));
+        nav.back();
+        nav.long_press(1);
+        assert!(nav.back(), "B closes the buttons");
+        assert!(nav.view().rows[1].actions.is_empty());
+        nav.long_press(2);
+        assert!(nav.selecting.is_none(), "nothing to hold on Add server");
     }
 
     #[test]

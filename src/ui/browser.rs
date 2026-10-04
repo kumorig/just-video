@@ -13,8 +13,7 @@ const ROW: f32 = 88.0;
 const PAD: f32 = 32.0;
 const CRUMB_SIZE: f32 = 40.0;
 const CRUMB_SEP: &str = "  ›  ";
-/// Unlock button and row actions, from the right edge of a row.
-const LOCK_W: f32 = 76.0;
+/// Row actions, from the right edge of a row.
 const ACTION_W: f32 = 150.0;
 const ICON_ACTION_W: f32 = 84.0;
 /// The scrollbar's grab zone at the right edge of the list.
@@ -59,7 +58,8 @@ pub enum Action {
     Rename,
     /// Delete a file or folder.
     Delete,
-    Edit,
+    /// A server's address, login and name.
+    Settings,
     /// Remove a saved server.
     Remove,
 }
@@ -82,7 +82,7 @@ impl Action {
         match self {
             Action::Rename => "Rename",
             Action::Delete => "Delete",
-            Action::Edit => "Edit",
+            Action::Settings => "Settings",
             Action::Remove => "Remove",
         }
     }
@@ -94,8 +94,6 @@ pub struct Row {
     pub label: String,
     pub detail: String,
     pub right: String,
-    /// A lock toggle (servers): `Some(unlocked)`.
-    pub lock: Option<bool>,
     /// Buttons at the right end, left to right.
     pub actions: Vec<Action>,
     /// A checkbox in place of the icon (selecting what to delete).
@@ -113,7 +111,6 @@ impl Row {
             label: label.into(),
             detail: String::new(),
             right: String::new(),
-            lock: None,
             actions: Vec::new(),
             checked: None,
             dimmed: false,
@@ -199,7 +196,6 @@ pub struct View {
 pub enum Hit {
     Row(usize),
     Crumb(usize),
-    Lock(usize),
     RowAction(usize, Action),
     Tool(usize),
     /// The scrollbar: scroll with [`scroll_at`].
@@ -300,19 +296,10 @@ fn row_rect(view: &View, i: usize) -> Rect {
     (PAD, y + 4.0, WIDTH as f32 - 2.0 * PAD - SCROLL_W, ROW - 8.0)
 }
 
-fn lock_rect(view: &View, i: usize) -> Rect {
-    let (x, y, w, h) = row_rect(view, i);
-    (x + w - LOCK_W - 8.0, y + 6.0, LOCK_W, h - 12.0)
-}
-
-/// The `k`th action button of row `i` (buttons sit left of the lock, if any).
+/// The `k`th action button of row `i`.
 fn action_rect(view: &View, i: usize, k: usize) -> Rect {
     let (x, y, w, h) = row_rect(view, i);
-    let right = if view.rows[i].lock.is_some() {
-        lock_rect(view, i).0 - 10.0
-    } else {
-        x + w - 8.0
-    };
+    let right = x + w - 8.0;
     let actions = &view.rows[i].actions;
     let from_right: f32 = actions[k..].iter().map(|a| a.width() + 10.0).sum();
     (
@@ -363,9 +350,6 @@ pub fn hit(view: &View, fonts: &mut Fonts, x: f32, y: f32) -> Hit {
     }
     let i = index as usize;
     let row = &view.rows[i];
-    if row.lock.is_some() && inside(lock_rect(view, i), x, y) {
-        return Hit::Lock(i);
-    }
     for (k, action) in row.actions.iter().enumerate() {
         if inside(action_rect(view, i, k), x, y) {
             return Hit::RowAction(i, *action);
@@ -458,24 +442,6 @@ fn draw_checkbox(canvas: &mut Canvas, cx: f32, cy: f32, checked: bool) {
     }
 }
 
-/// A padlock, open or closed.
-fn draw_lock(canvas: &mut Canvas, cx: f32, cy: f32, open: bool, color: Rgb) {
-    canvas.rect(cx - 16.0, cy - 2.0, 32.0, 24.0, 5.0, color);
-    let shackle_x = if open { cx + 2.0 } else { cx - 11.0 };
-    // Shackle: an arch from two posts and a top bar.
-    canvas.rect(shackle_x, cy - 20.0, 5.0, 20.0, 2.0, color);
-    canvas.rect(
-        shackle_x + 17.0,
-        cy - (if open { 26.0 } else { 20.0 }),
-        5.0,
-        if open { 14.0 } else { 20.0 },
-        2.0,
-        color,
-    );
-    canvas.rect(shackle_x, cy - 22.0, 22.0, 5.0, 2.0, color);
-    canvas.circle(cx, cy + 9.0, 3.5, BG);
-}
-
 /// Renders the panel; `pointer` highlights what it hovers and, with
 /// `draw_cursor`, marks its position (previews; the headset has a cursor layer).
 pub fn render(
@@ -533,29 +499,6 @@ pub fn render(
                 None => draw_icon(&mut canvas, &row.icon, icon_x, icon_y),
             }
             let mut right_edge = rx + rw - 24.0;
-            if let Some(unlocked) = row.lock {
-                let lock = lock_rect(view, i);
-                let lock_hover = hover == Some(Hit::Lock(i));
-                if lock_hover || unlocked {
-                    let fill = if unlocked { [0x3a, 0x2c, 0x14] } else { HOVER };
-                    canvas.rect(lock.0, lock.1, lock.2, lock.3, 12.0, fill);
-                }
-                let color = if unlocked {
-                    ORANGE
-                } else if lock_hover {
-                    TEXT
-                } else {
-                    FAINT
-                };
-                draw_lock(
-                    &mut canvas,
-                    lock.0 + lock.2 / 2.0,
-                    lock.1 + lock.3 / 2.0 + 2.0,
-                    unlocked,
-                    color,
-                );
-                right_edge = lock.0 - 16.0;
-            }
             for (k, action) in row.actions.iter().enumerate() {
                 let (ax, ay, aw, ah) = action_rect(view, i, k);
                 let color = if matches!(action, Action::Remove | Action::Delete) {
@@ -591,8 +534,8 @@ pub fn render(
                     right_edge = ax - 16.0;
                 }
             }
-            let unlocked = !row.actions.is_empty();
-            let right_w = if row.right.is_empty() || unlocked {
+            let has_actions = !row.actions.is_empty();
+            let right_w = if row.right.is_empty() || has_actions {
                 0.0
             } else {
                 fonts.measure(&row.right, 28.0) + 24.0
@@ -885,17 +828,11 @@ mod tests {
     }
 
     #[test]
-    fn locks_actions_and_tools() {
+    fn row_actions_and_tools() {
         let mut view = view();
         let mut fonts = Fonts::load().expect("fonts");
-        view.rows[2].lock = Some(true);
-        view.rows[2].actions = vec![Action::Edit, Action::Remove];
-        let (x, y, w, h) = lock_rect(&view, 2);
-        assert_eq!(
-            hit(&view, &mut fonts, x + w / 2.0, y + h / 2.0),
-            Hit::Lock(2)
-        );
-        for (k, action) in [Action::Edit, Action::Remove].into_iter().enumerate() {
+        view.rows[2].actions = vec![Action::Settings, Action::Remove];
+        for (k, action) in [Action::Settings, Action::Remove].into_iter().enumerate() {
             let (ax, ay, aw, ah) = action_rect(&view, 2, k);
             assert_eq!(
                 hit(&view, &mut fonts, ax + aw / 2.0, ay + ah / 2.0),

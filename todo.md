@@ -3,7 +3,7 @@
 - [x] Investigate browsing failures that force a 15-second wait. Fixed a lost directory-batch wakeup that stalled browsing until the timeout.
 - [x] Try attaching the controls to the bottom of the video screen; they are currently too close. The bar now hangs just under a flat or curved screen at its depth (facing the viewer) and follows it when moved, zoomed or curved; VR180/360 keep the bar ahead of the head.
 - [x] Allow zooming out further, at least when rotated. Is the limit based on width? It was: the screen width was fixed and only the height followed the aspect, so a rotated 16:9 was 5.7 m tall. Screens now fit a 4:3 box (tall ones are limited by height) and zoom goes down to 0.25× (0.8 m wide).
-- [ ] Allow editing without the top-level toggle. Rename "Edit" on the top-level server item. Hold to enable edit mode and keep the item selected.
+- [x] Allow editing without the top-level toggle. Rename "Edit" on the top-level server item. Hold to enable edit mode and keep the item selected. The server lock is gone: holding an entry enters edit mode with it selected (Delete, Move and, for one entry, Rename in the header); holding a server shows its Settings and Remove buttons.
 - [ ] Investigate sharpening or anti-aliasing. Pixels are very visible at the edges of the screen.
 - [ ] Add a 1 px high progress bar while browsing, and consider a cancel button.
 - [ ] Show buffered ranges on the time-seek bar. This may require reworking the seek bar completely.

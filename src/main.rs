@@ -852,16 +852,14 @@ fn main() -> anyhow::Result<()> {
                 rows: vec![
                     Row {
                         detail: "smb://user@192.168.1.10".into(),
-                        lock: Some(true),
                         actions: vec![
-                            just_video::ui::browser::Action::Edit,
+                            just_video::ui::browser::Action::Settings,
                             just_video::ui::browser::Action::Remove,
                         ],
                         ..Row::new(Icon::Server, "NAS")
                     },
                     Row {
                         detail: "smb://user@10.0.0.2".into(),
-                        lock: Some(false),
                         ..Row::new(Icon::Server, "PC")
                     },
                     Row {
