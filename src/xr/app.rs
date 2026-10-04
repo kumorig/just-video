@@ -194,7 +194,7 @@ fn screen_controls_panel(placement: &Placement, screen: [f32; 2]) -> Panel {
     };
     let [_, up, normal] = base.basis();
     Panel {
-        center: [0, 1, 2].map(|i| up[i] * y - normal[i] * depth),
+        center: [0, 1, 2].map(|i| placement.pivot[i] + up[i] * y - normal[i] * depth),
         // Turned up (down above eye level) to face the viewer.
         tilt: placement.pitch + y.atan2(depth),
         ..base
@@ -400,7 +400,7 @@ fn caption_panel(
         pixels: [captions::WIDTH, captions::HEIGHT],
     };
     let [_, up, normal] = panel.basis();
-    panel.center = [0, 1, 2].map(|i| up[i] * y - normal[i] * depth);
+    panel.center = [0, 1, 2].map(|i| placement.pivot[i] + up[i] * y - normal[i] * depth);
     panel
 }
 
@@ -466,7 +466,7 @@ fn screen_outline(placement: &Placement, screen: [f32; 2], t: f32) -> Vec<Line> 
     let r = placement.distance;
     if !placement.curved {
         let panel = Panel {
-            center: scale(normal, -r),
+            center: placement.center(),
             ..base
         };
         return panel_outline(&panel, t);
@@ -474,8 +474,11 @@ fn screen_outline(placement: &Placement, screen: [f32; 2], t: f32) -> Vec<Line> 
     // A point on the curved screen `angle` to the right, `y` up, facing the viewer.
     let at = |angle: f32, y: f32| -> xr::Posef {
         let p = add(
-            add(scale(right, r * angle.sin()), scale(up, y)),
-            scale(normal, -r * angle.cos()),
+            placement.pivot,
+            add(
+                add(scale(right, r * angle.sin()), scale(up, y)),
+                scale(normal, -r * angle.cos()),
+            ),
         );
         let (s, c) = (-angle / 2.0).sin_cos();
         let turn = xr::Quaternionf {
@@ -518,10 +521,22 @@ fn video_hit(
     screen: [f32; 2],
 ) -> Option<[f32; 3]> {
     let r = placement.rotation();
-    // Into the placement's frame (Rᵀ·v).
+    // Into the placement's frame (Rᵀ·v), relative to its pivot.
     let local = |v: [f32; 3]| [0, 1, 2].map(|i| (0..3).map(|k| r[i][k] * v[k]).sum::<f32>());
-    let world = |v: [f32; 3]| [0, 1, 2].map(|i| (0..3).map(|k| r[k][i] * v[k]).sum::<f32>());
-    let (o, d) = (local(ray.origin), local(ray.direction));
+    let world = |v: [f32; 3]| {
+        add(
+            placement.pivot,
+            [0, 1, 2].map(|i| (0..3).map(|k| r[k][i] * v[k]).sum::<f32>()),
+        )
+    };
+    let (o, d) = (
+        local([
+            ray.origin[0] - placement.pivot[0],
+            ray.origin[1] - placement.pivot[1],
+            ray.origin[2] - placement.pivot[2],
+        ]),
+        local(ray.direction),
+    );
     let (w, h) = (screen[0], screen[1]);
     let p = match projection {
         Projection::Flat if placement.curved => {
@@ -596,6 +611,19 @@ fn spawn_watchdog(heartbeat: Arc<AtomicI64>, phase: Arc<AtomicU8>, quit: Arc<Ato
                 }
             }
         });
+}
+
+/// Between the eyes (the reference space's origin when nothing is tracked).
+fn head_position(views: &[xr::View]) -> [f32; 3] {
+    if views.is_empty() {
+        return [0.0; 3];
+    }
+    let mut sum = [0.0f32; 3];
+    for v in views {
+        let p = v.pose.position;
+        sum = add(sum, [p.x, p.y, p.z]);
+    }
+    scale(sum, 1.0 / views.len() as f32)
 }
 
 fn aim_angles(ray: &Ray) -> (f32, f32) {
@@ -1064,12 +1092,15 @@ pub fn run(
                             if !p.dragging
                                 && (dyaw.abs() > DRAG_THRESHOLD || dpitch.abs() > DRAG_THRESHOLD)
                             {
-                                // Start from here, so the screen doesn't jump by the threshold.
+                                // Start from here, so the screen doesn't jump by the
+                                // threshold, and orbit the head where it is now.
                                 p.dragging = true;
+                                placement.anchor_at(head_position(&views));
                                 (p.yaw, p.pitch, p.start) = (yaw, pitch, placement);
                             } else if p.dragging {
                                 placement.yaw = p.start.yaw + dyaw;
-                                placement.pitch = (p.start.pitch + dpitch).clamp(-1.3, 1.3);
+                                placement.pitch = (p.start.pitch + dpitch)
+                                    .clamp(-super::player::MAX_PITCH, super::player::MAX_PITCH);
                                 // The stick pushes the screen away or pulls it closer.
                                 if buttons.scroll.abs() > 0.2 {
                                     placement.distance = (placement.distance
@@ -1239,8 +1270,10 @@ pub fn run(
                     controls_drawn = None;
                 }
                 if buttons.reset {
+                    // Ahead of the head, wherever it is now.
                     placement = Placement {
                         curved: placement.curved,
+                        pivot: head_position(&views),
                         ..Placement::new(&options.view)
                     };
                     press = None;
@@ -1576,6 +1609,7 @@ mod tests {
             distance: 3.0,
             curved: true,
             zoom: 1.0,
+            pivot: [0.0; 3],
         };
         let lines = screen_outline(&placement, [4.0, 2.25], 0.01);
         for (pose, _) in &lines {
@@ -1603,6 +1637,7 @@ mod tests {
                 distance: 3.0,
                 curved,
                 zoom,
+                pivot: [0.0; 3],
             };
             let screen = [3.2 * zoom, 1.8 * zoom];
             let bar = screen_controls_panel(&placement, screen);
@@ -1758,6 +1793,7 @@ mod tests {
                 distance: options.screen_distance,
                 curved,
                 zoom,
+                pivot: [0.0; 3],
             };
             let screen = screen_size((1920, 1080), crate::vr::Stereo::Mono, &options, zoom, turns);
             let captions = caption_panel(&placement, Projection::Flat, screen, Default::default());

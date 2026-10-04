@@ -42,7 +42,7 @@ impl Default for ViewOptions {
 /// Where the video is placed around the viewer (changed by dragging).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Placement {
-    /// Rotation around the viewer: yaw (left/right) and pitch (up/down), radians.
+    /// Rotation around the pivot: yaw (left/right) and pitch (up/down), radians.
     pub yaw: f32,
     pub pitch: f32,
     /// Flat/curved screen distance in metres.
@@ -50,7 +50,15 @@ pub struct Placement {
     pub curved: bool,
     /// Size multiplier: screen width for flat/curved, magnification for VR180/360.
     pub zoom: f32,
+    /// The point the screen orbits: where the head was when it was last
+    /// placed or dragged (the reference space's origin is wherever the head
+    /// was at the start, which is no use once the viewer has lain down).
+    pub pivot: [f32; 3],
 }
+
+/// Steepest pitch: nearly overhead or underfoot, short of the pole where
+/// yaw would lose its meaning.
+pub const MAX_PITCH: f32 = 1.5;
 
 impl Placement {
     pub fn new(options: &ViewOptions) -> Self {
@@ -60,7 +68,35 @@ impl Placement {
             distance: options.screen_distance,
             curved: false,
             zoom: 1.0,
+            pivot: [0.0; 3],
         }
+    }
+
+    /// Where the flat screen's centre is.
+    pub fn center(&self) -> [f32; 3] {
+        let r = self.rotation();
+        [0, 1, 2].map(|i| self.pivot[i] - self.distance * r[2][i])
+    }
+
+    /// Makes `head` the pivot, keeping the screen where it is (so it turns
+    /// to face the viewer from now on, and dragging orbits them, not a
+    /// point they have moved away from).
+    pub fn anchor_at(&mut self, head: [f32; 3]) {
+        let c = self.center();
+        let v = [c[0] - head[0], c[1] - head[1], c[2] - head[2]];
+        let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        if len < 0.3 {
+            // Standing in the screen: just move the pivot.
+            self.pivot = head;
+            return;
+        }
+        self.yaw = (-v[0]).atan2(-v[2]);
+        self.pitch = (v[1] / len)
+            .clamp(-1.0, 1.0)
+            .asin()
+            .clamp(-MAX_PITCH, MAX_PITCH);
+        self.distance = len.max(0.8);
+        self.pivot = head;
     }
 
     /// Rotation matrix (columns) of the placement: yaw about +Y, then pitch about +X.
@@ -93,6 +129,33 @@ mod tests {
 
     fn apply(m: [[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
         [0, 1, 2].map(|i| (0..3).map(|k| m[k][i] * v[k]).sum())
+    }
+
+    #[test]
+    fn anchoring_keeps_the_screen_in_place() {
+        let mut p = Placement {
+            yaw: 0.4,
+            pitch: 0.2,
+            distance: 3.0,
+            curved: false,
+            zoom: 1.0,
+            pivot: [0.0; 3],
+        };
+        let before = p.center();
+        // The viewer has lain down: 1 m lower, half a metre forward.
+        p.anchor_at([0.0, -1.0, -0.5]);
+        let after = p.center();
+        for i in 0..3 {
+            assert!(
+                (before[i] - after[i]).abs() < 1e-4,
+                "{before:?} vs {after:?}"
+            );
+        }
+        assert_eq!(p.pivot, [0.0, -1.0, -0.5]);
+        // Dragging straight up from here reaches overhead.
+        p.pitch = MAX_PITCH;
+        let c = p.center();
+        assert!(c[1] - p.pivot[1] > 2.9, "{c:?}");
     }
 
     #[test]
@@ -142,6 +205,7 @@ mod tests {
             distance: 3.0,
             curved: false,
             zoom: 1.0,
+            pivot: [0.0; 3],
         };
         // Yaw 90° (left) moves the screen's forward (-Z) to -X.
         let f = apply(p.rotation(), [0.0, 0.0, -1.0]);
@@ -1038,7 +1102,12 @@ pub fn eye_params(
     // fixed there, so rotating the placement moves the video around the viewer.
     let placed = placement.rotation();
     let p = view.pose.position;
-    let origin = mat_mul_t(placed, [[p.x, p.y, p.z, 0.0], [0.0; 4], [0.0; 4]])[0];
+    let [px, py, pz] = [
+        p.x - placement.pivot[0],
+        p.y - placement.pivot[1],
+        p.z - placement.pivot[2],
+    ];
+    let origin = mat_mul_t(placed, [[px, py, pz, 0.0], [0.0; 4], [0.0; 4]])[0];
     let curved = layout.projection == Projection::Flat && placement.curved;
     EyeParams {
         rot: mat_mul_t(placed, quat_to_columns(view.pose.orientation)),
