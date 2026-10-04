@@ -127,17 +127,67 @@ impl Panel {
     }
 }
 
+/// The browser starts 2.2 m ahead: far enough that pointing needs only
+/// small hand movements, and scaled to look as big as 1.6 × 1.0 m at 1.5 m.
 const BROWSER_DISTANCE: f32 = 2.2;
+const BROWSER_SIZE: [f32; 2] = [2.347, 1.467];
 
-/// The browser 2.2 m ahead: far enough that pointing needs only small hand
-/// movements, and scaled to look as big as 1.6 × 1.0 m at 1.5 m.
-const BROWSER_PANEL: Panel = Panel {
-    center: [0.0, -0.147, -BROWSER_DISTANCE],
-    yaw: 0.0,
-    tilt: 0.0,
-    size: [2.347, 1.467],
-    pixels: [browser::WIDTH, browser::HEIGHT],
-};
+/// Where the browser starts: a little below eye level.
+fn browser_placement(pivot: [f32; 3]) -> Placement {
+    Placement {
+        yaw: 0.0,
+        pitch: (-0.147f32).atan2(BROWSER_DISTANCE),
+        distance: BROWSER_DISTANCE,
+        curved: false,
+        zoom: 1.0,
+        pivot,
+    }
+}
+
+/// The browser panel where it has been dragged, facing its pivot and
+/// keeping its apparent size at any distance.
+fn browser_panel(place: &Placement) -> Panel {
+    let s = place.distance / BROWSER_DISTANCE;
+    Panel {
+        center: place.center(),
+        yaw: place.yaw,
+        tilt: place.pitch,
+        size: [BROWSER_SIZE[0] * s, BROWSER_SIZE[1] * s],
+        pixels: [browser::WIDTH, browser::HEIGHT],
+    }
+}
+
+/// The handle below the browser (a white bar, as under the Steam
+/// dashboard): point at it and hold select to move the browser.
+fn handle_panel(browser: &Panel) -> Panel {
+    let width = browser.size[0] * 0.22;
+    let height = width * HANDLE_PX[1] as f32 / HANDLE_PX[0] as f32;
+    let [_, up, _] = browser.basis();
+    let drop = browser.size[1] / 2.0 + browser.size[1] * 0.035 + height / 2.0;
+    Panel {
+        center: [0, 1, 2].map(|i| browser.center[i] - up[i] * drop),
+        size: [width, height],
+        pixels: HANDLE_PX,
+        ..*browser
+    }
+}
+
+const HANDLE_PX: [u32; 2] = [256, 32];
+
+/// A white pill with premultiplied alpha, for the browser's handle.
+fn handle_image(opacity: f32) -> Vec<u8> {
+    let mut c = crate::ui::canvas::Canvas::new(HANDLE_PX[0], HANDLE_PX[1]);
+    c.translucent_rect(
+        0.0,
+        0.0,
+        HANDLE_PX[0] as f32,
+        HANDLE_PX[1] as f32,
+        HANDLE_PX[1] as f32 / 2.0,
+        [0xff, 0xff, 0xff],
+        opacity,
+    );
+    c.pixels
+}
 
 /// Preferred distance of the control bar; it looks as big as 1.2 m wide at 1 m.
 const CONTROLS_DISTANCE: f32 = 1.8;
@@ -680,6 +730,12 @@ pub fn run(
     let mut caption_edit = false;
     let mut cursor = renderer.create_quad(&ctx, CURSOR_PX, CURSOR_PX)?;
     renderer.upload_quad(&mut cursor, &cursor_image())?;
+    // The browser's handle, and a brighter one while pointed at or held.
+    let mut handle = renderer.create_quad(&ctx, HANDLE_PX[0], HANDLE_PX[1])?;
+    renderer.upload_quad(&mut handle, &handle_image(0.55))?;
+    let mut handle_hot = renderer.create_quad(&ctx, HANDLE_PX[0], HANDLE_PX[1])?;
+    renderer.upload_quad(&mut handle_hot, &handle_image(1.0))?;
+    let mut handle_lit = false;
 
     let mut mode = match initial {
         Some(playback) => Mode::Playing(Box::new(playback)),
@@ -696,6 +752,7 @@ pub fn run(
     let mut resume_saved_at = Instant::now();
     let mut screenshot = options.play.screenshot.clone();
     let mut placement = Placement::new(&options.view);
+    let mut browser_place = browser_placement([0.0; 3]);
     let mut controls_panel_at: Option<Panel> = None;
     let mut controls_drawn: Option<(controls::State, controls::Hit)> = None;
     let mut press: Option<Press> = None;
@@ -873,12 +930,75 @@ pub fn run(
                         .end(state.predicted_display_time, ctx.blend_mode, &[])?;
                     continue;
                 }
-                let point = ray.and_then(|r| BROWSER_PANEL.hit(r));
+                let browser_at = browser_panel(&browser_place);
+                let handle_at = handle_panel(&browser_at);
+                let point = ray.and_then(|r| browser_at.hit(r));
+                let on_handle = ray.and_then(|r| handle_at.hit(r));
+                // Moving the browser: select held on its handle, or the grip
+                // held while pointing at it. The stick then moves it nearer
+                // or farther; a thumbstick click puts it back ahead.
+                if buttons.reset {
+                    browser_place = browser_placement(head_position(&views));
+                    press = None;
+                }
+                let grab = (on_handle.is_some() && buttons.select[active_hand])
+                    || (buttons.grip && (point.is_some() || on_handle.is_some()));
+                if grab
+                    && press.is_none()
+                    && browser_press.is_none()
+                    && let Some(r) = buttons.rays[active_hand].as_ref()
+                {
+                    let (yaw, pitch) = aim_angles(r);
+                    // From the handle it moves at once; by grip after a small move.
+                    let dragging = on_handle.is_some() && buttons.select[active_hand];
+                    if dragging {
+                        browser_place.anchor_at(head_position(&views));
+                    }
+                    press = Some(Press {
+                        hand: active_hand,
+                        since: now,
+                        yaw,
+                        pitch,
+                        start: browser_place,
+                        dragging,
+                    });
+                }
+                let mut moving = false;
+                if let Some(p) = &mut press {
+                    let held = buttons.select_held[p.hand] || buttons.grip;
+                    match (held, buttons.rays[p.hand].as_ref()) {
+                        (true, Some(r)) => {
+                            let (yaw, pitch) = aim_angles(r);
+                            let (dyaw, dpitch) = (wrap_angle(yaw - p.yaw), pitch - p.pitch);
+                            if !p.dragging
+                                && (dyaw.abs() > DRAG_THRESHOLD || dpitch.abs() > DRAG_THRESHOLD)
+                            {
+                                p.dragging = true;
+                                browser_place.anchor_at(head_position(&views));
+                                (p.yaw, p.pitch, p.start) = (yaw, pitch, browser_place);
+                            } else if p.dragging {
+                                browser_place.yaw = p.start.yaw + dyaw;
+                                browser_place.pitch = (p.start.pitch + dpitch)
+                                    .clamp(-super::player::MAX_PITCH, super::player::MAX_PITCH);
+                                if buttons.scroll.abs() > 0.2 {
+                                    browser_place.distance = (browser_place.distance
+                                        + buttons.scroll * 1.5 * dt)
+                                        .clamp(1.0, 6.0);
+                                }
+                            }
+                            moving = p.dragging;
+                        }
+                        _ => press = None,
+                    }
+                }
+                handle_lit = on_handle.is_some() || moving;
+                let point = if press.is_some() { None } else { point };
                 let hit = point.map_or(browser::Hit::Nothing, |(x, y)| {
                     browser::hit(nav.view(), &mut fonts, x, y)
                 });
                 if buttons.select[active_hand]
                     && browser_press.is_none()
+                    && press.is_none()
                     && let Some((_, y)) = point
                 {
                     browser_press = Some(BrowserPress {
@@ -927,7 +1047,7 @@ pub fn run(
                 if buttons.back {
                     nav.back();
                 }
-                if buttons.scroll.abs() > 0.2 {
+                if buttons.scroll.abs() > 0.2 && !moving {
                     // Holding the grip scrolls four times faster.
                     let speed = if buttons.grip { 48.0 } else { 12.0 };
                     nav.scroll_by(-buttons.scroll * speed * dt);
@@ -942,7 +1062,9 @@ pub fn run(
                     renderer.upload_quad(target, &canvas.pixels)?;
                 }
                 if let Some((x, y)) = point {
-                    cursor_at = Some((BROWSER_PANEL, x, y));
+                    cursor_at = Some((browser_at, x, y));
+                } else if let Some((x, y)) = on_handle.filter(|_| !moving) {
+                    cursor_at = Some((handle_at, x, y));
                 }
                 // A thin bar under the header: filling as videos are checked,
                 // or sweeping while something with no known end runs.
@@ -955,11 +1077,11 @@ pub fn run(
                         }
                     };
                     let (x, y, w, h) = browser::progress_rect(from, to);
-                    let p = BROWSER_PANEL.point(x + w / 2.0, y + h / 2.0, 0.003);
-                    let scale = BROWSER_PANEL.size[0] / BROWSER_PANEL.pixels[0] as f32;
+                    let p = browser_at.point(x + w / 2.0, y + h / 2.0, 0.003);
+                    let scale = browser_at.size[0] / browser_at.pixels[0] as f32;
                     (
                         xr::Posef {
-                            orientation: BROWSER_PANEL.orientation(),
+                            orientation: browser_at.orientation(),
                             position: xr::Vector3f {
                                 x: p[0],
                                 y: p[1],
@@ -1424,8 +1546,12 @@ pub fn run(
         let mut quads: Vec<(&QuadTarget, xr::Posef, [f32; 2], bool)> = Vec::new();
         match &mode {
             Mode::Browser => {
+                let browser_at = browser_panel(&browser_place);
                 if let Some(target) = browser_target.as_ref().filter(|t| t.ready) {
-                    quads.push((target, BROWSER_PANEL.pose(), BROWSER_PANEL.size, false));
+                    quads.push((target, browser_at.pose(), browser_at.size, false));
+                    let bar = handle_panel(&browser_at);
+                    let image = if handle_lit { &handle_hot } else { &handle };
+                    quads.push((image, bar.pose(), bar.size, true));
                 }
                 if let Some((pose, size)) = progress_at.filter(|(_, s)| s[0] > 0.0) {
                     quads.push((&progress_line, pose, size, true));
@@ -1806,6 +1932,28 @@ mod tests {
                 &[(captions, &caption, true), (bar_panel, &bar, false)],
             );
         }
+    }
+
+    #[test]
+    fn browser_handle_hangs_below_the_panel() {
+        let mut place = browser_placement([0.0, 1.6, 0.0]);
+        place.yaw = 0.5;
+        place.distance = 3.3;
+        let panel = browser_panel(&place);
+        // Apparent size is kept: 1.5x the distance, 1.5x the size.
+        assert!((panel.size[0] - BROWSER_SIZE[0] * 1.5).abs() < 1e-3);
+        let handle = handle_panel(&panel);
+        let [_, up, normal] = panel.basis();
+        let d = [0, 1, 2].map(|i| handle.center[i] - panel.center[i]);
+        assert!(dot(d, up) < -panel.size[1] / 2.0, "below the bottom edge");
+        assert!(dot(d, normal).abs() < 1e-4, "in the panel's plane");
+        assert!(handle.size[0] < panel.size[0] / 3.0);
+        // It faces the pivot (the head).
+        let to_head = scale(
+            [0, 1, 2].map(|i| place.pivot[i] - panel.center[i]),
+            1.0 / place.distance,
+        );
+        assert!(dot(normal, to_head) > 0.999, "{normal:?} vs {to_head:?}");
     }
 
     #[test]
