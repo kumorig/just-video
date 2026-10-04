@@ -23,6 +23,8 @@ pub struct XrContext {
     pub session: xr::Session<xr::Vulkan>,
     pub frame_waiter: xr::FrameWaiter,
     pub frame_stream: xr::FrameStream<xr::Vulkan>,
+    /// XR_KHR_composition_layer_cylinder: overlays can bend with a curved screen.
+    pub cylinder_layers: bool,
 }
 
 impl XrContext {
@@ -35,6 +37,16 @@ impl XrContext {
         );
         let mut extensions = xr::ExtensionSet::default();
         extensions.khr_vulkan_enable2 = true;
+        let cylinder_layers = available.khr_composition_layer_cylinder;
+        extensions.khr_composition_layer_cylinder = cylinder_layers;
+        eprintln!(
+            "OpenXR: cylinder layers {}",
+            if cylinder_layers {
+                "available"
+            } else {
+                "not offered (subtitles stay flat on a curved screen)"
+            }
+        );
         // Native Steam Frame controller bindings (otherwise SteamVR remaps Index ones).
         const FRAME_CONTROLLER: &str = "XR_VALVE_frame_controller_interaction";
         if available
@@ -156,6 +168,7 @@ impl XrContext {
             session,
             frame_waiter,
             frame_stream,
+            cylinder_layers,
         })
     }
 

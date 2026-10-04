@@ -325,6 +325,80 @@ fn quad_layer<'a>(
     }
 }
 
+/// How an overlay layer is shaped.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Shape {
+    /// A flat quad of this size (metres).
+    Quad([f32; 2]),
+    /// A section of a cylinder around the pose's Y axis: radius, angle
+    /// covered (radians) and width/height of the visible section.
+    Cylinder {
+        radius: f32,
+        angle: f32,
+        aspect: f32,
+    },
+}
+
+/// An overlay layer to submit this frame.
+struct Overlay<'a> {
+    target: &'a QuadTarget,
+    pose: xr::Posef,
+    shape: Shape,
+    blend: bool,
+}
+
+impl<'a> Overlay<'a> {
+    fn quad(target: &'a QuadTarget, pose: xr::Posef, size: [f32; 2], blend: bool) -> Self {
+        Self {
+            target,
+            pose,
+            shape: Shape::Quad(size),
+            blend,
+        }
+    }
+}
+
+/// A built composition layer, kept so the layers can be submitted in order.
+enum Built<'a> {
+    Quad(xr::CompositionLayerQuad<'a, xr::Vulkan>),
+    Cylinder(xr::CompositionLayerCylinderKHR<'a, xr::Vulkan>),
+}
+
+fn cylinder_layer<'a>(
+    space: &'a xr::Space,
+    target: &'a QuadTarget,
+    pose: xr::Posef,
+    radius: f32,
+    angle: f32,
+    aspect: f32,
+    blend: bool,
+) -> xr::CompositionLayerCylinderKHR<'a, xr::Vulkan> {
+    let layer = xr::CompositionLayerCylinderKHR::new()
+        .space(space)
+        .eye_visibility(xr::EyeVisibility::BOTH)
+        .sub_image(
+            xr::SwapchainSubImage::new()
+                .swapchain(&target.swapchain)
+                .image_array_index(0)
+                .image_rect(xr::Rect2Di {
+                    offset: xr::Offset2Di { x: 0, y: 0 },
+                    extent: xr::Extent2Di {
+                        width: target.width as i32,
+                        height: target.height as i32,
+                    },
+                }),
+        )
+        .pose(pose)
+        .radius(radius)
+        .central_angle(angle)
+        .aspect_ratio(aspect);
+    if blend {
+        layer.layer_flags(xr::CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA)
+    } else {
+        layer
+    }
+}
+
 enum Mode {
     Browser,
     Playing(Box<Playback>),
@@ -410,8 +484,31 @@ const DRAG_THRESHOLD: f32 = 0.035;
 /// Longest press (ns) that still counts as a click.
 const CLICK_NS: i64 = 400_000_000;
 
-/// Where subtitles go: over the bottom of a flat screen, just in front of it;
-/// for VR180/360, 2 m ahead in the view's direction, below its centre.
+/// Subtitles on a curved screen: bent along it, just in front (a cylinder
+/// section around the screen's axis, as high as the flat panel would be).
+fn caption_cylinder(placement: &Placement, panel: &Panel) -> (xr::Posef, Shape) {
+    let radius = placement.distance - 0.02;
+    let [_, up, _] = panel.basis();
+    // The axis passes through the pivot; the section sits at the panel's height.
+    let y = dot([0, 1, 2].map(|i| panel.center[i] - placement.pivot[i]), up);
+    let axis = Panel {
+        center: [0, 1, 2].map(|i| placement.pivot[i] + up[i] * y),
+        ..*panel
+    };
+    (
+        axis.pose(),
+        Shape::Cylinder {
+            radius,
+            angle: (panel.size[0] / radius).min(std::f32::consts::PI),
+            aspect: panel.size[0] / panel.size[1],
+        },
+    )
+}
+
+/// Where subtitles go: over the bottom of a flat screen, just in front of
+/// it (on a curved screen, at its depth, i.e. its backmost point: in front of
+/// its nearest part they would float too close); for VR180/360, 2 m ahead
+/// in the view's direction, below its centre.
 fn caption_panel(
     placement: &Placement,
     projection: Projection,
@@ -430,15 +527,8 @@ fn caption_panel(
         };
     let quad_h = quad_w * captions::HEIGHT as f32 / captions::WIDTH as f32;
     let (y, depth) = if flat {
-        // A curved screen bends towards us: stay in front of its nearest part.
-        let d = placement.distance;
-        let depth = if placement.curved {
-            (d * d - quad_w * quad_w / 4.0).max(0.01).sqrt()
-        } else {
-            d
-        };
         let bottom = -screen[1] / 2.0 + screen[1] * (0.04 + settings.raise);
-        (bottom + quad_h / 2.0, depth - 0.02)
+        (bottom + quad_h / 2.0, placement.distance - 0.02)
     } else {
         (-0.45 + 0.9 * settings.raise + quad_h / 2.0 - 0.14, 2.0)
     };
@@ -725,7 +815,7 @@ pub fn run(
         renderer.create_quad(&ctx, controls::DIALOG_WIDTH, controls::DIALOG_HEIGHT)?;
     // The caption on screen, and where it goes this frame.
     let mut caption_drawn: Option<crate::subtitles::Caption> = None;
-    let mut caption_at: Option<(xr::Posef, [f32; 2])> = None;
+    let mut caption_at: Option<(xr::Posef, Shape)> = None;
     // Editing subtitle size and position (from the track dialog).
     let mut caption_edit = false;
     let mut cursor = renderer.create_quad(&ctx, CURSOR_PX, CURSOR_PX)?;
@@ -1474,9 +1564,13 @@ pub fn run(
                     screen,
                     caption_settings,
                 );
-                caption_at = caption
-                    .is_some()
-                    .then(|| (caption_area.pose(), caption_area.size));
+                caption_at = caption.is_some().then(|| {
+                    if flat && placement.curved && ctx.cylinder_layers {
+                        caption_cylinder(&placement, &caption_area)
+                    } else {
+                        (caption_area.pose(), Shape::Quad(caption_area.size))
+                    }
+                });
                 outlines.clear();
                 if caption_edit {
                     // Thick enough to see at any distance.
@@ -1542,19 +1636,24 @@ pub fn run(
             }
         }
 
-        // Quad layers to show this frame: (target, pose, size, blend).
-        let mut quads: Vec<(&QuadTarget, xr::Posef, [f32; 2], bool)> = Vec::new();
+        // Overlay layers to show this frame, back to front.
+        let mut overlays: Vec<Overlay> = Vec::new();
         match &mode {
             Mode::Browser => {
                 let browser_at = browser_panel(&browser_place);
                 if let Some(target) = browser_target.as_ref().filter(|t| t.ready) {
-                    quads.push((target, browser_at.pose(), browser_at.size, false));
+                    overlays.push(Overlay::quad(
+                        target,
+                        browser_at.pose(),
+                        browser_at.size,
+                        false,
+                    ));
                     let bar = handle_panel(&browser_at);
                     let image = if handle_lit { &handle_hot } else { &handle };
-                    quads.push((image, bar.pose(), bar.size, true));
+                    overlays.push(Overlay::quad(image, bar.pose(), bar.size, true));
                 }
                 if let Some((pose, size)) = progress_at.filter(|(_, s)| s[0] > 0.0) {
-                    quads.push((&progress_line, pose, size, true));
+                    overlays.push(Overlay::quad(&progress_line, pose, size, true));
                 }
             }
             Mode::Playing(_) => {
@@ -1564,16 +1663,31 @@ pub fn run(
                     } else {
                         &screen_line
                     };
-                    quads.push((target, *pose, *size, true));
+                    overlays.push(Overlay::quad(target, *pose, *size, true));
                 }
-                if let Some((pose, size)) = caption_at.filter(|_| captions_target.ready) {
-                    quads.push((&captions_target, pose, size, true));
+                if let Some((pose, shape)) = caption_at.filter(|_| captions_target.ready) {
+                    overlays.push(Overlay {
+                        target: &captions_target,
+                        pose,
+                        shape,
+                        blend: true,
+                    });
                 }
                 if let Some(panel) = controls_panel_at.filter(|_| controls_target.ready) {
-                    quads.push((&controls_target, panel.pose(), panel.size, false));
+                    overlays.push(Overlay::quad(
+                        &controls_target,
+                        panel.pose(),
+                        panel.size,
+                        false,
+                    ));
                     if dialog.is_some() && dialog_target.ready {
                         let above = dialog_panel(&panel);
-                        quads.push((&dialog_target, above.pose(), above.size, false));
+                        overlays.push(Overlay::quad(
+                            &dialog_target,
+                            above.pose(),
+                            above.size,
+                            false,
+                        ));
                     }
                 }
             }
@@ -1599,7 +1713,7 @@ pub fn run(
                     z: p[2],
                 },
             };
-            quads.push((&cursor, pose, [size, size], true));
+            overlays.push(Overlay::quad(&cursor, pose, [size, size], true));
         }
 
         if let Some((p, yaw, pitch, distance)) = video_cursor {
@@ -1620,7 +1734,7 @@ pub fn run(
                 },
             };
             let size = CURSOR_SIZE * distance;
-            quads.push((&cursor, pose, [size, size], true));
+            overlays.push(Overlay::quad(&cursor, pose, [size, size], true));
         }
         set_phase(7);
         let projection_views: Vec<xr::CompositionLayerProjectionView<xr::Vulkan>> = if eyes_rendered
@@ -1652,16 +1766,30 @@ pub fn run(
         let projection = xr::CompositionLayerProjection::new()
             .space(&space)
             .views(&projection_views);
-        let quad_layers: Vec<xr::CompositionLayerQuad<xr::Vulkan>> = quads
+        let built: Vec<Built> = overlays
             .iter()
-            .map(|(target, pose, size, blend)| quad_layer(&space, target, *pose, *size, *blend))
+            .map(|o| match o.shape {
+                Shape::Quad(size) => {
+                    Built::Quad(quad_layer(&space, o.target, o.pose, size, o.blend))
+                }
+                Shape::Cylinder {
+                    radius,
+                    angle,
+                    aspect,
+                } => Built::Cylinder(cylinder_layer(
+                    &space, o.target, o.pose, radius, angle, aspect, o.blend,
+                )),
+            })
             .collect();
         let mut layers: Vec<&xr::CompositionLayerBase<xr::Vulkan>> = Vec::new();
         if !projection_views.is_empty() {
             layers.push(&projection);
         }
-        for quad in &quad_layers {
-            layers.push(&**quad);
+        for layer in &built {
+            layers.push(match layer {
+                Built::Quad(l) => &**l,
+                Built::Cylinder(l) => &**l,
+            });
         }
         ctx.frame_stream
             .end(state.predicted_display_time, ctx.blend_mode, &layers)?;
@@ -1932,6 +2060,49 @@ mod tests {
                 &[(captions, &caption, true), (bar_panel, &bar, false)],
             );
         }
+    }
+
+    #[test]
+    fn curved_captions_hug_the_screen() {
+        let placement = Placement {
+            yaw: 0.3,
+            pitch: 0.1,
+            distance: 3.0,
+            curved: true,
+            zoom: 1.0,
+            pivot: [0.0, -0.5, 0.2],
+        };
+        let screen = [3.2, 1.8];
+        let panel = caption_panel(&placement, Projection::Flat, screen, Default::default());
+        // Flat fallback: at the screen's depth, not in front of its nearest part.
+        let to_center = [0, 1, 2].map(|i| panel.center[i] - placement.pivot[i]);
+        let [_, up, _] = panel.basis();
+        let horizontal = dot(to_center, to_center) - dot(to_center, up).powi(2);
+        assert!(
+            (horizontal.sqrt() - 2.98).abs() < 1e-3,
+            "{}",
+            horizontal.sqrt()
+        );
+        let (pose, shape) = caption_cylinder(&placement, &panel);
+        let Shape::Cylinder {
+            radius,
+            angle,
+            aspect,
+        } = shape
+        else {
+            panic!("{shape:?}")
+        };
+        assert!((radius - 2.98).abs() < 1e-5);
+        assert!((angle - panel.size[0] / radius).abs() < 1e-5);
+        assert!((aspect - panel.size[0] / panel.size[1]).abs() < 1e-5);
+        // The axis runs through the pivot, at the caption's height.
+        let p = [pose.position.x, pose.position.y, pose.position.z];
+        let off = [0, 1, 2].map(|i| p[i] - placement.pivot[i]);
+        assert!((dot(off, off).sqrt() - dot(to_center, up).abs()).abs() < 1e-4);
+        assert!(
+            dot(off, up).abs() > dot(off, off).sqrt() * 0.999,
+            "along up"
+        );
     }
 
     #[test]
