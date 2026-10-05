@@ -2,17 +2,21 @@
 //! settings, each at display size (about 110 KB raw, far less as PNG). The
 //! name hashes everything the picture depends on (file, size, modification
 //! time, layout, thumbnail size), so a changed file or layout just misses and
-//! the stale file ages out. Errors are never kept: a broken read may work
+//! the stale file ages out (anything unused for 24 hours is deleted, and never
+//! served). Errors are never kept: a broken read may work
 //! next time.
 
 use crate::media::Thumb;
 use crate::vr::Layout;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 /// Size of every thumbnail; rows are laid out around it.
 pub const THUMB_W: u32 = 220;
 pub const THUMB_H: u32 = 124;
 
+/// A thumbnail not used for this long is deleted, and never served.
+const MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// Files beyond this (oldest modification time first) are deleted.
 const MAX_FILES: usize = 5000;
 /// Pruning runs again after this many stores.
@@ -62,7 +66,18 @@ impl ThumbCache {
 
     /// The stored thumbnail, if there is a readable one of the right size.
     pub fn load(&self, key: &str) -> Option<Thumb> {
-        let file = std::io::BufReader::new(std::fs::File::open(self.path(key)).ok()?);
+        let path = self.path(key);
+        // Last used more than MAX_AGE ago: a miss, and gone.
+        let used = std::fs::metadata(&path).ok()?.modified().ok()?;
+        if SystemTime::now()
+            .duration_since(used)
+            .is_ok_and(|age| age > MAX_AGE)
+        {
+            eprintln!("Thumbnails: dropping an expired thumbnail");
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+        let file = std::io::BufReader::new(std::fs::File::open(&path).ok()?);
         let mut reader = png::Decoder::new(file).read_info().ok()?;
         let mut rgba = vec![0; reader.output_buffer_size()?];
         let info = reader.next_frame(&mut rgba).ok()?;
@@ -74,8 +89,8 @@ impl ThumbCache {
             // what was made first.
             let _ = std::fs::File::options()
                 .write(true)
-                .open(self.path(key))
-                .and_then(|f| f.set_modified(std::time::SystemTime::now()));
+                .open(&path)
+                .and_then(|f| f.set_modified(SystemTime::now()));
         }
         right.then(|| {
             rgba.truncate(info.buffer_size());
@@ -97,6 +112,7 @@ impl ThumbCache {
         }
         self.stores += 1;
         if self.stores.is_multiple_of(PRUNE_EVERY) {
+            self.prune_older_than(MAX_AGE);
             self.prune(MAX_FILES);
         }
     }
@@ -113,7 +129,8 @@ impl ThumbCache {
         Ok(())
     }
 
-    /// Keeps the newest [`MAX_FILES`] files.
+    /// Drops what is older than [`MAX_AGE`], then keeps the newest
+    /// [`MAX_FILES`] files.
     pub fn prune_old(&self) {
         // Half-written files from a stop in mid-save (nothing writes yet).
         if let Ok(entries) = std::fs::read_dir(&self.dir) {
@@ -123,7 +140,25 @@ impl ThumbCache {
                 }
             }
         }
+        self.prune_older_than(MAX_AGE);
         self.prune(MAX_FILES);
+    }
+
+    /// Deletes thumbnails last used more than `age` ago.
+    pub fn prune_older_than(&self, age: Duration) {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        let now = SystemTime::now();
+        for e in entries.flatten() {
+            let is_png = Path::new(&e.file_name())
+                .extension()
+                .is_some_and(|x| x == "png");
+            let used = e.metadata().ok().and_then(|m| m.modified().ok());
+            if is_png && used.is_some_and(|u| now.duration_since(u).is_ok_and(|a| a > age)) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
     }
 
     /// Deletes the oldest files beyond `keep`.
@@ -273,6 +308,61 @@ mod tests {
             .filter(|n| cache.path(&format!("{n:016x}")).exists())
             .collect();
         assert_eq!(kept, [0, 3]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn set_age(cache: &ThumbCache, key: &str, age: Duration) {
+        std::fs::File::options()
+            .write(true)
+            .open(cache.path(key))
+            .unwrap()
+            .set_modified(SystemTime::now() - age)
+            .unwrap();
+    }
+
+    #[test]
+    fn expired_files_are_pruned_and_fresh_ones_kept() {
+        let dir = temp("expire");
+        let mut cache = ThumbCache::at(dir.clone());
+        for (k, hours) in [("a", 30), ("b", 25), ("c", 23), ("d", 1)] {
+            cache.store(k, &picture(3));
+            set_age(&cache, k, Duration::from_secs(hours * 3600));
+        }
+        cache.prune_old();
+        let kept: Vec<_> = ["a", "b", "c", "d"]
+            .into_iter()
+            .filter(|k| cache.path(k).exists())
+            .collect();
+        assert_eq!(kept, ["c", "d"]);
+        // A shorter limit drops more.
+        cache.prune_older_than(Duration::from_secs(2 * 3600));
+        assert!(!cache.path("c").exists() && cache.path("d").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn expired_lookup_is_a_miss_and_deletes() {
+        let dir = temp("expire-load");
+        let mut cache = ThumbCache::at(dir.clone());
+        cache.store("old", &picture(3));
+        cache.store("new", &picture(3));
+        set_age(&cache, "old", MAX_AGE + Duration::from_secs(60));
+        set_age(&cache, "new", MAX_AGE - Duration::from_secs(600));
+        assert!(cache.load("old").is_none());
+        assert!(!cache.path("old").exists());
+        assert!(cache.load("new").is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn using_a_file_keeps_it_alive() {
+        let dir = temp("expire-used");
+        let mut cache = ThumbCache::at(dir.clone());
+        cache.store("k", &picture(3));
+        set_age(&cache, "k", MAX_AGE - Duration::from_secs(600));
+        assert!(cache.load("k").is_some()); // refreshes the use time
+        cache.prune_older_than(Duration::from_secs(3600));
+        assert!(cache.path("k").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
