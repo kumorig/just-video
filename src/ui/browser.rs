@@ -945,7 +945,25 @@ pub fn render(
     pointer: Option<(f32, f32)>,
     draw_cursor: bool,
 ) -> Canvas {
-    let mut canvas = Canvas::new(WIDTH, HEIGHT);
+    render_into(
+        Canvas::new(WIDTH, HEIGHT),
+        view,
+        fonts,
+        pointer,
+        draw_cursor,
+    )
+}
+
+/// [`render`] over a canvas from an earlier render (any content), which saves
+/// allocating and faulting in 6 MB for every repaint.
+pub fn render_into(
+    mut canvas: Canvas,
+    view: &View,
+    fonts: &mut Fonts,
+    pointer: Option<(f32, f32)>,
+    draw_cursor: bool,
+) -> Canvas {
+    debug_assert_eq!((canvas.width, canvas.height), (WIDTH, HEIGHT));
     canvas.clear(BG);
     let w = WIDTH as f32;
     let crumbs = crumb_layout(view, fonts);
@@ -1325,12 +1343,13 @@ mod tests {
             ..Default::default()
         };
         let mut fonts = Fonts::load().expect("fonts");
-        render(&view, &mut fonts, Some((400.0, 300.0)), false);
+        // As the app does: each repaint reuses the last canvas.
+        let mut canvas = render(&view, &mut fonts, Some((400.0, 300.0)), false);
         let started = std::time::Instant::now();
         let n = 50;
         for i in 0..n {
             view.scroll = i as f32 * 0.1;
-            render(&view, &mut fonts, Some((400.0, 300.0)), false);
+            canvas = render_into(canvas, &view, &mut fonts, Some((400.0, 300.0)), false);
         }
         println!(
             "browser repaint: {:.2} ms",

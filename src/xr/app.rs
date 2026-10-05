@@ -881,6 +881,8 @@ pub fn run(
     let mut exit_requested = false;
     let mut active_hand = 1usize;
     let mut hovered: Option<browser::Hit> = None;
+    // The browser panel as last painted, reused for the next repaint.
+    let mut browser_canvas: Option<crate::ui::canvas::Canvas> = None;
     // Where the playing file's chosen format is saved.
     let mut playing_key: Option<String> = None;
     let mut resume_saved_at = Instant::now();
@@ -1408,8 +1410,17 @@ pub fn run(
                         (None, browser::Hit::Nothing) => None,
                         (None, _) => point,
                     };
-                    let canvas = browser::render(nav.view(), &mut fonts, hover_point, false);
+                    let canvas = browser::render_into(
+                        browser_canvas.take().unwrap_or_else(|| {
+                            crate::ui::canvas::Canvas::new(browser::WIDTH, browser::HEIGHT)
+                        }),
+                        nav.view(),
+                        &mut fonts,
+                        hover_point,
+                        false,
+                    );
                     renderer.upload_quad(target, &canvas.pixels)?;
+                    browser_canvas = Some(canvas);
                 }
                 if let Some((x, y)) = point.filter(|_| focus.is_none()) {
                     cursor_at = Some((browser_at, x, y));
