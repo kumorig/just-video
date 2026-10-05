@@ -69,6 +69,14 @@ impl ThumbCache {
         let right = (info.width, info.height) == (THUMB_W, THUMB_H)
             && info.color_type == png::ColorType::Rgba
             && info.bit_depth == png::BitDepth::Eight;
+        if right {
+            // Used now: pruning drops what was not used for longest, not
+            // what was made first.
+            let _ = std::fs::File::options()
+                .write(true)
+                .open(self.path(key))
+                .and_then(|f| f.set_modified(std::time::SystemTime::now()));
+        }
         right.then(|| {
             rgba.truncate(info.buffer_size());
             Thumb {
@@ -107,6 +115,14 @@ impl ThumbCache {
 
     /// Keeps the newest [`MAX_FILES`] files.
     pub fn prune_old(&self) {
+        // Half-written files from a stop in mid-save (nothing writes yet).
+        if let Ok(entries) = std::fs::read_dir(&self.dir) {
+            for e in entries.flatten() {
+                if e.file_name().to_string_lossy().ends_with(".tmp") {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
         self.prune(MAX_FILES);
     }
 
@@ -229,6 +245,34 @@ mod tests {
         for n in 0..5 {
             assert_eq!(cache.load(&format!("{n:016x}")).is_some(), n >= 2, "{n}");
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn prune_keeps_what_was_used_lately() {
+        let dir = temp("prune-used");
+        let mut cache = ThumbCache::at(dir.clone());
+        for n in 0..4 {
+            cache.store(&format!("{n:016x}"), &picture(3));
+            let file = std::fs::File::options()
+                .write(true)
+                .open(cache.path(&format!("{n:016x}")))
+                .unwrap();
+            let age = std::time::Duration::from_secs(1000 - n * 100);
+            file.set_modified(std::time::SystemTime::now() - age)
+                .unwrap();
+        }
+        // Leftovers of an interrupted save go at start-up.
+        std::fs::write(dir.join(".dead.tmp"), b"half").unwrap();
+        cache.prune_old();
+        assert!(!dir.join(".dead.tmp").exists());
+        // The oldest is shown again: it is now the newest.
+        assert!(cache.load(&format!("{:016x}", 0)).is_some());
+        cache.prune(2);
+        let kept: Vec<u64> = (0..4)
+            .filter(|n| cache.path(&format!("{n:016x}")).exists())
+            .collect();
+        assert_eq!(kept, [0, 3]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
