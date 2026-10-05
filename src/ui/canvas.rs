@@ -39,20 +39,58 @@ impl Canvas {
         self.pixels[i + 3] = 255;
     }
 
-    /// Filled rectangle with anti-aliased rounded corners.
+    /// Filled rectangle with anti-aliased rounded corners. Pixels well inside
+    /// are written straight; only the edge band computes coverage.
     pub fn rect(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32, color: Rgb) {
         let r = radius.min(w / 2.0).min(h / 2.0).max(0.0);
-        let (x0, y0) = (x.floor() as i32, y.floor() as i32);
-        let (x1, y1) = ((x + w).ceil() as i32, (y + h).ceil() as i32);
+        let (x0, y0) = ((x.floor() as i32).max(0), (y.floor() as i32).max(0));
+        let (x1, y1) = (
+            ((x + w).ceil() as i32).min(self.width as i32),
+            ((y + h).ceil() as i32).min(self.height as i32),
+        );
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        let (mx, my) = (x + w / 2.0, y + h / 2.0);
+        let (hx, hy) = (w / 2.0 - r, h / 2.0 - r);
+        let solid = [color[0], color[1], color[2], 255];
         for py in y0..y1 {
-            for px in x0..x1 {
-                let (cx, cy) = (px as f32 + 0.5, py as f32 + 0.5);
-                // Signed distance to the rounded rectangle.
-                let qx = (cx - (x + w / 2.0)).abs() - (w / 2.0 - r);
-                let qy = (cy - (y + h / 2.0)).abs() - (h / 2.0 - r);
+            let cy = py as f32 + 0.5;
+            let qy = (cy - my).abs() - hy;
+            // Fully covered pixels (coverage 0.5 - outside >= 1) form one span
+            // of the row, [from, to): `reach` is how far past the straight
+            // part's edge (qx) the row stays covered.
+            let inner = r - 0.5 - 1e-3;
+            let reach = if qy >= 0.0 {
+                (qy <= inner).then(|| (inner * inner - qy * qy).sqrt())
+            } else if r >= 0.5 || qy <= inner {
+                Some(inner)
+            } else {
+                None
+            };
+            let (from, to) = match reach {
+                Some(reach) if hx + reach >= 0.0 => {
+                    let half = hx + reach;
+                    let from = ((mx - half - 0.5).ceil() as i32).clamp(x0, x1);
+                    let to = (((mx + half - 0.5).floor() as i32) + 1).clamp(from, x1);
+                    (from, to)
+                }
+                _ => (x1, x1),
+            };
+            for px in (x0..from).chain(to..x1) {
+                let cx = px as f32 + 0.5;
+                let qx = (cx - mx).abs() - hx;
                 let outside =
                     (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - r;
                 self.blend(px, py, color, 0.5 - outside);
+            }
+            if from < to {
+                let row = (py as u32 * self.width) as usize;
+                for px in self.pixels[(row + from as usize) * 4..(row + to as usize) * 4]
+                    .chunks_exact_mut(4)
+                {
+                    px.copy_from_slice(&solid);
+                }
             }
         }
     }
@@ -310,5 +348,82 @@ impl Fonts {
             lines.push(line);
         }
         lines
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The rectangle as it was drawn before the solid-span shortcut.
+    fn reference_rect(c: &mut Canvas, x: f32, y: f32, w: f32, h: f32, radius: f32, color: Rgb) {
+        let r = radius.min(w / 2.0).min(h / 2.0).max(0.0);
+        let (x0, y0) = (x.floor() as i32, y.floor() as i32);
+        let (x1, y1) = ((x + w).ceil() as i32, (y + h).ceil() as i32);
+        for py in y0..y1 {
+            for px in x0..x1 {
+                let (cx, cy) = (px as f32 + 0.5, py as f32 + 0.5);
+                let qx = (cx - (x + w / 2.0)).abs() - (w / 2.0 - r);
+                let qy = (cy - (y + h / 2.0)).abs() - (h / 2.0 - r);
+                let outside =
+                    (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - r;
+                c.blend(px, py, color, 0.5 - outside);
+            }
+        }
+    }
+
+    /// The cases the browser draws most: whole-pixel bounds, square corners
+    /// (the cover bars), the row radius, and rectangles past the canvas edge.
+    #[test]
+    fn rect_matches_the_reference_on_whole_pixel_bounds() {
+        let cases = [
+            (0.0, 0.0, 100.0, 12.0, 0.0),
+            (0.0, 68.0, 100.0, 40.0, 0.0),
+            (4.0, 10.0, 90.0, 30.0, 14.0),
+            (4.0, 10.0, 90.0, 30.0, 15.0),
+            (10.0, 10.0, 30.0, 30.0, 15.0),
+            (10.0, 10.0, 1.0, 1.0, 0.0),
+            (10.0, 10.0, 2.0, 40.0, 1.0),
+            (-5.0, -5.0, 120.0, 100.0, 14.0),
+            (50.5, 20.5, 20.0, 20.0, 3.0),
+        ];
+        for (x, y, w, h, r) in cases {
+            let (mut a, mut b) = (Canvas::new(100, 80), Canvas::new(100, 80));
+            a.clear([20, 30, 40]);
+            b.clear([20, 30, 40]);
+            a.rect(x, y, w, h, r, [200, 100, 50]);
+            reference_rect(&mut b, x, y, w, h, r, [200, 100, 50]);
+            assert!(
+                a.pixels == b.pixels,
+                "rect({x}, {y}, {w}, {h}, r {r}) differs"
+            );
+        }
+    }
+
+    #[test]
+    fn rect_matches_the_per_pixel_reference() {
+        // A small deterministic generator: no new dependencies.
+        let mut state = 0x2545F4914F6CDD1Du64;
+        let mut next = move |lo: f32, hi: f32| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            lo + (state >> 40) as f32 / (1u64 << 24) as f32 * (hi - lo)
+        };
+        for _ in 0..3000 {
+            let (x, y) = (next(-20.0, 90.0), next(-20.0, 70.0));
+            let (w, h) = (next(0.0, 90.0), next(0.0, 70.0));
+            let radius = next(0.0, 40.0);
+            let color = [next(0.0, 255.0) as u8, next(0.0, 255.0) as u8, 77];
+            let (mut a, mut b) = (Canvas::new(100, 80), Canvas::new(100, 80));
+            a.clear([9, 40, 200]);
+            b.clear([9, 40, 200]);
+            a.rect(x, y, w, h, radius, color);
+            reference_rect(&mut b, x, y, w, h, radius, color);
+            assert!(
+                a.pixels == b.pixels,
+                "rect({x}, {y}, {w}, {h}, r {radius}) differs"
+            );
+        }
     }
 }
