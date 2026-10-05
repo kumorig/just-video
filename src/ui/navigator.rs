@@ -2068,6 +2068,14 @@ impl Navigator {
                 } else {
                     user
                 };
+                if user.contains(':') {
+                    f.error = Some(
+                        "A user name can't contain a colon. Type the password in the Password field."
+                            .into(),
+                    );
+                    f.focus(1, None);
+                    return;
+                }
                 let url = match format!("smb://{user}@{host}").parse::<SmbUrl>() {
                     Ok(url) if url.share.is_empty() => url,
                     Ok(_) => {
@@ -2752,6 +2760,22 @@ mod tests {
         assert_eq!(config::servers().unwrap(), vec![pc, nas.clone()]);
         assert_eq!(config::password(&nas.url).unwrap().as_deref(), Some("b"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_password_typed_into_the_user_field_is_explained_for_the_headset() {
+        let (library, _responses) = Library::detached();
+        let mut nav = Navigator::new(library);
+        nav.start_server_form(None);
+        let form = nav.view.form.as_mut().expect("add form");
+        form.fields[0].value = "nas".into();
+        form.fields[1].value = "bob:secret".into();
+        nav.submit_form();
+        let form = nav.view().form.as_ref().expect("still open");
+        assert_eq!(form.busy, None, "nothing is sent");
+        let error = form.error.as_deref().expect("explained");
+        assert!(error.contains("Password field"), "{error}");
+        assert!(!error.contains("JUST_VIDEO"), "{error}");
     }
 
     #[test]
