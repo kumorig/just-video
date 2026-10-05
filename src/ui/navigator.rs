@@ -1550,8 +1550,16 @@ impl Navigator {
             }) = self.items.get_mut(i)
         {
             let file: Path = path.iter().chain([&*name]).cloned().collect();
+            let before = *layout;
             if let Ok(Some(saved)) = config::layout_override(&file_key(server, share, &file)) {
                 saved.apply(layout);
+            }
+            // The picture is cropped by the format: make it again.
+            if *layout != before {
+                let name = name.clone();
+                self.thumbs.remove(&name);
+                self.thumbs_sent.remove(&name);
+                self.request_thumbnails();
             }
         }
     }
@@ -2911,6 +2919,56 @@ mod tests {
         nav.selecting = Some(HashSet::new());
         nav.rebuild_rows();
         assert!(!tool(&nav), "not while selecting");
+    }
+
+    #[test]
+    fn a_format_changed_while_playing_remakes_the_thumbnail() {
+        let dir = config::temp_config("nav-thumb-format");
+        let (library, responses) = Library::detached();
+        let mut nav = Navigator::new(library);
+        video_folder(&mut nav, &["clip.mp4", "other.mp4"]);
+        nav.click(Hit::Tool(0));
+        let g = nav.thumb_generation;
+        for name in ["clip.mp4", "other.mp4"] {
+            responses
+                .send(Response::Thumbnail {
+                    generation: g,
+                    name: name.into(),
+                    image: thumb(),
+                })
+                .unwrap();
+        }
+        nav.poll();
+        assert_eq!(nav.thumbs.len(), 2);
+        // Played, and its format set to VR180 side by side meanwhile.
+        nav.playing = nav.items.iter().position(|i| i.name() == "clip.mp4");
+        let Location::Folder {
+            server,
+            share,
+            path,
+        } = nav.location.clone()
+        else {
+            panic!("a folder");
+        };
+        let file: Path = path
+            .iter()
+            .cloned()
+            .chain(["clip.mp4".to_string()])
+            .collect();
+        config::save_layout_override(
+            &file_key(&server, &share, &file),
+            Some(config::LayoutOverride {
+                projection: crate::vr::Projection::Equirect180,
+                stereo: crate::vr::Stereo::SideBySide,
+                image: config::ImageAdjust::default(),
+            }),
+        )
+        .unwrap();
+        nav.playback_ended();
+        assert!(!nav.thumbs.contains_key("clip.mp4"), "the old crop is gone");
+        assert!(nav.thumbs.contains_key("other.mp4"));
+        assert!(nav.thumbs_sent.contains("clip.mp4"), "asked for again");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
