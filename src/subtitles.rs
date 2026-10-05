@@ -174,9 +174,20 @@ pub fn parse_srt(text: &str) -> Vec<Cue> {
         .trim_start_matches('\u{feff}')
         .replace("\r\n", "\n")
         .replace('\r', "\n");
+    // Blocks end at a blank line; many files have spaces or tabs on it.
+    let mut blocks: Vec<Vec<&str>> = vec![Vec::new()];
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            if !blocks.last().is_some_and(Vec::is_empty) {
+                blocks.push(Vec::new());
+            }
+        } else if let Some(block) = blocks.last_mut() {
+            block.push(line);
+        }
+    }
     let mut cues = Vec::new();
-    for block in text.split("\n\n") {
-        let mut lines = block.lines().skip_while(|l| l.trim().is_empty());
+    for block in blocks {
+        let mut lines = block.into_iter();
         let mut first = lines.next();
         // The counter line is optional in practice.
         if first.is_some_and(|l| !l.contains("-->")) {
@@ -438,6 +449,14 @@ mod tests {
         assert_eq!(cues.len(), 2);
         assert_eq!(cues[0], Cue::text(2.0, 4.4, "Good morning,\neveryone"));
         assert!((cues[1].end - 65.96).abs() < 1e-9);
+    }
+
+    #[test]
+    fn blank_looking_separators_still_split_cues() {
+        let srt = "1\n00:00:01,000 --> 00:00:02,000\nfirst\n \n2\n00:00:03,000 --> 00:00:04,000\nsecond\n\t\n\n3\n00:00:05,000 --> 00:00:06,000\nthird";
+        let cues = parse_srt(srt);
+        let texts: Vec<&str> = cues.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, ["first", "second", "third"]);
     }
 
     #[test]
