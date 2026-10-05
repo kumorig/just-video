@@ -755,7 +755,20 @@ fn print(value: serde_json::Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Gives freed memory back to the system sooner: with glibc's defaults the
+/// heap freed by closing many FFmpeg contexts (probing, thumbnails) stays resident.
+fn trim_freed_memory() {
+    // SAFETY: plain call, before other threads exist. Setting the trim
+    // threshold also fixes the mmap threshold, so big buffers are mapped
+    // and unmapped, not kept in the heap.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::mallopt(libc::M_TRIM_THRESHOLD, 128 * 1024);
+    }
+}
+
 fn main() -> anyhow::Result<()> {
+    trim_freed_memory();
     let cli = Cli::parse();
     let platform = cli.platform.unwrap_or_else(Platform::current);
     let Some(command) = cli.command else {
