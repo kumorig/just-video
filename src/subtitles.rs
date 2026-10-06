@@ -217,7 +217,7 @@ pub fn clean_markup(text: &str) -> String {
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            '{' if text.contains('}') => {
+            '{' if chars.clone().any(|c| c == '}') => {
                 for c in chars.by_ref() {
                     if c == '}' {
                         break;
@@ -473,6 +473,9 @@ mod tests {
             "Top line\nSecond word"
         );
         assert_eq!(clean_markup("a < b and c > d"), "a < b and c > d");
+        // A `{` with no `}` after it is text, not a block that eats the line.
+        assert_eq!(clean_markup("a { b"), "a { b");
+        assert_eq!(clean_markup(r"{\i1}a { b"), "a { b");
     }
 
     #[test]
