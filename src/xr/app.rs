@@ -140,6 +140,7 @@ fn browser_placement(pivot: [f32; 3]) -> Placement {
         distance: BROWSER_DISTANCE,
         curved: false,
         zoom: 1.0,
+        offset: 0.0,
         pivot,
     }
 }
@@ -451,10 +452,14 @@ fn save_layout(
 }
 
 /// Remembers where the playing file was left (off the frame loop: the
-/// write may be slow).
-fn save_resume(key: Option<&String>, playback: &Playback) {
-    let Some(key) = key.cloned() else { return };
-    let point = crate::config::resume_point(playback.position(), playback.duration);
+/// write may be slow). Returns what was saved: None when nothing was, Some(None)
+/// when the place was forgotten (watched to the end, or back at the start).
+fn save_resume(key: Option<&String>, playback: &Playback) -> Option<ResumeSaved> {
+    let key = key.cloned()?;
+    // Nothing shown yet: the position is still the saved one, not a new place.
+    playback.current()?;
+    let point = crate::config::resume_point(playback.position(), playback.duration)
+        .map(|s| (s, Some(playback.duration)));
     let _ = std::thread::Builder::new()
         .name("save resume".into())
         .spawn(move || {
@@ -462,7 +467,11 @@ fn save_resume(key: Option<&String>, playback: &Playback) {
                 eprintln!("Can't save where the video was left: {e:#}");
             }
         });
+    Some(point)
 }
+
+/// A saved place: seconds and the video's length, or None for "from the top".
+type ResumeSaved = Option<(f64, Option<f64>)>;
 
 /// How often the place in the playing video is saved (for a crash or power-off).
 const RESUME_SAVE_INTERVAL: Duration = Duration::from_secs(15);
@@ -806,10 +815,10 @@ pub fn run(
     renderer.upload_quad(&mut screen_line, &solid_image([0xff, 0xff, 0xff], 0.7))?;
     let mut caption_line = renderer.create_quad(&ctx, 4, 4)?;
     renderer.upload_quad(&mut caption_line, &solid_image([0xff, 0xcc, 0x00], 0.9))?;
-    // The browser's progress bar.
+    // The browser's progress bar, and the player's loading hairline.
     let mut progress_line = renderer.create_quad(&ctx, 4, 4)?;
     renderer.upload_quad(&mut progress_line, &solid_image([0x4f, 0x8c, 0xff], 1.0))?;
-    let mut progress_at: Option<(xr::Posef, [f32; 2])> = None;
+    let mut progress_at: Option<(xr::Posef, [f32; 2])>;
     let mut outlines: Vec<(bool, Line)> = Vec::new();
     let mut dialog_target =
         renderer.create_quad(&ctx, controls::DIALOG_WIDTH, controls::DIALOG_HEIGHT)?;
@@ -949,8 +958,9 @@ pub fn run(
         }
         if stop_playback {
             set_phase(3);
+            let mut saved: Option<ResumeSaved> = None;
             if let Mode::Playing(playback) = std::mem::replace(&mut mode, Mode::Browser) {
-                save_resume(playing_key.as_ref(), &playback);
+                saved = save_resume(playing_key.as_ref(), &playback);
                 stats.displayed_frames += playback.stats.displayed_frames;
                 stats.uploaded_frames += playback.stats.uploaded_frames;
                 stats.skipped_frames += playback.stats.skipped_frames;
@@ -961,6 +971,11 @@ pub fn run(
             buttons.back = false;
             controls_panel_at = None;
             press = None;
+            if let (Some(nav), Some(key), Some(point)) =
+                (navigator.as_mut(), playing_key.as_ref(), saved)
+            {
+                nav.note_resume(key, point);
+            }
             match navigator.as_mut() {
                 // Previous/next: the browser shows "Opening …" until it plays.
                 Some(nav) if let Some(delta) = switch_video.take() => {
@@ -988,6 +1003,9 @@ pub fn run(
                         .end(state.predicted_display_time, ctx.blend_mode, &[])?;
                     continue;
                 };
+                if nav.take_exit() {
+                    options.quit.store(true, Ordering::Relaxed);
+                }
                 if let Some(opened) = nav.poll() {
                     playing_key = Some(opened.key.clone());
                     eprintln!(
@@ -1002,12 +1020,6 @@ pub fn run(
                         // Full level: the headset's volume buttons set loudness.
                         1.0,
                     );
-                    if start > 0.0 {
-                        playback.notice(
-                            format!("Continuing from {}", controls::format_time(start)),
-                            Duration::from_secs(4),
-                        );
-                    }
                     resume_saved_at = Instant::now();
                     playback.set_buffer(opened.buffer);
                     playback.add_external_subtitles(opened.external_subtitles);
@@ -1070,7 +1082,7 @@ pub fn run(
                                 browser_place.yaw = p.start.yaw + dyaw;
                                 browser_place.pitch = (p.start.pitch + dpitch)
                                     .clamp(-super::player::MAX_PITCH, super::player::MAX_PITCH);
-                                if buttons.scroll.abs() > 0.2 {
+                                if buttons.scroll != 0.0 {
                                     browser_place.distance = (browser_place.distance
                                         + buttons.scroll * 1.5 * dt)
                                         .clamp(1.0, 6.0);
@@ -1137,7 +1149,7 @@ pub fn run(
                 if buttons.back {
                     nav.back();
                 }
-                if buttons.scroll.abs() > 0.2 && !moving {
+                if buttons.scroll != 0.0 && !moving {
                     // Holding the grip scrolls four times faster.
                     let speed = if buttons.grip { 48.0 } else { 12.0 };
                     nav.scroll_by(-buttons.scroll * speed * dt);
@@ -1314,7 +1326,7 @@ pub fn run(
                                 placement.pitch = (p.start.pitch + dpitch)
                                     .clamp(-super::player::MAX_PITCH, super::player::MAX_PITCH);
                                 // The stick pushes the screen away or pulls it closer.
-                                if buttons.scroll.abs() > 0.2 {
+                                if buttons.scroll != 0.0 {
                                     placement.distance = (placement.distance
                                         + buttons.scroll * 2.0 * dt)
                                         .clamp(0.8, 12.0);
@@ -1490,14 +1502,21 @@ pub fn run(
                     };
                     press = None;
                 }
-                // The stick zooms (screen size / magnification), except while
-                // dragging, when it moves the screen nearer or farther.
-                if !dragging && buttons.scroll.abs() > 0.2 {
-                    // A screen can shrink to a quarter (0.8 m wide by default);
-                    // VR180/360 below 0.4× would be mostly black.
-                    let min = if curved_applies { 0.25 } else { 0.4 };
+                // The sticks zoom, except while dragging, when they move the
+                // screen nearer or farther.
+                if !dragging && curved_applies {
+                    // Either stick resizes a screen, down to a quarter (0.8 m
+                    // wide by default).
                     placement.zoom =
-                        (placement.zoom * (buttons.scroll * 1.2 * dt).exp()).clamp(min, 3.0);
+                        (placement.zoom * (buttons.scroll * 1.2 * dt).exp()).clamp(0.25, 3.0);
+                } else if !dragging {
+                    // VR180/360, two ways to compare: the left stick moves the
+                    // viewpoint towards the picture; the right magnifies or
+                    // shrinks it (below 0.4× it would be mostly black).
+                    placement.offset = (placement.offset + buttons.stick[0] * 0.6 * dt)
+                        .clamp(super::player::MIN_OFFSET, super::player::MAX_OFFSET);
+                    placement.zoom =
+                        (placement.zoom * (buttons.stick[1] * 1.2 * dt).exp()).clamp(0.4, 3.0);
                 }
 
                 if controls_panel_at.is_some() {
@@ -1590,6 +1609,27 @@ pub fn run(
                 }
                 set_phase(6);
                 let upload = playback.advance(now);
+                // A hairline sweeping along the bar's top edge while the next
+                // picture is awaited (after opening or seeking).
+                progress_at = controls_panel_at
+                    .filter(|_| playback.loading())
+                    .map(|panel| {
+                        let t = (now as f64 / 1.4e9).fract() as f32 * 1.3 - 0.3;
+                        let (x, y, w, h) = controls::progress_rect(t, t + 0.3);
+                        let p = panel.point(x + w / 2.0, y + h / 2.0, 0.003);
+                        let scale = panel.size[0] / panel.pixels[0] as f32;
+                        (
+                            xr::Posef {
+                                orientation: panel.orientation(),
+                                position: xr::Vector3f {
+                                    x: p[0],
+                                    y: p[1],
+                                    z: p[2],
+                                },
+                            },
+                            [w * scale, h * scale],
+                        )
+                    });
                 renderer.begin_frame(if upload { playback.current() } else { None })?;
                 if upload {
                     playback.stats.uploaded_frames += 1;
@@ -1689,6 +1729,9 @@ pub fn run(
                             false,
                         ));
                     }
+                }
+                if let Some((pose, size)) = progress_at.filter(|(_, s)| s[0] > 0.0) {
+                    overlays.push(Overlay::quad(&progress_line, pose, size, true));
                 }
             }
         }
@@ -1797,8 +1840,10 @@ pub fn run(
     options.quit.store(true, Ordering::Relaxed);
     if let Mode::Playing(playback) = mode {
         // Written here, not in the background: the app is about to exit.
-        let point = crate::config::resume_point(playback.position(), playback.duration);
+        let point = crate::config::resume_point(playback.position(), playback.duration)
+            .map(|s| (s, Some(playback.duration)));
         if let Some(key) = &playing_key
+            && playback.current().is_some()
             && let Err(e) = crate::config::save_resume_position(key, point)
         {
             eprintln!("Can't save where the video was left: {e:#}");
@@ -1863,6 +1908,7 @@ mod tests {
             distance: 3.0,
             curved: true,
             zoom: 1.0,
+            offset: 0.0,
             pivot: [0.0; 3],
         };
         let lines = screen_outline(&placement, [4.0, 2.25], 0.01);
@@ -1891,6 +1937,7 @@ mod tests {
                 distance: 3.0,
                 curved,
                 zoom,
+                offset: 0.0,
                 pivot: [0.0; 3],
             };
             let screen = [3.2 * zoom, 1.8 * zoom];
@@ -1918,6 +1965,7 @@ mod tests {
         path: &std::path::Path,
         look: (f32, f32),
         placement: &Placement,
+        projection: Projection,
         screen: [f32; 2],
         panels: &[(Panel, &crate::ui::canvas::Canvas, bool)],
     ) {
@@ -1955,7 +2003,32 @@ mod tests {
                 } else {
                     [40.0, 38.0, 36.0]
                 };
-                if let Some(p) = video_hit(&ray, placement, Projection::Flat, screen) {
+                if projection == Projection::Equirect180 {
+                    // The shader's sphere, on the CPU: a unit sphere in the
+                    // placement's frame, the viewpoint moved along -Z.
+                    let ld = [0, 1, 2].map(|i| (0..3).map(|k| r[i][k] * d[k]).sum::<f32>());
+                    let k = placement.offset;
+                    let od = -k * ld[2];
+                    let t = -od + (od * od - k * k + 1.0).max(0.0).sqrt();
+                    let n = [ld[0] * t, ld[1] * t, ld[2] * t - k];
+                    let n = scale(n, 1.0 / dot(n, n).sqrt());
+                    let lon = n[0].atan2(-n[2]) / placement.zoom;
+                    let lat = n[1].clamp(-1.0, 1.0).asin() / placement.zoom;
+                    c = if lon.abs() <= std::f32::consts::FRAC_PI_2 {
+                        // 10° cells; the one straight ahead is lighter still.
+                        let cell = 10f32.to_radians();
+                        let (i, j) = ((lon / cell).floor() as i32, (lat / cell).floor() as i32);
+                        if (i == 0 || i == -1) && (j == 0 || j == -1) {
+                            [150.0, 170.0, 200.0]
+                        } else if (i + j) & 1 == 0 {
+                            [90.0, 110.0, 140.0]
+                        } else {
+                            [70.0, 85.0, 110.0]
+                        }
+                    } else {
+                        [0.0; 3]
+                    };
+                } else if let Some(p) = video_hit(&ray, placement, Projection::Flat, screen) {
                     let local = [0, 1, 2].map(|i| (0..3).map(|k| r[i][k] * p[k]).sum::<f32>());
                     let u = if placement.curved {
                         local[0].atan2(-local[2]) * placement.distance
@@ -2047,6 +2120,7 @@ mod tests {
                 distance: options.screen_distance,
                 curved,
                 zoom,
+                offset: 0.0,
                 pivot: [0.0; 3],
             };
             let screen = screen_size((1920, 1080), crate::vr::Stereo::Mono, &options, zoom, turns);
@@ -2056,6 +2130,37 @@ mod tests {
                 &dir.join(format!("{name}.png")),
                 look,
                 &placement,
+                Projection::Flat,
+                screen,
+                &[(captions, &caption, true), (bar_panel, &bar, false)],
+            );
+        }
+        // VR180: the left stick's dolly (offset) against the right's zoom.
+        // The lighter cell stays ahead; the others grow with either.
+        for (name, offset, zoom) in [
+            ("vr180", 0.0, 1.0),
+            ("vr180-dolly", 0.6, 1.0),
+            ("vr180-back", -0.4, 1.0),
+            ("vr180-zoom", 0.0, 2.0),
+        ] {
+            let placement = Placement {
+                zoom,
+                offset,
+                ..Placement::new(&options)
+            };
+            let screen = screen_size((3840, 1920), crate::vr::Stereo::Mono, &options, zoom, 0);
+            let captions = caption_panel(
+                &placement,
+                Projection::Equirect180,
+                screen,
+                Default::default(),
+            );
+            let bar_panel = controls_panel(&xr::Posef::IDENTITY);
+            render_scene(
+                &dir.join(format!("{name}.png")),
+                (0.0, -0.1),
+                &placement,
+                Projection::Equirect180,
                 screen,
                 &[(captions, &caption, true), (bar_panel, &bar, false)],
             );
@@ -2070,6 +2175,7 @@ mod tests {
             distance: 3.0,
             curved: true,
             zoom: 1.0,
+            offset: 0.0,
             pivot: [0.0, -0.5, 0.2],
         };
         let screen = [3.2, 1.8];

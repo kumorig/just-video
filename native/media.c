@@ -13,6 +13,9 @@
 #include <libswresample/swresample.h>
 
 #define IO_BUFFER_SIZE (256 * 1024)
+// Packets a V4L2 decoder may hold before outputting a picture (its queue
+// plus reference frames); beyond this it must have dropped one.
+#define PENDING_PICTURES 64
 
 #define MAX_SUBTITLES 32
 #define CUE_QUEUE 64
@@ -223,6 +226,17 @@ struct JVDecoder {
     AVFrame *transfer;  // scratch for hwaccel -> CPU transfers
     FormatChoice choice;
     int flushing;
+    // V4L2 wrapper only: the driver's frame timestamps can't be used (the
+    // Frame's iris decoder tags pictures with another packet's time when
+    // the file's pts aren't in display order, and wraps negative ones), and
+    // its pipeline keeps the pictures queued before a seek. Pictures come
+    // out in display order, so each takes the earliest time among the
+    // packets sent and not yet matched; `stale` pictures (inside the decoder
+    // when it was last seeked) are dropped first.
+    int64_t pending[PENDING_PICTURES];
+    int pending_count;
+    int64_t sent, received;  // packets in, pictures out, since the last seek
+    int64_t stale;
     // Audio (optional): decoded and resampled to interleaved float.
     AVCodecContext *audio;
     SwrContext *swr;
@@ -606,6 +620,7 @@ static int describe_frame(JVDecoder *d, AVFrame *frame, JVFrame *out) {
         out->data[i] = frame->data[i];
         out->linesize[i] = frame->linesize[i];
     }
+    out->key = !!(frame->flags & AV_FRAME_FLAG_KEY);
     int64_t ts = frame->best_effort_timestamp;
     int64_t start = video->start_time != AV_NOPTS_VALUE ? video->start_time : 0;
     out->pts = ts == AV_NOPTS_VALUE ? -1 : (ts - start) * av_q2d(video->time_base);
@@ -692,11 +707,52 @@ int jv_decoder_audio_read(JVDecoder *d, float *out, int frames, double *pts) {
     return n;
 }
 
+// Remembers a packet's time for the picture it will become (V4L2 wrapper).
+static void remember_packet(JVDecoder *d, const AVPacket *packet) {
+    int64_t ts = packet->pts != AV_NOPTS_VALUE ? packet->pts : packet->dts;
+    if (d->pending_count == PENDING_PICTURES) {
+        // A picture never came out: forget the oldest time rather than lag.
+        int oldest = 0;
+        for (int i = 1; i < PENDING_PICTURES; i++)
+            if (d->pending[i] < d->pending[oldest]) oldest = i;
+        d->pending[oldest] = d->pending[--d->pending_count];
+    }
+    d->pending[d->pending_count++] = ts;
+    d->sent++;
+}
+
+// The earliest remembered time, removed; AV_NOPTS_VALUE if none.
+static int64_t take_earliest(JVDecoder *d) {
+    if (d->pending_count == 0) return AV_NOPTS_VALUE;
+    int earliest = 0;
+    for (int i = 1; i < d->pending_count; i++)
+        if (d->pending[i] < d->pending[earliest]) earliest = i;
+    int64_t ts = d->pending[earliest];
+    d->pending[earliest] = d->pending[--d->pending_count];
+    return ts;
+}
+
 int jv_decoder_next(JVDecoder *d, JVFrame *out) {
     AVFrame *frame = av_frame_alloc();
     if (!frame) return AVERROR(ENOMEM);
     for (;;) {
         int ret = avcodec_receive_frame(d->ctx, frame);
+        if (ret == 0 && d->choice.hardware_wrapper) {
+            if (d->stale > 0) {  // queued before the last seek
+                d->stale--;
+                av_frame_unref(frame);
+                continue;
+            }
+            d->received++;
+            frame->pts = frame->best_effort_timestamp = take_earliest(d);
+            AVStream *video = d->media->format->streams[d->media->video_stream];
+            int64_t start = video->start_time != AV_NOPTS_VALUE ? video->start_time : 0;
+            if (frame->pts != AV_NOPTS_VALUE && frame->pts < start) {
+                // Before the edit list's start: software decoders drop these too.
+                av_frame_unref(frame);
+                continue;
+            }
+        }
         if (ret == 0) {
             ret = describe_frame(d, frame, out);
             if (ret < 0) av_frame_free(&frame);
@@ -722,6 +778,7 @@ int jv_decoder_next(JVDecoder *d, JVFrame *out) {
         }
         if (d->packet->stream_index != d->media->video_stream) { av_packet_unref(d->packet); continue; }
         ret = avcodec_send_packet(d->ctx, d->packet);
+        if (ret >= 0 && d->choice.hardware_wrapper) remember_packet(d, d->packet);
         av_packet_unref(d->packet);
         // A damaged packet costs a glitch, not the whole playback.
         if (ret < 0 && ret != AVERROR_INVALIDDATA) { av_frame_free(&frame); return ret; }
@@ -740,6 +797,13 @@ int jv_decoder_seek(JVDecoder *d, double seconds) {
     int ret = av_seek_frame(d->media->format, d->media->video_stream, ts, AVSEEK_FLAG_BACKWARD);
     if (ret < 0) return ret;
     avcodec_flush_buffers(d->ctx);
+    if (d->choice.hardware_wrapper) {
+        // FFmpeg's V4L2 decoder has no flush: whatever the driver holds
+        // still comes out, ahead of the pictures from the new position.
+        d->stale += d->sent - d->received;
+        d->sent = d->received = 0;
+        d->pending_count = 0;
+    }
     if (d->audio) {
         avcodec_flush_buffers(d->audio);
         swr_close(d->swr);

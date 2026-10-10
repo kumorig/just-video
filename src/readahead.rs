@@ -82,6 +82,14 @@ const STALL_LIMIT: Duration = Duration::from_secs(45);
 const READ_RETRIES: u32 = 3;
 /// How long closing waits for outstanding reads.
 const CLOSE_WAIT: Duration = Duration::from_secs(10);
+/// After a jump, this many blocks are requested even past the in-flight
+/// cap: a keyframe spans several, and waiting for the old window's reads
+/// to drain would fetch them one round trip at a time. It is also where the
+/// window restarts: requesting the whole window at once would queue tens
+/// of MiB on the link, behind which the next seek's data would wait.
+const JUMP_BLOCKS: u64 = 4;
+/// Blocks the window grows by for each block read sequentially.
+const RAMP_BLOCKS: u64 = 2;
 
 pub struct ReadAheadReader<S: BlockSource> {
     runtime: Arc<Runtime>,
@@ -96,6 +104,11 @@ pub struct ReadAheadReader<S: BlockSource> {
     /// can send nothing at all.
     detached: Vec<JoinHandle<io::Result<Vec<u8>>>>,
     in_flight: Arc<AtomicUsize>,
+    /// Blocks requested ahead: small after a jump, growing with sequential
+    /// reads up to `blocks_ahead`.
+    window: u64,
+    /// The block the last read was in.
+    last_block: Option<u64>,
     stats: ReadStats,
     watch: BufferWatch,
 }
@@ -112,6 +125,8 @@ impl<S: BlockSource> ReadAheadReader<S> {
             blocks: BTreeMap::new(),
             detached: Vec::new(),
             in_flight: Arc::new(AtomicUsize::new(0)),
+            window: JUMP_BLOCKS,
+            last_block: None,
             stats: ReadStats::default(),
             watch: Arc::new(Mutex::new(Buffered {
                 position: 0,
@@ -181,17 +196,29 @@ impl<S: BlockSource> ReadAheadReader<S> {
         self.blocks.insert(index, Block::Pending(task));
     }
 
-    /// Keeps `[current, current + blocks_ahead)` requested and drops the rest,
-    /// except one block behind, which absorbs small backward seeks by demuxers.
+    /// Keeps `[current, current + window)` requested, where the window
+    /// restarts small at a jump and grows with sequential reading to
+    /// `blocks_ahead`. Blocks outside `[current - 1, current + blocks_ahead)`
+    /// are dropped; the one behind absorbs small backward seeks by demuxers.
     fn schedule(&mut self, current: u64) {
+        let blocks_ahead = self.options.blocks_ahead as u64;
+        match self.last_block {
+            Some(last) if last == current => {}
+            Some(last) if last + 1 == current => {
+                self.window = (self.window + RAMP_BLOCKS).min(blocks_ahead);
+            }
+            _ => self.window = JUMP_BLOCKS.min(blocks_ahead),
+        }
+        self.last_block = Some(current);
         let block_count = self.len.div_ceil(self.options.block_size as u64);
-        let end = (current + self.options.blocks_ahead as u64).min(block_count);
+        let end = (current + self.window).min(block_count);
+        let keep_until = (current + blocks_ahead).min(block_count);
         let keep_from = current.saturating_sub(1);
         let stale: Vec<u64> = self
             .blocks
             .keys()
             .copied()
-            .filter(|&i| i < keep_from || i >= end)
+            .filter(|&i| i < keep_from || i >= keep_until)
             .collect();
         for index in stale {
             if let Some(Block::Pending(handle)) = self.blocks.remove(&index) {
@@ -201,10 +228,10 @@ impl<S: BlockSource> ReadAheadReader<S> {
         }
         self.detached.retain(|h| !h.is_finished());
         // Detached reads count against the window, so seeking around cannot
-        // pile up requests; the block needed now is always requested.
+        // pile up requests; the blocks needed first are always requested.
         for index in current..end {
             if !self.blocks.contains_key(&index) {
-                if index != current
+                if index >= current + JUMP_BLOCKS
                     && self.in_flight.load(Ordering::SeqCst) >= self.options.blocks_ahead
                 {
                     break;
@@ -495,6 +522,41 @@ mod tests {
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         assert_eq!(out, data);
+    }
+
+    /// A jump requests a few blocks, not the whole window: the next seek
+    /// would wait behind all of it.
+    #[test]
+    fn jumps_request_few_blocks_then_ramp_up() {
+        let options = ReadAhead {
+            block_size: 1000,
+            blocks_ahead: 16,
+        };
+        let (mut r, _) = reader(200_000, 0, options);
+        let mut buf = [0u8; 1000];
+        r.read_exact(&mut buf).unwrap();
+        assert_eq!(r.stats().requests, JUMP_BLOCKS);
+        r.seek(SeekFrom::Start(100_000)).unwrap();
+        r.read_exact(&mut buf).unwrap();
+        assert_eq!(r.stats().requests, 2 * JUMP_BLOCKS);
+        // Reading on grows the window until it is full.
+        for _ in 0..12 {
+            r.read_exact(&mut buf).unwrap();
+        }
+        let requested_ahead = r.blocks.keys().filter(|&&i| i > 112).count() as u64;
+        assert_eq!(
+            requested_ahead,
+            16 - 1,
+            "{:?}",
+            r.blocks.keys().collect::<Vec<_>>()
+        );
+        // Blocks already fetched ahead survive a small backward seek.
+        r.seek(SeekFrom::Start(110_000)).unwrap();
+        r.read_exact(&mut buf).unwrap();
+        assert!(
+            r.blocks.keys().any(|&i| i > 120),
+            "fetched blocks were dropped"
+        );
     }
 
     #[test]

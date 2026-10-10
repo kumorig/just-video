@@ -57,3 +57,57 @@ HEVC 8-bit at 75× real time.
 Conclusion: 8K60 10-bit HEVC is not playable on the Frame CPU. It needs the iris
 hardware decoder to gain 10-bit support (SteamOS/kernel update). Every other format we
 tested plays.
+
+## 10-bit outlook check — 2026-10-07
+
+Still SteamOS 0.3.0, kernel 6.18.0-gfbdbca41fd45, firmware `vpu33_4v.mbn`; iris still lists
+only 8-bit capture formats (Q08C, NV12, NV21, AB24, QC24).
+
+| Test | Result |
+|---|---|
+| 8K60 HEVC **8-bit**, synthetic 80 Mb/s clip, `hevc_v4l2m2m`, 8 capture buffers | **84 fps, 1.4× real time** (same with 4 buffers). The hardware is not the limit for 8K60; only 10-bit output is missing. |
+
+Findings:
+- Mainline Linux 7.2 (2026-08-16) added 10-bit (P010 / QC10C) decode to the iris driver,
+  tested by Qualcomm on SM8550 and SM8650. Turnip still has no Vulkan Video and Adreno has
+  no video block, so that path stays closed.
+- The Frame's `iris.ko` sits at `drivers/media/platform/qcom/vcodec/iris/` and uses
+  Qualcomm downstream symbols (`is_10bit_colorformat`, `vdec_set_bit_depth`), not the
+  mainline driver. The mainline 10-bit series does not apply to it.
+- Valve's Frame hotfix package repos (0.3.x and 0.4.x) already carry a `linux-72-deckard`
+  7.2.0 kernel (built 2026-10-01) next to 6.16/6.17/6.18. Its iris module is the same
+  downstream driver (one tracepoint differs), so a kernel bump alone will not enable 10-bit.
+- Open SteamOS issues on the Frame's iris (VP9 firmware crash #2865, missing
+  DYN_RESOLUTION #2869) had no Valve reply yet.
+
+Conclusion unchanged: 8K60 HEVC Main10 waits on Valve/Qualcomm enabling 10-bit capture
+formats in the Frame's iris driver and firmware. When a SteamOS update lands, check
+`uname -r` and `v4l2-ctl -d /dev/video-dec0 --list-formats` for `P010`.
+
+## Seek stalls and B-frame stutter — 2026-10-10
+
+Same SteamOS 0.3.0 / kernel 6.18 / `vpu33_4v.mbn`. Test file: FC2-PPV-4808888.mp4, 1080p
+29.97 H.264 High with 2 B-frames, 6 Mb/s, moov first, keyframes every 8.3 s, over SMB on
+the direct link. Measured with the hidden `just-video play-probe` command (`--raw` prints
+the pictures a decoder returns around a seek with a luma signature, so two decoders can be
+compared picture by picture).
+
+| Finding | Detail |
+|---|---|
+| FFmpeg's `*_v4l2m2m` decoders have no flush | `avcodec_flush_buffers` leaves whatever the driver holds (up to 16 queued packets plus the reference frames); those pictures come out first after a seek. The player took the first one as the landing point, so a backward seek decoded and dropped everything up to the old position: 5–10 s of "searching". Forward seeks only looked fine because the stale pictures were behind the target. |
+| iris returns timestamps as given, never flags keyframes | The file's pts equal its dts (no composition offsets), so in display order they run 8.275, 8.375, 8.342, 8.408, 8.308… FFmpeg's software decoder falls back to a dts-based best-effort time (consecutive, two frames late); the V4L2 path has no dts, so the pictures showed out of step. `V4L2_BUF_FLAG_KEYFRAME` is never set on capture buffers, and negative times (edit-list leading frames) come back as 4294.9 s (2^32 µs). |
+
+Fix (`native/media.c`, V4L2 wrapper only): each picture takes the earliest time among the
+packets sent and not yet matched (pictures come out in display order, one per packet),
+and the pictures still inside the decoder at a seek are counted and dropped. Verified with
+the signatures: the hardware pictures match the software decoder's one for one. Seeks now
+land in 40–130 ms in both directions (210 ms for a short jump forward that decodes up to
+the target by design), and the file plays at a steady 29.97 fps.
+
+The read-ahead window also restarts at 4 blocks after a jump and grows by 2 per block read
+in sequence: the old 32-block burst sat on the link ahead of the next seek's reads
+(475 ms → 97 ms for a seek right after another).
+
+Still open: a proper V4L2 flush (`VIDIOC_STREAMOFF`/`STREAMON` on both queues) would skip
+decoding the stale pictures (~20 at 8K ≈ 300 ms per seek) and needs FFmpeg's buffer
+bookkeeping patched; and the decoder cannot be restarted after draining at end of stream.

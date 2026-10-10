@@ -50,6 +50,9 @@ pub struct Placement {
     pub curved: bool,
     /// Size multiplier: screen width for flat/curved, magnification for VR180/360.
     pub zoom: f32,
+    /// VR180/360: the viewpoint moved along the placement's -Z towards the
+    /// picture, as a fraction of the sphere's radius (0 = centre).
+    pub offset: f32,
     /// The point the screen orbits: where the head was when it was last
     /// placed or dragged (the reference space's origin is wherever the head
     /// was at the start, which is no use once the viewer has lain down).
@@ -60,6 +63,11 @@ pub struct Placement {
 /// yaw would lose its meaning.
 pub const MAX_PITCH: f32 = 1.5;
 
+/// How far the viewpoint may move inside a spherical video: back a little
+/// (the picture shrinks), or most of the way to the picture.
+pub const MIN_OFFSET: f32 = -0.5;
+pub const MAX_OFFSET: f32 = 0.85;
+
 impl Placement {
     pub fn new(options: &ViewOptions) -> Self {
         Self {
@@ -68,6 +76,7 @@ impl Placement {
             distance: options.screen_distance,
             curved: false,
             zoom: 1.0,
+            offset: 0.0,
             pivot: [0.0; 3],
         }
     }
@@ -139,6 +148,7 @@ mod tests {
             distance: 3.0,
             curved: false,
             zoom: 1.0,
+            offset: 0.0,
             pivot: [0.0; 3],
         };
         let before = p.center();
@@ -205,6 +215,7 @@ mod tests {
             distance: 3.0,
             curved: false,
             zoom: 1.0,
+            offset: 0.0,
             pivot: [0.0; 3],
         };
         // Yaw 90° (left) moves the screen's forward (-Z) to -X.
@@ -356,9 +367,13 @@ fn spawn_audio(
         .expect("spawn audio thread");
 }
 
+/// A seek: generation, target seconds and, for a jump forward, where
+/// playback was (frames before it are never shown).
+type SeekCommand = (u64, f64, Option<f64>);
+
 struct DecodeThread {
     frames: mpsc::Receiver<Decoded>,
-    control: mpsc::Sender<(u64, f64)>,
+    control: mpsc::Sender<SeekCommand>,
     requested: Arc<AtomicU64>,
     /// Which embedded subtitle track to decode (None: none).
     subtitle_track: mpsc::Sender<Option<usize>>,
@@ -377,13 +392,24 @@ fn spawn_decoder(
     let (audio_track, audio_changes) = mpsc::channel::<usize>();
     // A few frames of slack absorb decode jitter; more would only cost memory.
     let (tx, frames) = mpsc::sync_channel(4);
-    let (control, commands) = mpsc::channel::<(u64, f64)>();
+    let (control, commands) = mpsc::channel::<SeekCommand>();
     let requested = Arc::new(AtomicU64::new(0));
     let pending = requested.clone();
     std::thread::Builder::new()
         .name("decode".into())
         .spawn(move || {
             let (mut generation, mut start) = (0u64, start);
+            // After a seek: where it was aimed, and (for a jump forward) where
+            // playback was, until the first frame decides where to show from.
+            let mut landing: Option<(f64, Option<f64>)> = None;
+            // Continuing part way: jump there first, or every frame from the
+            // top would be decoded and dropped.
+            if start > 0.0 {
+                if let Err(e) = decoder.seek(start) {
+                    eprintln!("Seek to {start:.1}s failed: {e:#}");
+                }
+                landing = Some((start, None));
+            }
             'decode: loop {
                 // Before seeks: the seek that follows a switch restarts the new track.
                 while let Ok(track) = audio_changes.try_recv() {
@@ -391,11 +417,12 @@ fn spawn_decoder(
                         eprintln!("Audio: can't decode track {track}");
                     }
                 }
-                while let Ok((g, t)) = commands.try_recv() {
+                while let Ok((g, t, from)) = commands.try_recv() {
                     if let Err(e) = decoder.seek(t) {
                         eprintln!("Seek to {t:.1}s failed: {e:#}");
                     }
                     (generation, start) = (g, t);
+                    landing = Some((t, from));
                 }
                 while let Ok(track) = subtitle_changes.try_recv() {
                     embedded_cues.lock().expect("cues").clear();
@@ -411,6 +438,19 @@ fn spawn_decoder(
                     Ok(None) => Decoded::End(generation),
                     Err(e) => Decoded::Failed(generation, format!("{e:#}")),
                 };
+                // Seeking lands on a keyframe before the target. Show from
+                // there at once rather than decoding (and dropping) up to the
+                // target, unless that keyframe is behind where a jump forward
+                // started: then only the target moves forward.
+                if let (Decoded::Frame(_, frame), Some((target, from))) = (&message, landing)
+                    && let Some(key) = frame.pts()
+                {
+                    start = match from {
+                        Some(from) if key <= from => target,
+                        _ => key,
+                    };
+                    landing = None;
+                }
                 let cues = decoder.take_subtitles();
                 if !cues.is_empty() {
                     let mut shared = embedded_cues.lock().expect("cues");
@@ -437,7 +477,7 @@ fn spawn_decoder(
                         }
                     }
                 }
-                // Seeking lands on the keyframe before `start`; decode through to it.
+                // Frames before where we show from are decoded and dropped.
                 if let Decoded::Frame(_, frame) = &message
                     && frame.pts().is_some_and(|t| t < start)
                 {
@@ -865,6 +905,11 @@ impl Playback {
         self.current.as_ref()
     }
 
+    /// Waiting for the first picture after opening or seeking.
+    pub fn loading(&self) -> bool {
+        self.clock_start.is_none() && !self.ended && self.error.is_none()
+    }
+
     pub fn paused(&self) -> bool {
         self.paused_at.is_some()
     }
@@ -907,7 +952,9 @@ impl Playback {
         }
     }
 
-    /// Jumps to `seconds`; the current picture stays until the new one arrives.
+    /// Jumps to `seconds`; the current picture stays until the new one
+    /// arrives, which is the keyframe at or before the target (a jump
+    /// forward never lands behind where it started).
     pub fn seek(&mut self, seconds: f64) {
         let target = seconds.clamp(0.0, (self.duration - 0.5).max(0.0));
         self.generation += 1;
@@ -918,7 +965,8 @@ impl Playback {
             audio.generation.store(self.generation, Ordering::Relaxed);
             *audio.clock.lock().expect("audio clock") = None;
         }
-        let _ = self.decode.control.send((self.generation, target));
+        let from = (target > self.last_pts).then_some(self.last_pts);
+        let _ = self.decode.control.send((self.generation, target, from));
         self.next = None;
         self.ended = false;
         self.error = None;
@@ -1109,6 +1157,7 @@ pub fn eye_params(
     ];
     let origin = mat_mul_t(placed, [[px, py, pz, 0.0], [0.0; 4], [0.0; 4]])[0];
     let curved = layout.projection == Projection::Flat && placement.curved;
+    let spherical = layout.projection != Projection::Flat;
     EyeParams {
         rot: mat_mul_t(placed, quat_to_columns(view.pose.orientation)),
         tan: [
@@ -1134,7 +1183,12 @@ pub fn eye_params(
             if layout.swap_eyes { 1.0 } else { 0.0 },
             options.fisheye_fov.to_radians(),
         ],
-        screen: [screen[0], screen[1], placement.distance, 0.0],
+        screen: [
+            screen[0],
+            screen[1],
+            placement.distance,
+            if spherical { placement.offset } else { 0.0 },
+        ],
         tex: [w, h, options.debug_view as f32, placement.zoom],
     }
 }

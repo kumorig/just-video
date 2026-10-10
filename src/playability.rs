@@ -134,6 +134,8 @@ pub struct Assessment {
     pub verdict: Verdict,
     /// Short user-facing line, e.g. for a badge tooltip or dialog title.
     pub title: String,
+    /// Just the video's shape, e.g. "4K 60 fps 10-bit HEVC" (for a list row).
+    pub summary: String,
     /// One or two sentences explaining the reason.
     pub detail: Option<String>,
     /// What version of the video would play, when we can tell.
@@ -182,6 +184,7 @@ pub fn assess(platform: Platform, video: Option<&VideoInfo>) -> Assessment {
             platform,
             verdict: Verdict::Unplayable,
             title: "No video track".into(),
+            summary: "No video track".into(),
             detail: Some("This file contains no video stream.".into()),
             hint: None,
             software_speed: None,
@@ -193,6 +196,7 @@ pub fn assess(platform: Platform, video: Option<&VideoInfo>) -> Assessment {
             platform,
             verdict: Verdict::Hardware,
             title: format!("Plays with hardware decoding ({})", describe(v)),
+            summary: describe(v),
             detail: None,
             hint: None,
             software_speed: None,
@@ -216,6 +220,7 @@ pub fn assess(platform: Platform, video: Option<&VideoInfo>) -> Assessment {
             platform,
             verdict: Verdict::Software,
             title: format!("Plays with CPU decoding ({})", describe(v)),
+            summary: describe(v),
             detail: Some(format!("{why_hw}. It is decoded on the CPU instead.")),
             hint: None,
             software_speed: None,
@@ -224,6 +229,7 @@ pub fn assess(platform: Platform, video: Option<&VideoInfo>) -> Assessment {
             platform,
             verdict: Verdict::Software,
             title: format!("Plays with CPU decoding ({})", describe(v)),
+            summary: describe(v),
             detail: Some(format!(
                 "{why_hw}. It is decoded on the CPU instead: playback is smooth but uses more battery."
             )),
@@ -234,6 +240,7 @@ pub fn assess(platform: Platform, video: Option<&VideoInfo>) -> Assessment {
             platform,
             verdict: Verdict::SoftwareMarginal,
             title: format!("May stutter ({})", describe(v)),
+            summary: describe(v),
             detail: Some(format!(
                 "{why_hw}. The CPU can only just keep up with this video, so playback may stutter."
             )),
@@ -244,6 +251,7 @@ pub fn assess(platform: Platform, video: Option<&VideoInfo>) -> Assessment {
             platform,
             verdict: Verdict::Unplayable,
             title: format!("Can't play smoothly on {name} ({})", describe(v)),
+            summary: describe(v),
             detail: Some(format!(
                 "{why_hw}. Decoding it on the CPU instead reaches only about {:.0}% of the speed needed, so playback would stutter badly.",
                 (s * 100.0).floor()

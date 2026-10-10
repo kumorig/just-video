@@ -426,6 +426,7 @@ struct RawFrame {
     full_range: i32,
     transfer: i32,
     hardware: i32,
+    key: i32,
 }
 
 unsafe extern "C" {
@@ -550,6 +551,11 @@ impl Frame {
 
     pub fn hardware(&self) -> bool {
         self.raw.hardware != 0
+    }
+
+    /// The decoder flagged this frame as a keyframe.
+    pub fn key(&self) -> bool {
+        self.raw.key != 0
     }
 
     /// Bytes per sample: 1 for 8-bit, 2 for 10-bit.

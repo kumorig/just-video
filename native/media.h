@@ -82,6 +82,7 @@ typedef struct {
     int32_t full_range;
     int32_t transfer;        // JV_TRANSFER_*
     int32_t hardware;        // produced by a hardware decoder
+    int32_t key;             // decoder flagged it a keyframe
 } JVFrame;
 
 // Opens the video decoder (same selection/fallback rules as jv_media_decode);

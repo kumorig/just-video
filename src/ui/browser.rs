@@ -18,10 +18,9 @@ const ACTION_W: f32 = 150.0;
 const ICON_ACTION_W: f32 = 84.0;
 /// The scrollbar's grab zone at the right edge of the list.
 const SCROLL_W: f32 = 64.0;
-/// Header tool buttons (e.g. "Select", "Delete 3").
+/// Header tool buttons (e.g. "Cancel", "Delete 3").
 const TOOL_W: f32 = 220.0;
 const TOOL_GAP: f32 = 12.0;
-const ICON_TOOL_W: f32 = 84.0;
 
 /// Shown top right so installs can be told apart.
 pub const BUILD: &str = env!("JUST_VIDEO_BUILD");
@@ -51,13 +50,12 @@ pub enum Icon {
     /// A file that isn't a video.
     File,
     Add,
+    /// Close the app.
+    Exit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
-    Rename,
-    /// Delete a file or folder.
-    Delete,
     /// A server's address, login and name.
     Settings,
     /// Remove a saved server.
@@ -65,9 +63,9 @@ pub enum Action {
 }
 
 impl Action {
-    /// Rename is a pencil, Delete and Remove are trash cans; the rest are labelled.
+    /// Remove is a trash can; the rest are labelled.
     fn is_icon(self) -> bool {
-        matches!(self, Action::Rename | Action::Delete | Action::Remove)
+        matches!(self, Action::Remove)
     }
 
     fn width(self) -> f32 {
@@ -80,8 +78,6 @@ impl Action {
 
     fn label(self) -> &'static str {
         match self {
-            Action::Rename => "Rename",
-            Action::Delete => "Delete",
             Action::Settings => "Settings",
             Action::Remove => "Remove",
         }
@@ -102,6 +98,8 @@ pub struct Row {
     pub dimmed: bool,
     /// Outlined: the entry just come back out of.
     pub outlined: bool,
+    /// How much of a video was watched (a line along the row's foot).
+    pub progress: Option<f32>,
 }
 
 impl Row {
@@ -115,6 +113,7 @@ impl Row {
             checked: None,
             dimmed: false,
             outlined: false,
+            progress: None,
         }
     }
 }
@@ -124,18 +123,6 @@ impl Row {
 pub struct Tool {
     pub label: String,
     pub danger: bool,
-    /// Drawn as a square icon button instead of the label.
-    pub icon: Option<ToolIcon>,
-    /// Toggled on (e.g. edit mode).
-    pub active: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ToolIcon {
-    /// Edit mode: rename and delete on each row.
-    Edit,
-    /// Select several entries to delete.
-    Select,
 }
 
 impl Tool {
@@ -143,26 +130,11 @@ impl Tool {
         Self {
             label: label.into(),
             danger,
-            icon: None,
-            active: false,
-        }
-    }
-
-    pub fn icon(icon: ToolIcon, active: bool) -> Self {
-        Self {
-            label: String::new(),
-            danger: false,
-            icon: Some(icon),
-            active,
         }
     }
 
     fn width(&self) -> f32 {
-        if self.icon.is_some() {
-            ICON_TOOL_W
-        } else {
-            TOOL_W
-        }
+        TOOL_W
     }
 }
 
@@ -180,6 +152,9 @@ pub struct Dialog {
 pub struct View {
     /// Breadcrumb path; the last entry is the current place.
     pub crumbs: Vec<String>,
+    /// Shown in place of the breadcrumbs (e.g. "2 selected" while the
+    /// header holds the selection's tools).
+    pub heading: Option<String>,
     pub rows: Vec<Row>,
     /// Shown instead of rows (loading, errors, empty folders).
     pub status: Option<String>,
@@ -335,6 +310,9 @@ pub fn hit(view: &View, fonts: &mut Fonts, x: f32, y: f32) -> Hit {
         if let Some(k) = (0..view.tools.len()).find(|&k| inside(tool_rect(view, k), x, y)) {
             return Hit::Tool(k);
         }
+        if view.heading.is_some() {
+            return Hit::Nothing;
+        }
         // The last crumb is where we are: not a link.
         let last = view.crumbs.len().saturating_sub(1);
         return crumbs
@@ -410,6 +388,13 @@ fn draw_icon(canvas: &mut Canvas, icon: &Icon, cx: f32, cy: f32) {
             canvas.rect(cx - 3.0, cy - 18.0, 6.0, 36.0, 3.0, ACCENT);
             canvas.rect(cx - 18.0, cy - 3.0, 36.0, 6.0, 3.0, ACCENT);
         }
+        Icon::Exit => {
+            // A power symbol: a ring open at the top with a bar through the gap.
+            canvas.circle(cx, cy + 2.0, 17.0, FAINT);
+            canvas.circle(cx, cy + 2.0, 11.0, ROW_BG);
+            canvas.rect(cx - 7.0, cy - 18.0, 14.0, 14.0, 0.0, ROW_BG);
+            canvas.rect(cx - 3.0, cy - 20.0, 6.0, 22.0, 3.0, FAINT);
+        }
     }
 }
 
@@ -421,16 +406,6 @@ fn draw_trash(canvas: &mut Canvas, cx: f32, cy: f32, color: Rgb) {
     for dx in [-6.0, 0.0, 6.0] {
         canvas.rect(cx + dx - 1.5, cy - 3.0, 3.0, 19.0, 1.5, [0x6a, 0x1d, 0x19]);
     }
-}
-
-/// A pencil pointing down-left.
-fn draw_pencil(canvas: &mut Canvas, cx: f32, cy: f32, color: Rgb) {
-    for i in 0..26 {
-        let t = i as f32;
-        canvas.rect(cx - 13.0 + t, cy + 13.0 - t - 4.0, 9.0, 9.0, 2.0, color);
-    }
-    // Tip.
-    canvas.rect(cx - 19.0, cy + 13.0, 6.0, 6.0, 1.0, color);
 }
 
 fn draw_checkbox(canvas: &mut Canvas, cx: f32, cy: f32, checked: bool) {
@@ -510,7 +485,7 @@ pub fn render(
             let mut right_edge = rx + rw - 24.0;
             for (k, action) in row.actions.iter().enumerate() {
                 let (ax, ay, aw, ah) = action_rect(view, i, k);
-                let color = if matches!(action, Action::Remove | Action::Delete) {
+                let color = if *action == Action::Remove {
                     RED
                 } else {
                     ACCENT
@@ -522,9 +497,7 @@ pub fn render(
                     [color[0] / 3, color[1] / 3, color[2] / 3]
                 };
                 canvas.rect(ax, ay, aw, ah, 12.0, fill);
-                if *action == Action::Rename {
-                    draw_pencil(&mut canvas, ax + aw / 2.0, ay + ah / 2.0, TEXT);
-                } else if action.is_icon() {
+                if action.is_icon() {
                     draw_trash(&mut canvas, ax + aw / 2.0, ay + ah / 2.0, TEXT);
                 } else {
                     let label = action.label();
@@ -591,6 +564,19 @@ pub fn render(
                     right_w,
                 );
             }
+            // Where a video was left: a line along the row's foot.
+            if let Some(progress) = row.progress {
+                let (px, pw) = (PAD + 96.0, right_edge - (PAD + 96.0));
+                canvas.rect(px, ry + rh - 5.0, pw, 3.0, 1.5, [0x3a, 0x42, 0x50]);
+                canvas.rect(
+                    px,
+                    ry + rh - 5.0,
+                    pw * progress.clamp(0.0, 1.0),
+                    3.0,
+                    1.5,
+                    ACCENT,
+                );
+            }
         }
         // Cover rows that scrolled under the header or off the bottom.
         canvas.rect(0.0, 0.0, w, HEADER - 8.0, 0.0, BG);
@@ -617,41 +603,38 @@ pub fn render(
         for (k, tool) in view.tools.iter().enumerate() {
             let (x, y, tw, th) = tool_rect(view, k);
             let hovered = hover == Some(Hit::Tool(k));
-            let fill = match (tool.danger, tool.active, hovered) {
-                (true, _, true) => [0xff, 0x6b, 0x60],
-                (true, _, false) => RED,
-                (false, true, true) => [0x6b, 0xa0, 0xff],
-                (false, true, false) => ACCENT,
-                (false, false, true) => HOVER,
-                (false, false, false) => [0x2a, 0x2f, 0x38],
+            let fill = match (tool.danger, hovered) {
+                (true, true) => [0xff, 0x6b, 0x60],
+                (true, false) => RED,
+                (false, true) => HOVER,
+                (false, false) => [0x2a, 0x2f, 0x38],
             };
             canvas.rect(x, y, tw, th, 14.0, fill);
             let (cx, cy) = (x + tw / 2.0, y + th / 2.0);
-            match tool.icon {
-                Some(ToolIcon::Edit) => draw_pencil(&mut canvas, cx, cy, TEXT),
-                Some(ToolIcon::Select) => {
-                    // A ticked box beside two list lines.
-                    draw_checkbox(&mut canvas, cx - 12.0, cy, true);
-                    canvas.rect(cx + 12.0, cy - 12.0, 16.0, 5.0, 2.0, TEXT);
-                    canvas.rect(cx + 12.0, cy + 7.0, 16.0, 5.0, 2.0, TEXT);
-                }
-                None => {
-                    let lw = fonts.measure(&tool.label, 30.0);
-                    fonts.draw(
-                        &mut canvas,
-                        &tool.label,
-                        cx - lw / 2.0,
-                        cy + 11.0,
-                        30.0,
-                        TEXT,
-                        tw,
-                    );
-                }
-            }
+            let lw = fonts.measure(&tool.label, 30.0);
+            fonts.draw(
+                &mut canvas,
+                &tool.label,
+                cx - lw / 2.0,
+                cy + 11.0,
+                30.0,
+                TEXT,
+                tw,
+            );
         }
         let limit = crumb_limit(view, fonts);
         let last = view.crumbs.len().saturating_sub(1);
-        for (i, crumb) in view.crumbs.iter().enumerate() {
+        if let Some(heading) = &view.heading {
+            // The selection's tools need the header: the crumbs make way.
+            let room = WIDTH as f32 - 2.0 * PAD - tools_width(view) - 24.0;
+            fonts.draw(&mut canvas, heading, PAD, 78.0, CRUMB_SIZE, TEXT, room);
+        }
+        for (i, crumb) in view
+            .crumbs
+            .iter()
+            .enumerate()
+            .filter(|_| view.heading.is_none())
+        {
             let (x0, x1) = crumbs[i];
             let hovered = hover == Some(Hit::Crumb(i));
             if hovered {
@@ -855,9 +838,9 @@ mod tests {
             "no actions on row 3"
         );
         view.tools = vec![
-            Tool::icon(ToolIcon::Edit, true),
             Tool::text("Cancel", false),
             Tool::text("Delete 2", true),
+            Tool::text("Move 2", false),
         ];
         for k in 0..3 {
             let (tx, ty, tw, th) = tool_rect(&view, k);
@@ -868,6 +851,12 @@ mod tests {
         }
         let (tx, _, tw, _) = tool_rect(&view, 2);
         assert!(tx + tw <= WIDTH as f32 - PAD + 0.5);
+        view.heading = Some("2 selected".into());
+        assert_eq!(
+            hit(&view, &mut fonts, 100.0, 70.0),
+            Hit::Nothing,
+            "no crumbs under a heading"
+        );
     }
 
     #[test]

@@ -150,6 +150,28 @@ enum Command {
         #[command(flatten)]
         read_ahead: ReadAheadArgs,
     },
+    /// Play a stretch, then seek; log the frame cadence, clock corrections and
+    /// the time to the first picture after each seek (diagnostics).
+    #[command(hide = true)]
+    PlayProbe {
+        input: String,
+        #[arg(long, value_enum, default_value_t = Hw::Auto)]
+        hw: Hw,
+        /// Seconds to play before the first seek (and after the last).
+        #[arg(long, default_value_t = 8.0)]
+        play: f64,
+        /// Seek targets (seconds), in order; the next follows 3 s after one lands.
+        #[arg(long = "seek")]
+        seeks: Vec<f64>,
+        /// Decoder only: print the frames that come out around each seek.
+        #[arg(long)]
+        raw: bool,
+        /// Display refresh to simulate (Hz).
+        #[arg(long, default_value_t = 72.0)]
+        refresh: f64,
+        #[command(flatten)]
+        read_ahead: ReadAheadArgs,
+    },
     /// Decode video frames from the input and report throughput vs. real time.
     Bench {
         input: String,
@@ -514,10 +536,7 @@ fn main() -> anyhow::Result<()> {
                     ""
                 }
             );
-            let mut decoder = media.into_decoder(hw_backend(hw), true, "")?;
-            if start > 0.0 {
-                decoder.seek(start)?;
-            }
+            let decoder = media.into_decoder(hw_backend(hw), true, "")?;
             if let Some(note) = &decoder.stats().note {
                 eprintln!("Decoder: {} ({note})", decoder.stats().decoder);
             } else {
@@ -809,9 +828,7 @@ fn main() -> anyhow::Result<()> {
             }))?;
         }
         Command::UiPreview { dir } => {
-            use just_video::ui::browser::{
-                Action, Dialog, Icon, Row, Tool, ToolIcon, View, render,
-            };
+            use just_video::ui::browser::{Dialog, Icon, Row, Tool, View, render};
             use just_video::ui::form::{Field, Form};
             let mut fonts = just_video::ui::canvas::Fonts::load()?;
             std::fs::create_dir_all(&dir)?;
@@ -824,29 +841,37 @@ fn main() -> anyhow::Result<()> {
             let crumbs = |c: &[&str]| c.iter().map(|s| s.to_string()).collect::<Vec<_>>();
             let folder = View {
                 crumbs: crumbs(&["Just Video", "NAS", "media", "Videos", "VR"]),
-                tools: vec![Tool::text("Cancel", false), Tool::text("Delete 2", true)],
+                heading: Some("2 selected".into()),
+                tools: vec![
+                    Tool::text("Cancel", false),
+                    Tool::text("Delete 2", true),
+                    Tool::text("Move 2", false),
+                ],
                 rows: vec![
                     Row {
                         outlined: true,
                         ..row(Icon::Folder, "Concerts", "", "")
                     },
-                    row(
-                        Icon::Video(Some(Verdict::Software)),
-                        "Documentary.2160p.HDR.mkv",
-                        "Plays with CPU decoding (4K 60 fps 10-bit HEVC)",
-                        "28.2 GB",
-                    ),
+                    Row {
+                        progress: Some(0.42),
+                        ..row(
+                            Icon::Video(Some(Verdict::Software)),
+                            "Documentary.2160p.HDR.mkv",
+                            "4K 60 fps 10-bit HEVC",
+                            "28.2 GB",
+                        )
+                    },
                     row(
                         Icon::Video(Some(Verdict::Hardware)),
                         "h264.mp4",
-                        "Plays with hardware decoding (1080p 24 fps 8-bit H.264)",
+                        "1080p 24 fps 8-bit H.264",
                         "1.8 GB",
                     ),
                     row(Icon::Video(None), "h265.mkv", "Checking…", "88.4 MB"),
                     row(
                         Icon::Video(Some(Verdict::Unplayable)),
                         "concert_8k.mp4",
-                        "Can't play smoothly on Steam Frame (8K 60 fps 10-bit HEVC)",
+                        "8K 60 fps 10-bit HEVC",
                         "5.1 GB",
                     ),
                     row(Icon::Broken, "damaged.mp4", "Can't read this file", "12 KB"),
@@ -858,7 +883,7 @@ fn main() -> anyhow::Result<()> {
                     row(
                         Icon::Video(Some(Verdict::Hardware)),
                         "旅行_180_LR.mp4",
-                        "Plays with hardware decoding (5.7K 30 fps 8-bit HEVC)",
+                        "5.7K 30 fps 8-bit HEVC",
                         "3.3 GB",
                     ),
                 ],
@@ -887,22 +912,23 @@ fn main() -> anyhow::Result<()> {
                         detail: "A Windows PC, NAS or Samba server on your network".into(),
                         ..Row::new(Icon::Add, "Add server")
                     },
+                    Row {
+                        detail: "Close just-video".into(),
+                        ..Row::new(Icon::Exit, "Exit")
+                    },
                 ],
                 ..Default::default()
             };
-            // Edit mode: rename/delete on each row.
-            let mut editing = folder.clone();
-            editing.tools = vec![
-                Tool::icon(ToolIcon::Select, false),
-                Tool::icon(ToolIcon::Edit, true),
-            ];
-            for row in &mut editing.rows {
+            // Nothing held: crumbs instead of the heading, no ticks or tools.
+            let mut browsing = folder.clone();
+            browsing.heading = None;
+            browsing.tools.clear();
+            for row in &mut browsing.rows {
                 row.checked = None;
-                row.actions = vec![Action::Rename, Action::Delete];
             }
             just_video::ui::save_png(
-                &render(&editing, &mut fonts, Some((700.0, 400.0)), true),
-                &dir.join("editing.png"),
+                &render(&browsing, &mut fonts, Some((700.0, 400.0)), true),
+                &dir.join("browsing.png"),
             )?;
             let mut adding = servers.clone();
             adding.form = Some(Form::new(
@@ -1090,6 +1116,197 @@ fn main() -> anyhow::Result<()> {
                 "mbit_per_second": total as f64 * 8.0 / seconds / 1e6,
                 "read_stats": reader.stats(),
             }))?;
+        }
+        Command::PlayProbe {
+            input,
+            hw,
+            play,
+            seeks,
+            raw,
+            refresh,
+            read_ahead,
+        } => {
+            use std::time::Duration;
+            let (source, _session, watch) = open_input_watched(&input, read_ahead.get())?;
+            let media = Media::open(file_name(&input), source)?;
+            let layout = vr::detect(&input, media.info().video.as_ref());
+            let fps = media.info().video.as_ref().map_or(30.0, |v| v.fps.max(1.0));
+            let frame_dur = 1.0 / fps;
+            let mut decoder = media.into_decoder(hw_backend(hw), true, "")?;
+            eprintln!("decoder: {:?}", decoder.stats());
+            if raw {
+                let started = Instant::now();
+                let mut n = 0u32;
+                let mut last = None;
+                while let Some(frame) = decoder.next_frame()? {
+                    n += 1;
+                    last = frame.pts();
+                    if frame.pts().is_some_and(|t| t >= play) {
+                        break;
+                    }
+                }
+                eprintln!(
+                    "decoded {n} frames to pts {last:?} in {:.2}s",
+                    started.elapsed().as_secs_f64()
+                );
+                for target in seeks {
+                    let at = Instant::now();
+                    decoder.seek(target)?;
+                    eprintln!(
+                        "seek -> {target:.1}s returned after {:.1} ms",
+                        at.elapsed().as_secs_f64() * 1e3
+                    );
+                    let mut shown = 0;
+                    while let Some(frame) = decoder.next_frame()? {
+                        // Coarse luma signature (4x4 grid of means): tells
+                        // whether two decoders deliver the same pictures in
+                        // the same order, whatever they say the pts is.
+                        let (w, h, _) = frame.plane_size(0);
+                        let (mut sums, mut counts) = ([0u64; 16], [0u64; 16]);
+                        for (y, row) in frame.rows(0).enumerate().step_by(8) {
+                            let cell_y = (y as u32 * 4 / h.max(1)).min(3) as usize;
+                            for (x, &v) in row.iter().enumerate().step_by(8) {
+                                let cell = cell_y * 4 + (x as u32 * 4 / w.max(1)).min(3) as usize;
+                                sums[cell] += v as u64;
+                                counts[cell] += 1;
+                            }
+                        }
+                        let signature: String = sums
+                            .iter()
+                            .zip(&counts)
+                            .map(|(s, c)| format!("{:02x}", s / c.max(&1)))
+                            .collect();
+                        eprintln!(
+                            "  +{:7.1} ms  pts {:>10}  {}{}",
+                            at.elapsed().as_secs_f64() * 1e3,
+                            frame.pts().map_or("none".into(), |t| format!("{t:.4}")),
+                            signature,
+                            if frame.key() { "  KEY" } else { "" }
+                        );
+                        shown += 1;
+                        if shown >= 40 {
+                            break;
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            let mut playback = just_video::xr::player::Playback::start(decoder, layout, 0.0, 0.05);
+            if let Some(watch) = watch {
+                playback.set_buffer(watch);
+            }
+            let origin = Instant::now();
+            let now_ns = || origin.elapsed().as_nanos() as i64 + 1_000_000_000;
+            let period = Duration::from_secs_f64(1.0 / refresh);
+            let mut last_shown: Option<(Instant, f64)> = None;
+            let (mut shown, mut gaps, mut worst_gap, mut corrections) = (0u64, 0u64, 0.0f64, 0u64);
+            let mut last_offset: Option<f64> = None;
+            let mut seeks = seeks.into_iter();
+            let mut next_seek_at = origin + Duration::from_secs_f64(play);
+            let mut pending: Option<(Instant, f64)> = None;
+            let mut after_landing = 0;
+            let mut report_at = origin + Duration::from_secs(2);
+            let mut shown_since_report = 0u64;
+            loop {
+                let now = now_ns();
+                if playback.advance(now) {
+                    shown += 1;
+                    shown_since_report += 1;
+                    let pts = playback.position();
+                    let wall = Instant::now();
+                    if let Some((t0, p0)) = last_shown
+                        && pending.is_none()
+                    {
+                        let gap = (wall - t0).as_secs_f64();
+                        if gap > 2.5 * frame_dur {
+                            gaps += 1;
+                            worst_gap = worst_gap.max(gap);
+                            eprintln!(
+                                "[{:6.2}] gap {:.0} ms before pts {pts:.3} (previous {p0:.3})",
+                                origin.elapsed().as_secs_f64(),
+                                gap * 1e3
+                            );
+                        }
+                    }
+                    last_shown = Some((wall, pts));
+                    if let Some((issued, target)) = pending.take() {
+                        eprintln!(
+                            "[{:6.2}] landed {:.0} ms after seek -> {target:.1}s: first picture pts {pts:.3}",
+                            origin.elapsed().as_secs_f64(),
+                            issued.elapsed().as_secs_f64() * 1e3
+                        );
+                        next_seek_at = wall + Duration::from_secs(3);
+                        after_landing = 6;
+                        last_offset = None;
+                    } else if after_landing > 0 {
+                        eprintln!("         then pts {pts:.3}");
+                        after_landing -= 1;
+                    }
+                }
+                if pending.is_none()
+                    && let Some(media_time) = playback.media_time(now)
+                {
+                    let offset = media_time - origin.elapsed().as_secs_f64();
+                    if let Some(previous) = last_offset
+                        && (offset - previous).abs() > 0.004
+                    {
+                        corrections += 1;
+                        if corrections <= 60 {
+                            eprintln!(
+                                "[{:6.2}] clock moved {:+.1} ms at pts {:.2}",
+                                origin.elapsed().as_secs_f64(),
+                                (offset - previous) * 1e3,
+                                playback.position()
+                            );
+                        }
+                    }
+                    last_offset = Some(offset);
+                }
+                if Instant::now() >= report_at {
+                    eprintln!(
+                        "[{:6.2}] pts {:.2}  {} frames in the last 2 s (expected {:.0})  loading={}",
+                        origin.elapsed().as_secs_f64(),
+                        playback.position(),
+                        shown_since_report,
+                        2.0 * fps,
+                        playback.loading()
+                    );
+                    shown_since_report = 0;
+                    report_at += Duration::from_secs(2);
+                }
+                if pending.is_none() && Instant::now() >= next_seek_at {
+                    match seeks.next() {
+                        Some(target) => {
+                            eprintln!(
+                                "[{:6.2}] seek -> {target:.1}s (from {:.2}s)",
+                                origin.elapsed().as_secs_f64(),
+                                playback.position()
+                            );
+                            playback.seek(target);
+                            pending = Some((Instant::now(), target));
+                        }
+                        _ => break,
+                    }
+                }
+                if let Some((issued, _)) = pending
+                    && issued.elapsed() > Duration::from_secs(30)
+                {
+                    eprintln!("seek never landed");
+                    break;
+                }
+                if playback.finished(now) {
+                    eprintln!("finished");
+                    break;
+                }
+                std::thread::sleep(period);
+            }
+            eprintln!(
+                "shown {shown} frames in {:.1}s, {gaps} gaps (worst {:.0} ms), {corrections} clock corrections, skipped {}",
+                origin.elapsed().as_secs_f64(),
+                worst_gap * 1e3,
+                playback.stats.skipped_frames
+            );
+            just_video::xr::app::drop_in_background(playback);
         }
         Command::Bench {
             input,

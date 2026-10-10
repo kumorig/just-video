@@ -1,13 +1,12 @@
 //! Browser state: servers → shares → folders → videos. Talks to the
 //! [`Library`] workers and turns their results into a [`View`].
 //!
-//! Holding select on an entry enters edit mode with it selected: the header
-//! then offers Delete, Move and (for one entry) Rename, and other entries
-//! can be ticked. The pencil tool enters edit mode too, with Rename and
-//! Delete on every row. Holding select on a server reveals its Settings
-//! and Remove buttons.
+//! Holding select on an entry selects it: the header then offers Delete,
+//! Move and (for one entry) Rename or Start over in place of the
+//! breadcrumbs, and other entries can be ticked. Holding select on a server
+//! reveals its Settings and Remove buttons.
 
-use super::browser::{Action, Dialog, Hit, Icon, Row, Tool, ToolIcon, View, format_size};
+use super::browser::{Action, Dialog, Hit, Icon, Row, Tool, View, format_size};
 use super::form::{self, Field, Form, Key};
 use crate::config::{self, Server};
 use crate::library::{Library, Listing, MoveSelection, Opened, Path, Request, Response};
@@ -55,6 +54,8 @@ enum Location {
 enum Item {
     Server(Server),
     AddServer,
+    /// Closes the app; last on the top page.
+    Exit,
     Share(String),
     Dir(String),
     Video {
@@ -62,6 +63,8 @@ enum Item {
         size: u64,
         assessment: Option<Assessment>,
         broken: Option<String>,
+        /// Where it was left (seconds) and its length, if remembered.
+        resume: Option<(f64, Option<f64>)>,
     },
     /// A file that isn't a video: shown dimmed, can be renamed or deleted.
     File {
@@ -74,7 +77,7 @@ impl Item {
     fn name(&self) -> &str {
         match self {
             Item::Server(s) => &s.name,
-            Item::AddServer => "",
+            Item::AddServer | Item::Exit => "",
             Item::Share(n)
             | Item::Dir(n)
             | Item::Video { name: n, .. }
@@ -97,9 +100,9 @@ impl Item {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ToolAction {
-    ToggleEdit,
-    StartSelect,
     CancelSelect,
+    /// Forget where the selected video was left.
+    ForgetResume,
     DeleteSelected,
     MoveSelected,
     RenameSelected,
@@ -136,15 +139,14 @@ pub struct Navigator {
     items: Vec<Item>,
     view: View,
     purpose: Option<Purpose>,
-    /// Selecting entries to move or delete: their indexes. On the server
-    /// list, the one server showing its Settings and Remove buttons.
+    /// Entries held and ticked, to move, delete, rename or start over
+    /// (the header shows the tools). On the server list, the one server
+    /// showing its Settings and Remove buttons.
     selecting: Option<HashSet<usize>>,
     /// Sources survive navigation until a destination is chosen or cancelled.
     moving: Option<MoveSelection>,
     move_request: Option<u64>,
     folder_loaded: bool,
-    /// Edit mode (inside an unlocked server): rename/delete on each row.
-    edit_mode: bool,
     /// What each header tool does.
     tool_actions: Vec<ToolAction>,
     /// The item being played (for previous/next).
@@ -167,6 +169,8 @@ pub struct Navigator {
     next_id: u64,
     generation: u64,
     dirty: bool,
+    /// Exit was chosen on the top page; the app reads it with [`Navigator::take_exit`].
+    exit_requested: bool,
 }
 
 impl Navigator {
@@ -181,7 +185,6 @@ impl Navigator {
             moving: None,
             move_request: None,
             folder_loaded: false,
-            edit_mode: false,
             tool_actions: Vec::new(),
             playing: None,
             pending: None,
@@ -195,6 +198,7 @@ impl Navigator {
             next_id: 1,
             generation: 0,
             dirty: true,
+            exit_requested: false,
         };
         nav.show_servers();
         nav
@@ -205,6 +209,11 @@ impl Navigator {
     }
 
     /// True (once) when the view changed and must be redrawn.
+    /// Whether Exit was chosen since the last call.
+    pub fn take_exit(&mut self) -> bool {
+        std::mem::take(&mut self.exit_requested)
+    }
+
     pub fn take_dirty(&mut self) -> bool {
         std::mem::take(&mut self.dirty)
     }
@@ -341,6 +350,7 @@ impl Navigator {
         });
         self.items = servers.into_iter().map(Item::Server).collect();
         self.items.push(Item::AddServer);
+        self.items.push(Item::Exit);
         self.restore_scroll();
         self.rebuild_rows();
     }
@@ -412,6 +422,10 @@ impl Navigator {
                         detail: "A Windows PC, NAS or Samba server on your network".into(),
                         ..Row::new(Icon::Add, "Add server")
                     },
+                    Item::Exit => Row {
+                        detail: "Close just-video".into(),
+                        ..Row::new(Icon::Exit, "Exit")
+                    },
                     Item::Share(name) => Row::new(Icon::Share, name),
                     Item::Dir(name) => Row::new(Icon::Folder, name),
                     Item::Video {
@@ -419,6 +433,7 @@ impl Navigator {
                         size,
                         assessment,
                         broken,
+                        resume,
                     } => Row {
                         icon: match (assessment, broken) {
                             (_, Some(_)) => Icon::Broken,
@@ -427,10 +442,12 @@ impl Navigator {
                         },
                         detail: match (assessment, broken) {
                             (_, Some(_)) => "Can't read this file".into(),
-                            (Some(a), None) => a.title.clone(),
+                            (Some(a), None) => a.summary.clone(),
                             (None, None) => "Checking…".into(),
                         },
                         right: format_size(*size),
+                        progress: resume
+                            .and_then(|(at, duration)| duration.map(|d| (at / d) as f32)),
                         ..Row::new(Icon::Video(None), name)
                     },
                     Item::File { name, size } => Row {
@@ -440,19 +457,14 @@ impl Navigator {
                     },
                 };
                 row.outlined = self.came_from.as_deref() == Some(item.trail_name());
-                if item.is_entry() {
-                    match selecting {
-                        Some(selected) => row.checked = Some(selected.contains(&i)),
-                        None if editing && self.edit_mode && self.moving.is_none() => {
-                            row.actions = vec![Action::Rename, Action::Delete]
-                        }
-                        None => {}
-                    }
+                if item.is_entry()
+                    && let Some(selected) = selecting
+                {
+                    row.checked = Some(selected.contains(&i));
                 }
                 row
             })
             .collect();
-        let has_entries = self.items.iter().any(Item::is_entry);
         let tools: Vec<(Tool, ToolAction)> = if self.move_request.is_some() {
             Vec::new()
         } else if self.listing.is_some() && self.pending.is_some() {
@@ -468,29 +480,35 @@ impl Navigator {
                 Some(selected) => {
                     let mut tools = vec![(Tool::text("Cancel", false), ToolAction::CancelSelect)];
                     if !selected.is_empty() && editing {
-                        let delete = Tool::text(format!("Delete {}", selected.len()), true);
+                        // One item needs no count.
+                        let count = |verb: &str| match selected.len() {
+                            1 => verb.to_string(),
+                            n => format!("{verb} {n}"),
+                        };
+                        let delete = Tool::text(count("Delete"), true);
                         tools.push((delete, ToolAction::DeleteSelected));
-                        tools.push((
-                            Tool::text(format!("Move {}", selected.len()), false),
-                            ToolAction::MoveSelected,
-                        ));
+                        tools.push((Tool::text(count("Move"), false), ToolAction::MoveSelected));
                         if selected.len() == 1 {
                             tools.push((Tool::text("Rename", false), ToolAction::RenameSelected));
                         }
+                        if self.selected_resume().is_some() {
+                            tools.push((Tool::text("Start over", false), ToolAction::ForgetResume));
+                        }
                     }
                     tools
-                }
-                None if editing && has_entries && self.edit_mode => vec![
-                    (Tool::icon(ToolIcon::Select, false), ToolAction::StartSelect),
-                    (Tool::icon(ToolIcon::Edit, true), ToolAction::ToggleEdit),
-                ],
-                None if editing && has_entries => {
-                    vec![(Tool::icon(ToolIcon::Edit, false), ToolAction::ToggleEdit)]
                 }
                 None => Vec::new(),
             }
         };
         (self.view.tools, self.tool_actions) = tools.into_iter().unzip();
+        // The selection's tools take the header; a count stands in for the crumbs.
+        self.view.heading = match &self.selecting {
+            Some(selected) if editing => Some(match selected.len() {
+                0 => "Select items".to_string(),
+                n => format!("{n} selected"),
+            }),
+            _ => None,
+        };
         self.view.clamp_scroll();
         self.dirty = true;
     }
@@ -567,6 +585,7 @@ impl Navigator {
                                             size: e.size,
                                             assessment: None,
                                             broken: None,
+                                            resume: None,
                                         }
                                     }
                                 })
@@ -586,6 +605,7 @@ impl Navigator {
                                 }
                             }
                             self.probes = (0, sent);
+                            self.refresh_resume();
                             self.view.status = if self.items.is_empty() {
                                 Some("This folder is empty.".into())
                             } else {
@@ -725,8 +745,6 @@ impl Navigator {
             Hit::DialogButton(i) => self.click_dialog(i),
             Hit::Crumb(i) => self.go_to_crumb(i),
             Hit::Tool(k) => self.click_tool(k),
-            Hit::RowAction(i, Action::Rename) => self.start_rename(i),
-            Hit::RowAction(i, Action::Delete) => self.confirm_delete(vec![i]),
             Hit::RowAction(i, Action::Settings) => self.start_edit_server(i),
             Hit::RowAction(i, Action::Remove) => self.confirm_remove_server(i),
             Hit::Row(i) => self.select(i),
@@ -736,9 +754,8 @@ impl Navigator {
 
     fn click_tool(&mut self, k: usize) {
         match self.tool_actions.get(k) {
-            Some(ToolAction::ToggleEdit) => self.edit_mode = !self.edit_mode,
-            Some(ToolAction::StartSelect) => self.selecting = Some(HashSet::new()),
             Some(ToolAction::CancelSelect) => self.selecting = None,
+            Some(ToolAction::ForgetResume) => self.forget_resume(),
             Some(ToolAction::DeleteSelected) => {
                 let mut indices: Vec<usize> = self.selecting.iter().flatten().copied().collect();
                 indices.sort_unstable();
@@ -792,7 +809,90 @@ impl Navigator {
             paths,
         });
         self.selecting = None;
-        self.edit_mode = false;
+    }
+
+    /// The one selected video that was left part way, if that is the selection.
+    fn selected_resume(&self) -> Option<usize> {
+        let selected = self.selecting.as_ref()?;
+        if selected.len() != 1 {
+            return None;
+        }
+        let &index = selected.iter().next()?;
+        match self.items.get(index) {
+            Some(Item::Video {
+                resume: Some(_), ..
+            }) => Some(index),
+            _ => None,
+        }
+    }
+
+    /// Forgets where the selected video was left, so it starts from the top.
+    fn forget_resume(&mut self) {
+        let Some(index) = self.selected_resume() else {
+            return;
+        };
+        let Location::Folder {
+            server,
+            share,
+            mut path,
+        } = self.location.clone()
+        else {
+            return;
+        };
+        if let Some(Item::Video { name, resume, .. }) = self.items.get_mut(index) {
+            path.push(name.clone());
+            let key = crate::library::file_key(&server, &share, &path);
+            if let Err(e) = config::save_resume_position(&key, None) {
+                eprintln!("Can't forget where the video was left: {e:#}");
+            }
+            *resume = None;
+        }
+        self.selecting = None;
+    }
+
+    /// Marks the videos in this folder that were left part way.
+    fn refresh_resume(&mut self) {
+        let Location::Folder {
+            server,
+            share,
+            path,
+        } = self.location.clone()
+        else {
+            return;
+        };
+        let all = config::resume_positions();
+        for item in &mut self.items {
+            if let Item::Video { name, resume, .. } = item {
+                let mut file = path.clone();
+                file.push(name.clone());
+                *resume = all
+                    .get(&crate::library::file_key(&server, &share, &file))
+                    .copied();
+            }
+        }
+    }
+
+    /// After playing `key`: where it was left (None: watched or forgotten),
+    /// for the row's marker. The file itself is written in the background.
+    pub fn note_resume(&mut self, key: &str, point: Option<(f64, Option<f64>)>) {
+        let Location::Folder {
+            server,
+            share,
+            path,
+        } = self.location.clone()
+        else {
+            return;
+        };
+        for item in &mut self.items {
+            if let Item::Video { name, resume, .. } = item {
+                let mut file = path.clone();
+                file.push(name.clone());
+                if crate::library::file_key(&server, &share, &file) == key {
+                    *resume = point;
+                }
+            }
+        }
+        self.rebuild_rows();
     }
 
     fn move_here(&mut self) {
@@ -879,7 +979,6 @@ impl Navigator {
                 self.selecting = Some(HashSet::from([index]));
             }
             Some(item) if item.is_entry() => {
-                self.edit_mode = true;
                 self.selecting
                     .get_or_insert_with(HashSet::new)
                     .insert(index);
@@ -978,6 +1077,7 @@ impl Navigator {
         match (item, self.location.clone()) {
             (Item::Server(s), _) => self.navigate(Location::Shares { server: s.clone() }),
             (Item::AddServer, _) => self.start_server_form(None),
+            (Item::Exit, _) => self.exit_requested = true,
             (Item::Share(name), Location::Shares { server }) => self.navigate(Location::Folder {
                 server,
                 share: name.clone(),
@@ -1322,10 +1422,6 @@ impl Navigator {
             self.rebuild_rows();
             return true;
         }
-        if std::mem::take(&mut self.edit_mode) && self.editing() {
-            self.rebuild_rows();
-            return true;
-        }
         match self.location.clone() {
             Location::Servers => return false,
             Location::Shares { .. } => self.show_servers(),
@@ -1592,56 +1688,86 @@ mod tests {
     }
 
     #[test]
-    fn server_list_offers_adding_one() {
-        let nav = Navigator::new(Library::start(None));
-        let last = nav.view().rows.last().expect("rows");
-        assert_eq!(last.icon, Icon::Add);
+    fn server_list_offers_adding_one_and_exiting() {
+        let mut nav = Navigator::new(Library::start(None));
+        let icons: Vec<Icon> = nav.view().rows.iter().map(|r| r.icon.clone()).collect();
+        assert_eq!(&icons[icons.len() - 2..], [Icon::Add, Icon::Exit]);
         assert_eq!(nav.view().crumbs, vec!["Just Video".to_string()]);
+        assert!(!nav.take_exit());
+        nav.click(Hit::Row(icons.len() - 1));
+        assert!(nav.take_exit());
+        assert!(!nav.take_exit(), "reported once");
     }
 
     #[test]
-    fn edit_mode_enables_rename_and_multi_delete() {
+    fn holding_an_entry_selects_it_and_offers_tools() {
         let mut nav = Navigator::new(Library::start(None));
         let server = Server {
             name: "NAS".into(),
             url: "smb://u@nas".into(),
         };
         nav.show_entries_for_test(server.clone(), &["a", "b", "c"]);
-        assert!(
-            nav.view().rows[0].actions.is_empty(),
-            "rename/delete wait for edit mode"
-        );
-        assert_eq!(nav.view().tools.len(), 1, "edit");
+        assert!(nav.view().rows.iter().all(|r| r.actions.is_empty()));
+        assert!(nav.view().tools.is_empty(), "no edit toggle");
+        assert!(nav.view().heading.is_none());
 
-        nav.click(Hit::Tool(0));
-        assert_eq!(
-            nav.view().rows[0].actions,
-            vec![Action::Rename, Action::Delete]
-        );
-        assert_eq!(nav.view().tools.len(), 2, "select + edit");
+        nav.long_press(1);
+        assert_eq!(nav.view().rows[1].checked, Some(true), "long press selects");
+        assert_eq!(nav.view().rows[0].checked, Some(false));
+        assert!(nav.view().rows.iter().all(|r| r.actions.is_empty()));
+        assert_eq!(nav.view().heading.as_deref(), Some("1 selected"));
+        let labels: Vec<&str> = nav.view().tools.iter().map(|t| t.label.as_str()).collect();
+        assert_eq!(labels, ["Cancel", "Delete", "Move", "Rename"]);
 
-        nav.click(Hit::Tool(0));
-        assert!(nav.view().rows.iter().all(|r| r.checked == Some(false)));
-        nav.click(Hit::Row(0));
         nav.click(Hit::Row(2));
-        assert_eq!(nav.view().tools[1].label, "Delete 2");
+        assert_eq!(nav.view().heading.as_deref(), Some("2 selected"));
+        let labels: Vec<&str> = nav.view().tools.iter().map(|t| t.label.as_str()).collect();
+        assert_eq!(labels, ["Cancel", "Delete 2", "Move 2"], "rename needs one");
         nav.click(Hit::Row(2));
-        assert_eq!(nav.view().tools[1].label, "Delete 1");
         nav.click(Hit::Tool(1));
         assert!(nav.dialog_open());
         assert!(nav.back(), "closes the dialog");
         assert!(nav.back(), "leaves selection");
         assert!(nav.view().rows.iter().all(|r| r.checked.is_none()));
-        assert!(nav.back(), "leaves edit mode");
-        assert!(nav.view().rows[0].actions.is_empty());
+        assert!(nav.view().heading.is_none(), "crumbs are back");
 
         nav.long_press(1);
-        assert_eq!(nav.view().rows[1].checked, Some(true), "long press selects");
-        let labels: Vec<&str> = nav.view().tools.iter().map(|t| t.label.as_str()).collect();
-        assert_eq!(labels, ["Cancel", "Delete 1", "Move 1", "Rename"]);
         nav.click(Hit::Tool(3));
         assert!(matches!(nav.purpose, Some(Purpose::Rename(1))));
         assert_eq!(nav.view().form.as_ref().map(|f| f.value(0)), Some("b"));
+    }
+
+    #[test]
+    fn a_video_left_part_way_can_start_over() {
+        let mut nav = Navigator::new(Library::start(None));
+        let server = Server {
+            name: "NAS".into(),
+            url: "smb://u@nas".into(),
+        };
+        nav.show_entries_for_test(server.clone(), &["folder"]);
+        // Marked directly: the config directory is the user's in tests, and
+        // forgetting a key that isn't saved writes nothing.
+        nav.items.push(Item::Video {
+            name: "clip.mp4".into(),
+            size: 1,
+            assessment: None,
+            broken: None,
+            resume: Some((600.0, Some(2400.0))),
+        });
+        nav.rebuild_rows();
+        assert_eq!(nav.view().rows[1].progress, Some(0.25));
+
+        nav.long_press(1);
+        let labels: Vec<&str> = nav.view().tools.iter().map(|t| t.label.as_str()).collect();
+        assert_eq!(labels, ["Cancel", "Delete", "Move", "Rename", "Start over"]);
+        nav.click(Hit::Tool(4));
+        assert!(nav.selecting.is_none());
+        assert_eq!(nav.view().rows[1].progress, None);
+        assert!(nav.view().heading.is_none());
+
+        let key = crate::library::file_key(&server, "s", &vec!["clip.mp4".to_string()]);
+        nav.note_resume(&key, Some((1200.0, Some(2400.0))));
+        assert_eq!(nav.view().rows[1].progress, Some(0.5));
     }
 
     #[test]
@@ -1715,6 +1841,7 @@ mod tests {
             size: 1,
             assessment: None,
             broken: broken.then(|| "bad".to_string()),
+            resume: None,
         };
         let file = Item::File {
             name: "notes.txt".into(),

@@ -13,4 +13,6 @@ export PKG_CONFIG_LIBDIR_$t="$media/lib/pkgconfig"
 export PKG_CONFIG_PATH_$t="$media/lib/pkgconfig"
 export JUST_VIDEO_STATIC_FFMPEG=1
 export CFLAGS_$t="-mcpu=cortex_a720 -O3"
+# Rust code tuned for the Frame's Cortex-A720 cores too (the C side is above).
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=cortex-a720"
 exec cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.39 "$@"

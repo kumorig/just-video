@@ -161,6 +161,9 @@ struct Resume {
     seconds: f64,
     /// Unix time of the save; the oldest are forgotten first.
     saved: u64,
+    /// The video's length, for showing how much was watched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    duration: Option<f64>,
 }
 
 /// Videos whose place is remembered; older ones are forgotten.
@@ -175,16 +178,36 @@ pub fn resume_position(key: &str) -> Option<f64> {
     all.get(key).map(|r| r.seconds)
 }
 
-/// Remembers (or with `None`, forgets) where a file was left.
-pub fn save_resume_position(key: &str, seconds: Option<f64>) -> anyhow::Result<()> {
+/// Every remembered place: file key to (seconds, video length if known).
+pub fn resume_positions() -> BTreeMap<String, (f64, Option<f64>)> {
+    read_json::<BTreeMap<String, Resume>>("resume.json")
+        .map(|all| {
+            all.into_iter()
+                .map(|(k, r)| (k, (r.seconds, r.duration)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Remembers (or with `None`, forgets) where a file was left, with the
+/// video's length when known (so the browser can show how much was watched).
+pub fn save_resume_position(key: &str, point: Option<(f64, Option<f64>)>) -> anyhow::Result<()> {
     let _guard = RESUME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut all: BTreeMap<String, Resume> = read_json("resume.json")?;
-    match seconds {
-        Some(seconds) => {
+    match point {
+        Some((seconds, duration)) => {
             let saved = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs());
-            all.insert(key.to_string(), Resume { seconds, saved });
+            let duration = duration.filter(|d| *d > 0.0);
+            all.insert(
+                key.to_string(),
+                Resume {
+                    seconds,
+                    saved,
+                    duration,
+                },
+            );
             while all.len() > MAX_RESUMES {
                 let oldest = all
                     .iter()
@@ -201,9 +224,9 @@ pub fn save_resume_position(key: &str, seconds: Option<f64>) -> anyhow::Result<(
 }
 
 pub fn move_resume_position(from: &str, to: &str) -> anyhow::Result<()> {
-    if let Some(seconds) = resume_position(from) {
+    if let Some(point) = resume_positions().remove(from) {
         save_resume_position(from, None)?;
-        save_resume_position(to, Some(seconds))?;
+        save_resume_position(to, Some(point))?;
     }
     Ok(())
 }
@@ -390,7 +413,7 @@ mod tests {
             Some(l)
         );
         assert_eq!(resume_position(key), None);
-        save_resume_position(key, Some(754.0)).unwrap();
+        save_resume_position(key, Some((754.0, Some(5400.0)))).unwrap();
         move_resume_position(key, "smb://alice@192.168.1.10/media/VR/renamed.mp4").unwrap();
         assert_eq!(resume_position(key), None);
         assert_eq!(

@@ -16,6 +16,8 @@ struct Eye {
     // y: stereo (0 mono, 1 side-by-side, 2 top-bottom), z: swap eyes, w: fisheye FOV (rad).
     mode: vec4<f32>,
     // Flat screen: x width, y height, z distance, w center height (metres).
+    // Spherical video: w is the viewpoint's offset along -Z inside the
+    // sphere, as a fraction of its radius (0 = centre).
     screen: vec4<f32>,
     // xy: luma texture size in texels; z: debug view (0 off, 1 projection UV, 2 raw luma);
     // w: zoom (magnification for spherical and fisheye video).
@@ -82,17 +84,27 @@ fn project(origin: vec3<f32>, d: vec3<f32>) -> vec3<f32> {
         let uv = vec2<f32>(arc / eye.screen.x + 0.5, 0.5 - (p.y - eye.screen.w) / eye.screen.y);
         return vec3<f32>(uv, select(-1.0, rect_inside(uv), p.z < 0.0));
     }
+    // Spherical video is a unit sphere around the viewer, locked to head
+    // rotation (the eye's position is ignored). Moving the viewpoint along
+    // -Z inside it (screen.w) makes the picture ahead grow and its edge
+    // slide behind, like leaning towards a screen.
+    let k = eye.screen.w;
+    let o = vec3<f32>(0.0, 0.0, -k);
+    let od = dot(o, d);
+    // The far hit; |k| < 1 keeps the root real and t positive.
+    let t = -od + sqrt(max(od * od - k * k + 1.0, 0.0));
+    let n = normalize(o + t * d);
     // Zooming a spherical video magnifies it around the view centre.
     let zoom = select(eye.tex.w, 1.0, eye.tex.w <= 0.0);
     if kind == 3u {
         // Equidistant fisheye centred on -Z.
-        let theta = acos(clamp(-d.z, -1.0, 1.0)) / zoom;
+        let theta = acos(clamp(-n.z, -1.0, 1.0)) / zoom;
         let r = theta / (eye.mode.w * 0.5) * 0.5;
-        let phi = atan2(d.y, d.x);
+        let phi = atan2(n.y, n.x);
         return vec3<f32>(0.5 + r * cos(phi), 0.5 - r * sin(phi), 0.5 - r);
     }
-    let lon = atan2(d.x, -d.z) / zoom;
-    let lat = asin(clamp(d.y, -1.0, 1.0)) / zoom;
+    let lon = atan2(n.x, -n.z) / zoom;
+    let lat = asin(clamp(n.y, -1.0, 1.0)) / zoom;
     let v = 0.5 - lat / PI;
     if kind == 1u {
         let uv = vec2<f32>(lon / PI + 0.5, v);

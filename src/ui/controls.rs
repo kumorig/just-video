@@ -169,6 +169,19 @@ pub struct State {
 
 type Rect = (f32, f32, f32, f32);
 
+/// The hairline along the bar's top edge, from `from` to `to` (fractions of
+/// the width), sweeping while a picture is awaited after opening or
+/// seeking. The app shows it as its own layer, so it can move without
+/// redrawing the bar.
+pub fn progress_rect(from: f32, to: f32) -> Rect {
+    let (from, to) = (from.clamp(0.0, 1.0), to.clamp(0.0, 1.0));
+    let full = WIDTH as f32;
+    (full * from, 0.0, full * (to - from), PROGRESS_H)
+}
+
+/// Thickness of the hairline: 1 canvas pixel shimmers at the bar's size.
+pub const PROGRESS_H: f32 = 3.0;
+
 const PREVIOUS: Rect = (24.0, 16.0, 96.0, 92.0);
 const PLAY: Rect = (136.0, 16.0, 96.0, 92.0);
 const NEXT: Rect = (248.0, 16.0, 96.0, 92.0);

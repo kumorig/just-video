@@ -43,8 +43,10 @@ cc = "1"
 pkg-config = "0.3"
 
 [profile.release]
-lto = "thin"
+# Whole-program optimisation: build time is cheap, the headset's time is not.
+lto = "fat"
 codegen-units = 1
+opt-level = 3
 
 [patch.crates-io]
 # TCP_NODELAY fix (see third_party/smb-transport/PATCHED.md).
