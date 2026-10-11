@@ -243,6 +243,7 @@ impl ReadAheadArgs {
         ReadAhead {
             block_size: self.block_kib.clamp(64, 8192) * 1024,
             blocks_ahead: self.blocks_ahead.clamp(1, 256),
+            reserve_bytes: 0,
         }
     }
 }
@@ -326,7 +327,7 @@ fn badge(verdict: Verdict) -> &'static str {
 }
 
 fn print_assessment(name: &str, a: &Assessment) {
-    println!("{} {name} — {}", badge(a.verdict), a.title);
+    println!("{} {name}: {}", badge(a.verdict), a.title);
     for line in [&a.detail, &a.hint].into_iter().flatten() {
         println!("     {line}");
     }
@@ -447,6 +448,7 @@ fn main() -> anyhow::Result<()> {
             let probe = ReadAhead {
                 block_size: 256 * 1024,
                 blocks_ahead: 4,
+                reserve_bytes: 0,
             };
             for entry in session.list(&path)? {
                 if entry.is_dir {
@@ -465,7 +467,7 @@ fn main() -> anyhow::Result<()> {
                     match assessment {
                         Ok(a) => print_assessment(&entry.name, &a),
                         Err(e) => println!(
-                            "⛔ {} — Can't read this file\n     It may be damaged or not a video ({e:#}).",
+                            "⛔ {}: Can't read this file\n     It may be damaged or not a video ({e:#}).",
                             entry.name
                         ),
                     }
@@ -913,6 +915,10 @@ fn main() -> anyhow::Result<()> {
                         ..Row::new(Icon::Add, "Add server")
                     },
                     Row {
+                        detail: "Fetched while paused, to play on without the network".into(),
+                        ..Row::new(Icon::Buffer, "Buffer ahead: 1 GB")
+                    },
+                    Row {
                         detail: "Close just-video".into(),
                         ..Row::new(Icon::Exit, "Exit")
                     },
@@ -955,10 +961,9 @@ fn main() -> anyhow::Result<()> {
             )?;
             let mut dialog = folder.clone();
             dialog.dialog = Some(Dialog {
-                title: "Can't play smoothly on Steam Frame".into(),
+                title: "Won't play smoothly (8K 60 fps 10-bit HEVC)".into(),
                 body: vec![
-                    "Steam Frame's hardware video decoder only handles 8-bit video in the current SteamOS, and this video is 10-bit. Decoding it on the CPU instead reaches only about 74% of the speed needed, so playback would stutter badly.".into(),
-                    "An 8-bit HEVC version or a 4K version of this video would play.".into(),
+                    "8K 10-bit video would stutter horrendously. It might be available later with an update of SteamOS.".into(),
                 ],
                 buttons: vec!["OK".into()],
                 danger: false,
@@ -973,9 +978,15 @@ fn main() -> anyhow::Result<()> {
                 position: 754.0,
                 duration: 5530.0,
                 buffered: vec![(754.0, 790.0), (2400.0, 2460.0)],
+                reserve: Some(controls::Reserve {
+                    on: true,
+                    held: 412 << 20,
+                    goal: 1 << 30,
+                }),
                 has_previous: true,
                 has_next: false,
                 curved: Some(true),
+                see_through: true,
                 format: controls::FORMATS[3],
                 favourites: vec![controls::FORMATS[0], controls::FORMATS[3]],
                 swap_eyes: false,
@@ -1016,6 +1027,36 @@ fn main() -> anyhow::Result<()> {
                 &controls::render(&state, &mut fonts, controls::Hit::Seek(0.62)),
                 &dir.join("controls.png"),
             )?;
+            // Buffering ahead done, and off with the pointer on it.
+            for (name, reserve, hover) in [
+                (
+                    "controls-buffered.png",
+                    controls::Reserve {
+                        on: true,
+                        held: 1 << 30,
+                        goal: 1 << 30,
+                    },
+                    controls::Hit::Nothing,
+                ),
+                (
+                    "controls-reserve-off.png",
+                    controls::Reserve {
+                        on: false,
+                        held: 0,
+                        goal: 1 << 30,
+                    },
+                    controls::Hit::Reserve,
+                ),
+            ] {
+                let bar = controls::State {
+                    reserve: Some(reserve),
+                    ..state.clone()
+                };
+                just_video::ui::save_png(
+                    &controls::render(&bar, &mut fonts, hover),
+                    &dir.join(name),
+                )?;
+            }
             let editing = controls::State {
                 caption_edit: true,
                 ..state.clone()

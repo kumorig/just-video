@@ -44,10 +44,10 @@ impl MoveSelection {
         destination: &Path,
     ) -> Result<Vec<Path>, String> {
         if server.url != self.server.url || !share.eq_ignore_ascii_case(&self.share) {
-            return Err("Choose a folder in the same share".into());
+            return Err("Same share only.".into());
         }
         if self.paths.is_empty() {
-            return Err("No items selected".into());
+            return Err("Nothing selected.".into());
         }
         self.paths
             .iter()
@@ -132,6 +132,8 @@ pub struct Opened {
     pub resume: Option<f64>,
     /// The network reader's buffer, for the seek bar.
     pub buffer: crate::readahead::BufferWatch,
+    /// Its reserve, for buffering ahead while paused.
+    pub reserve: std::sync::Arc<crate::readahead::Reserve>,
 }
 
 pub struct ExternalSubtitles {
@@ -164,6 +166,7 @@ fn load_sidecars(session: &SmbSession, share: &str, path: &Path) -> Vec<External
     let small = ReadAhead {
         block_size: 256 * 1024,
         blocks_ahead: 4,
+        reserve_bytes: 0,
     };
     names
         .into_iter()
@@ -250,7 +253,13 @@ fn connect(server: &Server, password: Option<String>) -> Result<Arc<SmbSession>,
             .unwrap_or_default(),
     };
     Ok(Arc::new(SmbSession::connect(url, password).map_err(
-        |e| format!("Can't connect to {}: {e:#}", server.name),
+        |e| {
+            format!(
+                "Can't connect to {}: {}",
+                server.name,
+                crate::smb::explain(&e)
+            )
+        },
     )?))
 }
 
@@ -259,16 +268,71 @@ fn session(
     server: &Server,
     purpose: Purpose,
 ) -> Result<Arc<SmbSession>, String> {
+    session_kept(sessions, server, purpose).map(|(s, _)| s)
+}
+
+/// The server's connection, and whether it was already open (kept from an
+/// earlier request) rather than made just now.
+fn session_kept(
+    sessions: &Sessions,
+    server: &Server,
+    purpose: Purpose,
+) -> Result<(Arc<SmbSession>, bool), String> {
     let key = (server.url.clone(), purpose);
     if let Some(s) = sessions.lock().expect("sessions").get(&key) {
-        return Ok(s.clone());
+        return Ok((s.clone(), true));
     }
     let session = connect(server, None)?;
     sessions
         .lock()
         .expect("sessions")
         .insert(key, session.clone());
-    Ok(session)
+    Ok((session, false))
+}
+
+/// Runs `request` on the server's connection. A kept connection may have
+/// died meanwhile (the headset slept, the Wi-Fi dropped, the server closed
+/// it) and then fails every request until the app restarts; so when it
+/// fails without the server having answered, reconnect and try once more.
+fn with_session<T>(
+    sessions: &Sessions,
+    server: &Server,
+    purpose: Purpose,
+    request: impl Fn(&SmbSession) -> Result<T, String>,
+) -> Result<T, String> {
+    let (session, kept) = session_kept(sessions, server, purpose)?;
+    match request(&session) {
+        Err(e) if kept && !server_answered(&e) => {
+            eprintln!(
+                "Library: {} failed on the kept connection to {} ({e}); reconnecting",
+                format!("{purpose:?}").to_lowercase(),
+                server.name
+            );
+            evict(sessions, server, purpose);
+            let session = connect(server, None)?;
+            sessions
+                .lock()
+                .expect("sessions")
+                .insert((server.url.clone(), purpose), session.clone());
+            request(&session)
+        }
+        result => result,
+    }
+}
+
+/// Whether an error came from the server itself (a status reply, a refusal,
+/// a cancelled or timed-out request), as opposed to the connection failing.
+fn server_answered(error: &str) -> bool {
+    let e = error.to_ascii_lowercase();
+    [
+        "status",
+        "did not answer",
+        "cancelled",
+        "not a file",
+        "is not a file",
+    ]
+    .iter()
+    .any(|s| e.contains(s))
 }
 
 /// Forgets a server connection after a failure so the next request reconnects;
@@ -348,12 +412,13 @@ fn handle(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
 }
 
 fn run(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
-    let err = |e: anyhow::Error| format!("{e:#}");
+    let err = |e: anyhow::Error| crate::smb::explain(&e);
     match request {
         Request::Shares { id, server } => Response::Shares {
             id,
-            result: session(sessions, &server, Purpose::Browse)
-                .and_then(|s| s.shares().map_err(err)),
+            result: with_session(sessions, &server, Purpose::Browse, |s| {
+                s.shares().map_err(err)
+            }),
         },
         Request::List {
             id,
@@ -363,7 +428,7 @@ fn run(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
             watch,
         } => Response::List {
             id,
-            result: session(sessions, &server, Purpose::Browse).and_then(|s| {
+            result: with_session(sessions, &server, Purpose::Browse, |s| {
                 s.list_in_watched(&share, &smb_path(&path), &mut |n| {
                     watch.count.store(n, Ordering::Relaxed);
                     !watch.cancel.load(Ordering::Relaxed)
@@ -381,8 +446,9 @@ fn run(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
             let probe = ReadAhead {
                 block_size: 256 * 1024,
                 blocks_ahead: 4,
+                reserve_bytes: 0,
             };
-            let result = session(sessions, &server, Purpose::Probe).and_then(|s| {
+            let result = with_session(sessions, &server, Purpose::Probe, |s| {
                 let reader = s.open_in(&share, &smb_path(&path), probe).map_err(err)?;
                 Media::open(path.last().map_or("", String::as_str), reader)
                     .map(|m| playability::assess(Platform::current(), m.info().video.as_ref()))
@@ -405,10 +471,15 @@ fn run(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
             let key = file_key(&server, &share, &path);
             let result = connect(&server, None).and_then(|s| {
                 let external_subtitles = load_sidecars(&s, &share, &path);
+                let read_ahead = ReadAhead {
+                    reserve_bytes: config::reserve_bytes(),
+                    ..ReadAhead::default()
+                };
                 let reader = s
-                    .open_owned(&share, &smb_path(&path), ReadAhead::default())
+                    .open_owned(&share, &smb_path(&path), read_ahead)
                     .map_err(err)?;
                 let buffer = reader.watch();
+                let reserve = reader.reserve();
                 let media =
                     Media::open(path.last().map_or("", String::as_str), reader).map_err(err)?;
                 let name = path.last().cloned().unwrap_or_default();
@@ -437,6 +508,7 @@ fn run(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
                     image,
                     resume,
                     buffer,
+                    reserve,
                 }))
             });
             Response::Opened { id, result }
@@ -448,7 +520,7 @@ fn run(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
             path,
             new_name,
         } => {
-            let result = session(sessions, &server, Purpose::Browse).and_then(|s| {
+            let result = with_session(sessions, &server, Purpose::Browse, |s| {
                 s.rename_in(&share, &smb_path(&path), &new_name)
                     .map_err(err)?;
                 // Keep a saved VR layout with the file.
@@ -472,7 +544,7 @@ fn run(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
             share,
             path,
         } => {
-            let result = session(sessions, &server, Purpose::Browse).and_then(|s| {
+            let result = with_session(sessions, &server, Purpose::Browse, |s| {
                 s.delete_in(&share, &smb_path(&path)).map_err(err)?;
                 let key = file_key(&server, &share, &path);
                 let _ = config::save_layout_override(&key, None);
@@ -691,14 +763,14 @@ mod tests {
             calls += 1;
             assert_eq!(target[0], "new");
             if path.last().unwrap() == "b" {
-                Err("Name exists".into())
+                Err("Already exists.".into())
             } else {
                 Ok(())
             }
         });
         assert_eq!(calls, 2);
         assert_eq!(result.failed, vec![selection.paths[1].clone()]);
-        assert_eq!(result.errors, vec!["b: Name exists"]);
+        assert_eq!(result.errors, vec!["b: Already exists."]);
     }
 
     #[test]
@@ -707,7 +779,7 @@ mod tests {
         let mut calls = 0;
         let result = move_entries(&selection, &vec!["new".into()], |_, _| {
             calls += 1;
-            Err("The server did not answer (move)".into())
+            Err("The server did not answer.".into())
         });
         assert_eq!(calls, 1);
         assert_eq!(result.failed, selection.paths);

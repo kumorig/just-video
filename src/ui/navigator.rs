@@ -54,6 +54,8 @@ enum Location {
 enum Item {
     Server(Server),
     AddServer,
+    /// How much to buffer ahead while paused; opens a dialog of presets.
+    BufferSize,
     /// Closes the app; last on the top page.
     Exit,
     Share(String),
@@ -77,7 +79,7 @@ impl Item {
     fn name(&self) -> &str {
         match self {
             Item::Server(s) => &s.name,
-            Item::AddServer | Item::Exit => "",
+            Item::AddServer | Item::BufferSize | Item::Exit => "",
             Item::Share(n)
             | Item::Dir(n)
             | Item::Video { name: n, .. }
@@ -130,6 +132,8 @@ enum Purpose {
     RemoveServer(usize),
     /// Deleting these entries.
     Delete(Vec<usize>),
+    /// Choosing a buffer size; the buttons are [`config::RESERVE_PRESETS`].
+    BufferSize,
     Info,
 }
 
@@ -350,6 +354,7 @@ impl Navigator {
         });
         self.items = servers.into_iter().map(Item::Server).collect();
         self.items.push(Item::AddServer);
+        self.items.push(Item::BufferSize);
         self.items.push(Item::Exit);
         self.restore_scroll();
         self.rebuild_rows();
@@ -421,6 +426,16 @@ impl Navigator {
                     Item::AddServer => Row {
                         detail: "A Windows PC, NAS or Samba server on your network".into(),
                         ..Row::new(Icon::Add, "Add server")
+                    },
+                    Item::BufferSize => Row {
+                        detail: "Fetched while paused, to play on without the network".into(),
+                        ..Row::new(
+                            Icon::Buffer,
+                            format!(
+                                "Buffer ahead: {}",
+                                crate::ui::controls::format_size(config::reserve_bytes())
+                            ),
+                        )
                     },
                     Item::Exit => Row {
                         detail: "Close just-video".into(),
@@ -543,7 +558,7 @@ impl Navigator {
                     self.pending = None;
                     match result {
                         Ok(shares) if shares.is_empty() => {
-                            self.set_status("This server has no shared folders you can open.")
+                            self.set_status("No shared folders you can open.")
                         }
                         Ok(shares) => {
                             self.view.status = None;
@@ -551,7 +566,7 @@ impl Navigator {
                             self.restore_scroll();
                             self.rebuild_rows();
                         }
-                        Err(e) => self.set_status(format!("{e}  —  Press B to go back.")),
+                        Err(e) => self.set_status(e),
                     }
                 }
                 Response::List { id, result } if Some(id) == self.pending => {
@@ -614,9 +629,7 @@ impl Navigator {
                             self.restore_scroll();
                             self.rebuild_rows();
                         }
-                        Err(e) => self.set_status(format!(
-                            "Can't open this folder: {e}  —  Press B to go back."
-                        )),
+                        Err(e) => self.set_status(format!("Can't open this folder: {e}")),
                     }
                 }
                 Response::Probe {
@@ -678,7 +691,7 @@ impl Navigator {
                     self.view.notice = None;
                     self.refresh();
                     if !result.errors.is_empty() {
-                        self.dialog("Couldn't move some items", result.errors);
+                        self.dialog("Some items didn't move", result.errors);
                     }
                 }
                 Response::ServerAdded { id, result } if self.pending_changes.remove(&id) => {
@@ -729,7 +742,7 @@ impl Navigator {
             let title = if errors.len() == 1 {
                 "That didn't work".to_string()
             } else {
-                format!("{} items couldn't be changed", errors.len())
+                format!("{} items failed", errors.len())
             };
             self.dialog(title, unique);
         }
@@ -938,7 +951,7 @@ impl Navigator {
             return;
         }
         let mut body = vec![format!(
-            "{} permanently deleted from the server. This can't be undone here. Only empty folders can be deleted.",
+            "{} deleted from the server for good.",
             if n == 1 { "It will be" } else { "They will be" }
         )];
         if n > 1 {
@@ -1077,6 +1090,19 @@ impl Navigator {
         match (item, self.location.clone()) {
             (Item::Server(s), _) => self.navigate(Location::Shares { server: s.clone() }),
             (Item::AddServer, _) => self.start_server_form(None),
+            (Item::BufferSize, _) => {
+                self.view.dialog = Some(Dialog {
+                    title: "Buffer ahead while paused".into(),
+                    body: vec!["How much the player's buffer button fetches while paused.".into()],
+                    buttons: config::RESERVE_PRESETS
+                        .iter()
+                        .map(|&b| crate::ui::controls::format_size(b))
+                        .collect(),
+                    danger: false,
+                });
+                self.purpose = Some(Purpose::BufferSize);
+                self.dirty = true;
+            }
             (Item::Exit, _) => self.exit_requested = true,
             (Item::Share(name), Location::Shares { server }) => self.navigate(Location::Folder {
                 server,
@@ -1112,7 +1138,7 @@ impl Navigator {
                 },
             ) => {
                 if let Some(e) = broken {
-                    let body = vec!["It may be damaged or not a video.".into(), e.clone()];
+                    let body = vec!["Damaged, or not a video.".into(), e.clone()];
                     self.dialog("Can't read this file", body);
                 } else if let Some(a) = assessment
                     .as_ref()
@@ -1218,7 +1244,7 @@ impl Navigator {
         };
         self.view.dialog = Some(Dialog {
             title: format!("Remove {}?", s.name),
-            body: vec!["Removes this server and its saved password from Just Video. Nothing on the server changes.".into()],
+            body: vec!["Forgets this server and its password.".into()],
             buttons: vec!["Cancel".into(), "Remove".into()],
             danger: true,
         });
@@ -1235,6 +1261,15 @@ impl Navigator {
         self.view.dialog = None;
         self.dirty = true;
         let purpose = self.purpose.take();
+        if let Some(Purpose::BufferSize) = purpose {
+            if let Some(&bytes) = config::RESERVE_PRESETS.get(button)
+                && let Err(e) = config::save_reserve_bytes(bytes)
+            {
+                eprintln!("Can't save the buffer size: {e:#}");
+            }
+            self.rebuild_rows();
+            return;
+        }
         if !confirmed {
             return;
         }
@@ -1244,7 +1279,7 @@ impl Navigator {
                     let url = s.url.clone();
                     match config::remove_server(&url) {
                         Ok(_) => self.show_servers(),
-                        Err(e) => self.dialog("Couldn't remove the server", vec![format!("{e:#}")]),
+                        Err(e) => self.dialog("Can't remove the server", vec![format!("{e:#}")]),
                     }
                 }
             }
@@ -1318,7 +1353,7 @@ impl Navigator {
                     f.value(3).trim().to_string(),
                 );
                 if address.is_empty() {
-                    f.error = Some("Enter the server's address.".into());
+                    f.error = Some("Enter an address.".into());
                     f.focus(0, None);
                     return;
                 }
@@ -1334,7 +1369,7 @@ impl Navigator {
                 let url = match format!("smb://{user}@{host}").parse::<SmbUrl>() {
                     Ok(url) if url.share.is_empty() => url,
                     Ok(_) => {
-                        f.error = Some("Enter just the server, without a share or folder.".into());
+                        f.error = Some("Server only, without a share or folder.".into());
                         return;
                     }
                     Err(e) => {
@@ -1691,7 +1726,10 @@ mod tests {
     fn server_list_offers_adding_one_and_exiting() {
         let mut nav = Navigator::new(Library::start(None));
         let icons: Vec<Icon> = nav.view().rows.iter().map(|r| r.icon.clone()).collect();
-        assert_eq!(&icons[icons.len() - 2..], [Icon::Add, Icon::Exit]);
+        assert_eq!(
+            &icons[icons.len() - 3..],
+            [Icon::Add, Icon::Buffer, Icon::Exit]
+        );
         assert_eq!(nav.view().crumbs, vec!["Just Video".to_string()]);
         assert!(!nav.take_exit());
         nav.click(Hit::Row(icons.len() - 1));

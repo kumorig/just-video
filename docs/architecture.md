@@ -14,8 +14,12 @@ the headset; no mount, root privileges or companion process on the file server.
 `ReadAheadReader` (`src/readahead.rs`) exposes a blocking `Read + Seek` to FFmpeg's
 custom AVIO (`native/media.c`) and keeps a window of 1 MiB reads in flight (32 MiB
 by default). SMB2-only negotiation, no compression (video is incompressible) and
-a 1024-credit backlog support that pipelining. FFmpeg never receives a URL
-or credentials, and its protocol whitelist is empty.
+a 1024-credit backlog support that pipelining. Beside the window the reader
+keeps a reserve: up to 1 GiB past the window, fetched only while the player
+asks (it does so while paused, from the control bar), so a video can play on
+without the network; fetching ahead while playing once starved playback over
+Wi-Fi. FFmpeg never receives a URL or credentials, and its protocol whitelist
+is empty.
 
 Give SMB I/O, demux/decode and XR rendering independent workers. Bound compressed
 read-ahead by bytes and decoded frames by surface count; start with 32 MiB and

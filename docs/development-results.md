@@ -1,4 +1,4 @@
-# Development host checks — 2026-09-25
+# Development host checks, 2026-09-25
 
 These validate the diagnostic tool. **They do not verify Steam Frame.**
 

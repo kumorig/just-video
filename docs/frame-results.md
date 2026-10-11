@@ -1,4 +1,4 @@
-# Steam Frame results — 2026-09-26
+# Steam Frame results, 2026-09-26
 
 Device: SteamOS 0.3.0 (`vr`, build 20260922), kernel 6.18, SM8650 (Snapdragon 8 Gen 3),
 Adreno 750 / Mesa Turnip 26.3-devel, system FFmpeg 7.0, glibc 2.39. Full inventory:
@@ -58,7 +58,7 @@ Conclusion: 8K60 10-bit HEVC is not playable on the Frame CPU. It needs the iris
 hardware decoder to gain 10-bit support (SteamOS/kernel update). Every other format we
 tested plays.
 
-## 10-bit outlook check — 2026-10-07
+## 10-bit outlook check, 2026-10-07
 
 Still SteamOS 0.3.0, kernel 6.18.0-gfbdbca41fd45, firmware `vpu33_4v.mbn`; iris still lists
 only 8-bit capture formats (Q08C, NV12, NV21, AB24, QC24).
@@ -84,7 +84,7 @@ Conclusion unchanged: 8K60 HEVC Main10 waits on Valve/Qualcomm enabling 10-bit c
 formats in the Frame's iris driver and firmware. When a SteamOS update lands, check
 `uname -r` and `v4l2-ctl -d /dev/video-dec0 --list-formats` for `P010`.
 
-## Seek stalls and B-frame stutter — 2026-10-10
+## Seek stalls and B-frame stutter, 2026-10-10
 
 Same SteamOS 0.3.0 / kernel 6.18 / `vpu33_4v.mbn`. Test file: FC2-PPV-4808888.mp4, 1080p
 29.97 H.264 High with 2 B-frames, 6 Mb/s, moov first, keyframes every 8.3 s, over SMB on

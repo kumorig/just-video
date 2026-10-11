@@ -50,6 +50,8 @@ pub enum Icon {
     /// A file that isn't a video.
     File,
     Add,
+    /// Buffering ahead: an arrow into a tray, as on the player's button.
+    Buffer,
     /// Close the app.
     Exit,
 }
@@ -387,6 +389,25 @@ fn draw_icon(canvas: &mut Canvas, icon: &Icon, cx: f32, cy: f32) {
         Icon::Add => {
             canvas.rect(cx - 3.0, cy - 18.0, 6.0, 36.0, 3.0, ACCENT);
             canvas.rect(cx - 18.0, cy - 3.0, 36.0, 6.0, 3.0, ACCENT);
+        }
+        Icon::Buffer => {
+            canvas.rect(cx - 3.0, cy - 20.0, 6.0, 16.0, 2.0, ACCENT);
+            let steps = 24;
+            for i in 0..steps {
+                let t = i as f32 / steps as f32;
+                let half = 12.0 * (1.0 - t);
+                canvas.rect(
+                    cx - half,
+                    cy - 6.0 + t * 12.0,
+                    half * 2.0,
+                    0.75,
+                    0.0,
+                    ACCENT,
+                );
+            }
+            canvas.rect(cx - 18.0, cy + 6.0, 5.0, 12.0, 2.0, ACCENT);
+            canvas.rect(cx + 13.0, cy + 6.0, 5.0, 12.0, 2.0, ACCENT);
+            canvas.rect(cx - 18.0, cy + 14.0, 36.0, 5.0, 2.0, ACCENT);
         }
         Icon::Exit => {
             // A power symbol: a ring open at the top with a bar through the gap.

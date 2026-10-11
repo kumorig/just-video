@@ -20,6 +20,8 @@ pub struct EyeParams {
     pub mode: [f32; 4],
     pub screen: [f32; 4],
     pub tex: [f32; 4],
+    /// x: 1 for a see-through surround (see `Eye` in video.wgsl).
+    pub surround: [f32; 4],
 }
 
 /// Matches `Color` in video.wgsl.

@@ -2,19 +2,24 @@
 //!
 //! The demuxer reads synchronously; behind it, a window of large block reads is
 //! kept in flight so network latency overlaps decode instead of adding to it.
+//!
+//! Beside the window sits the [`Reserve`]: up to a gigabyte of the video past
+//! the window, fetched only while the player says so (while paused, so that
+//! nothing competes with the reads playback needs), and handed to the window
+//! as reading reaches it. A paused video can thus be carried off the network.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     io::{self, Read, Seek, SeekFrom},
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
-use tokio::{runtime::Runtime, task::JoinHandle};
+use tokio::{runtime::Runtime, sync::Notify, task::JoinHandle};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -35,6 +40,8 @@ pub trait BlockSource: Send + Sync + 'static {
 pub struct ReadAhead {
     pub block_size: usize,
     pub blocks_ahead: usize,
+    /// Most the [`Reserve`] may hold; 0 for none.
+    pub reserve_bytes: u64,
 }
 
 impl Default for ReadAhead {
@@ -42,9 +49,20 @@ impl Default for ReadAhead {
         Self {
             block_size: 1 << 20,
             blocks_ahead: 32,
+            reserve_bytes: RESERVE_BYTES,
         }
     }
 }
+
+/// What the reserve holds by default: an hour or two of most videos.
+pub const RESERVE_BYTES: u64 = 1 << 30;
+/// Reads the reserve keeps in flight. It fills only while playback is
+/// paused, so nothing competes for the link; but reads are never cancelled
+/// (see `detached`), so these are what still arrives after play is pressed.
+/// A few MiB, not tens, keeps that short.
+const RESERVE_IN_FLIGHT: usize = 8;
+/// Failed reserve reads in a row before it gives up (the player shows it off).
+const RESERVE_FAILURES: u32 = 5;
 
 #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 pub struct ReadStats {
@@ -62,16 +80,271 @@ enum Block {
 }
 
 /// What the reader holds, for a buffer indicator: the read position, the
-/// file length and the byte ranges already fetched (sorted, disjoint).
+/// file length and the byte ranges already fetched (sorted, disjoint) by
+/// the window and by the reserve.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Buffered {
     pub position: u64,
     pub len: u64,
     pub ranges: Vec<(u64, u64)>,
+    pub reserved: Vec<(u64, u64)>,
+}
+
+impl Buffered {
+    /// Everything fetched, window and reserve together (sorted, merged).
+    pub fn fetched(&self) -> Vec<(u64, u64)> {
+        let mut all: Vec<(u64, u64)> = self.ranges.iter().chain(&self.reserved).copied().collect();
+        all.sort_unstable();
+        let mut out: Vec<(u64, u64)> = Vec::with_capacity(all.len());
+        for (a, b) in all {
+            match out.last_mut() {
+                Some(last) if last.1 >= a => last.1 = last.1.max(b),
+                _ => out.push((a, b)),
+            }
+        }
+        out
+    }
+
+    /// Bytes fetched within `[from, to)`.
+    pub fn fetched_within(&self, from: u64, to: u64) -> u64 {
+        self.fetched()
+            .iter()
+            .map(|&(a, b)| b.min(to).saturating_sub(a.max(from)))
+            .sum()
+    }
 }
 
 /// A live view of a reader's [`Buffered`] state, shared with the UI.
 pub type BufferWatch = Arc<Mutex<Buffered>>;
+
+struct ReserveInner {
+    blocks: BTreeMap<u64, Vec<u8>>,
+    /// Being fetched by the fill task.
+    pending: BTreeSet<u64>,
+    bytes: u64,
+    fill: Option<JoinHandle<()>>,
+}
+
+/// Blocks fetched past the reader's window while the player asks for it
+/// (see the module docs). Shared between the reader, its fill task and the
+/// player, which switches it on and off.
+pub struct Reserve {
+    runtime: Arc<Runtime>,
+    source: Arc<dyn BlockSource>,
+    block_size: u64,
+    len: u64,
+    cap: u64,
+    inner: Mutex<ReserveInner>,
+    /// The block the reader is in, and the end of its requested window:
+    /// the reserve fills from there, up to `cap` past the position.
+    position: AtomicU64,
+    fill_from: AtomicU64,
+    active: AtomicBool,
+    closed: AtomicBool,
+    wake: Notify,
+    watch: BufferWatch,
+}
+
+impl Reserve {
+    /// Starts or stops filling. Reads in flight finish either way.
+    pub fn set_active(self: &Arc<Self>, active: bool) {
+        if self.cap == 0 || self.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        self.active.store(active, Ordering::SeqCst);
+        if active {
+            let mut inner = self.inner.lock().expect("reserve");
+            if inner.fill.as_ref().is_none_or(|t| t.is_finished()) {
+                // The task holds the reserve until it ends (at close).
+                inner.fill = Some(self.runtime.spawn(self.clone().fill()));
+            }
+        }
+        self.wake.notify_waiters();
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::SeqCst)
+    }
+
+    pub fn capacity(&self) -> u64 {
+        self.cap
+    }
+
+    fn block_count(&self) -> u64 {
+        self.len.div_ceil(self.block_size)
+    }
+
+    /// The next block to fetch, making room for it by dropping a block
+    /// behind the reader (or far beyond what it can hold); None when full
+    /// or nothing is wanted.
+    fn next_block(&self) -> Option<u64> {
+        let position = self.position.load(Ordering::SeqCst);
+        let fill_from = self.fill_from.load(Ordering::SeqCst).max(position);
+        let end = (position + self.cap / self.block_size).min(self.block_count());
+        let mut inner = self.inner.lock().expect("reserve");
+        let wanted = (fill_from..end)
+            .find(|i| !inner.blocks.contains_key(i) && !inner.pending.contains(i))?;
+        while inner.bytes + (inner.pending.len() as u64 + 1) * self.block_size > self.cap {
+            let behind = inner
+                .blocks
+                .keys()
+                .next()
+                .copied()
+                .filter(|&i| i + 1 < position);
+            let beyond = inner
+                .blocks
+                .keys()
+                .next_back()
+                .copied()
+                .filter(|&i| i >= end);
+            let index = behind.or(beyond)?;
+            let dropped = inner.blocks.remove(&index).map_or(0, |b| b.len() as u64);
+            inner.bytes -= dropped;
+        }
+        inner.pending.insert(wanted);
+        Some(wanted)
+    }
+
+    fn ranges_of(&self, inner: &ReserveInner) -> Vec<(u64, u64)> {
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        for (&index, block) in &inner.blocks {
+            let start = index * self.block_size;
+            let end = start + block.len() as u64;
+            match ranges.last_mut() {
+                Some(last) if last.1 == start => last.1 = end,
+                _ => ranges.push((start, end)),
+            }
+        }
+        ranges
+    }
+
+    /// The byte ranges held (sorted, disjoint).
+    pub fn ranges(&self) -> Vec<(u64, u64)> {
+        self.ranges_of(&self.inner.lock().expect("reserve"))
+    }
+
+    fn publish(&self, inner: &ReserveInner) {
+        let ranges = self.ranges_of(inner);
+        if let Ok(mut shared) = self.watch.lock()
+            && shared.reserved != ranges
+        {
+            shared.reserved = ranges;
+        }
+    }
+
+    /// Hands a block to the reader.
+    fn take(&self, index: u64) -> Option<Vec<u8>> {
+        let mut inner = self.inner.lock().expect("reserve");
+        let block = inner.blocks.remove(&index)?;
+        inner.bytes -= block.len() as u64;
+        self.publish(&inner);
+        Some(block)
+    }
+
+    fn is_pending(&self, index: u64) -> bool {
+        self.inner.lock().expect("reserve").pending.contains(&index)
+    }
+
+    fn settle(&self, index: u64, result: io::Result<Vec<u8>>) -> bool {
+        let mut inner = self.inner.lock().expect("reserve");
+        inner.pending.remove(&index);
+        let ok = result.is_ok();
+        if let Ok(block) = result
+            && !self.closed.load(Ordering::SeqCst)
+        {
+            inner.bytes += block.len() as u64;
+            inner.blocks.insert(index, block);
+            self.publish(&inner);
+        }
+        drop(inner);
+        // A read waiting for this block (see `ReadAheadReader::read`).
+        self.wake.notify_waiters();
+        ok
+    }
+
+    /// Fetches wanted blocks while active; idles otherwise. Ends when the
+    /// reader closes, after its reads in flight have landed.
+    async fn fill(self: Arc<Self>) {
+        let mut tasks = tokio::task::JoinSet::new();
+        // Which block each task fetches, for one that panics.
+        let mut indices: std::collections::HashMap<tokio::task::Id, u64> = Default::default();
+        let mut failures = 0u32;
+        loop {
+            if self.closed.load(Ordering::SeqCst) {
+                break;
+            }
+            let next = if self.is_active() && tasks.len() < RESERVE_IN_FLIGHT {
+                self.next_block()
+            } else {
+                None
+            };
+            if let Some(index) = next {
+                let offset = index * self.block_size;
+                let length = self.block_size.min(self.len - offset) as usize;
+                let fetch = self.source.clone().fetch(offset, length);
+                let id = tasks.spawn(async move { (index, fetch.await) }).id();
+                indices.insert(id, index);
+                continue;
+            }
+            if tasks.is_empty() {
+                // Woken by the player (on/off), the reader (position) or a
+                // landed read; the timeout only guards a wakeup lost between
+                // the check above and here.
+                let _ =
+                    tokio::time::timeout(Duration::from_millis(500), self.wake.notified()).await;
+                continue;
+            }
+            let (index, result) = match tasks.join_next_with_id().await {
+                Some(Ok((id, (index, result)))) => {
+                    indices.remove(&id);
+                    (index, result)
+                }
+                Some(Err(e)) => match indices.remove(&e.id()) {
+                    Some(index) => (index, Err(io::Error::other(e))),
+                    None => continue,
+                },
+                None => continue,
+            };
+            if self.settle(index, result) {
+                failures = 0;
+            } else {
+                failures += 1;
+                if failures >= RESERVE_FAILURES {
+                    eprintln!("Reserve: reads keep failing; giving up");
+                    self.active.store(false, Ordering::SeqCst);
+                    failures = 0;
+                } else {
+                    tokio::time::sleep(Duration::from_millis(200 * failures as u64)).await;
+                }
+            }
+        }
+        while let Some(landed) = tasks.join_next_with_id().await {
+            match landed {
+                Ok((_, (index, result))) => {
+                    self.settle(index, result);
+                }
+                Err(e) => {
+                    if let Some(index) = indices.remove(&e.id()) {
+                        self.settle(index, Err(io::Error::other(e)));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Stops filling and waits for reads in flight (never cancelled).
+    fn shutdown(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.active.store(false, Ordering::SeqCst);
+        self.wake.notify_waiters();
+        let fill = self.inner.lock().expect("reserve").fill.take();
+        if let Some(fill) = fill {
+            self.runtime.block_on(async {
+                let _ = tokio::time::timeout(CLOSE_WAIT, fill).await;
+            });
+        }
+    }
+}
 
 /// How often a read waiting for its block logs (the request itself keeps
 /// running: cancelling it would leak SMB credits).
@@ -111,14 +384,41 @@ pub struct ReadAheadReader<S: BlockSource> {
     last_block: Option<u64>,
     stats: ReadStats,
     watch: BufferWatch,
+    reserve: Arc<Reserve>,
 }
 
 impl<S: BlockSource> ReadAheadReader<S> {
     pub fn new(runtime: Arc<Runtime>, source: S, len: u64, options: ReadAhead) -> Self {
         assert!(options.block_size > 0 && options.blocks_ahead > 0);
+        let source = Arc::new(source);
+        let watch = Arc::new(Mutex::new(Buffered {
+            position: 0,
+            len,
+            ranges: Vec::new(),
+            reserved: Vec::new(),
+        }));
+        let reserve = Arc::new(Reserve {
+            runtime: runtime.clone(),
+            source: source.clone(),
+            block_size: options.block_size as u64,
+            len,
+            cap: options.reserve_bytes,
+            inner: Mutex::new(ReserveInner {
+                blocks: BTreeMap::new(),
+                pending: BTreeSet::new(),
+                bytes: 0,
+                fill: None,
+            }),
+            position: AtomicU64::new(0),
+            fill_from: AtomicU64::new(0),
+            active: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            wake: Notify::new(),
+            watch: watch.clone(),
+        });
         Self {
             runtime,
-            source: Arc::new(source),
+            source,
             len,
             pos: 0,
             options,
@@ -128,17 +428,19 @@ impl<S: BlockSource> ReadAheadReader<S> {
             window: JUMP_BLOCKS,
             last_block: None,
             stats: ReadStats::default(),
-            watch: Arc::new(Mutex::new(Buffered {
-                position: 0,
-                len,
-                ranges: Vec::new(),
-            })),
+            watch,
+            reserve,
         }
     }
 
     /// The reader's buffer state, kept up to date as it reads.
     pub fn watch(&self) -> BufferWatch {
         self.watch.clone()
+    }
+
+    /// The reserve, for the player to switch on and off.
+    pub fn reserve(&self) -> Arc<Reserve> {
+        self.reserve.clone()
     }
 
     /// Publishes the fetched ranges (contiguous runs of ready blocks).
@@ -159,6 +461,7 @@ impl<S: BlockSource> ReadAheadReader<S> {
             position: self.pos,
             len: self.len,
             ranges,
+            reserved: self.reserve.ranges(),
         };
         if let Ok(mut shared) = self.watch.lock()
             && *shared != state
@@ -227,17 +530,63 @@ impl<S: BlockSource> ReadAheadReader<S> {
             self.stats.discarded_blocks += 1;
         }
         self.detached.retain(|h| !h.is_finished());
+        // The reserve fills on from the window's end (or past blocks still
+        // held from before a jump back, rather than fetching them twice).
+        let held_to = self
+            .blocks
+            .keys()
+            .next_back()
+            .map_or(end, |k| (k + 1).max(end));
+        self.reserve.position.store(current, Ordering::SeqCst);
+        self.reserve.fill_from.store(held_to, Ordering::SeqCst);
+        if self.reserve.is_active() {
+            self.reserve.wake.notify_waiters();
+        }
         // Detached reads count against the window, so seeking around cannot
         // pile up requests; the blocks needed first are always requested.
         for index in current..end {
-            if !self.blocks.contains_key(&index) {
-                if index >= current + JUMP_BLOCKS
-                    && self.in_flight.load(Ordering::SeqCst) >= self.options.blocks_ahead
-                {
-                    break;
-                }
-                self.spawn(index);
+            if self.blocks.contains_key(&index) {
+                continue;
             }
+            if let Some(data) = self.reserve.take(index) {
+                self.blocks.insert(index, Block::Ready(data));
+                continue;
+            }
+            if self.reserve.is_pending(index) {
+                continue; // on its way; `read` waits for it if needed
+            }
+            if index >= current + JUMP_BLOCKS
+                && self.in_flight.load(Ordering::SeqCst) >= self.options.blocks_ahead
+            {
+                break;
+            }
+            self.spawn(index);
+        }
+    }
+
+    /// Waits for a block the reserve is fetching, then takes it (or, should
+    /// that read fail, requests it itself).
+    fn await_reserve(&mut self, index: u64) -> io::Result<()> {
+        let started = Instant::now();
+        loop {
+            if let Some(data) = self.reserve.take(index) {
+                self.blocks.insert(index, Block::Ready(data));
+                return Ok(());
+            }
+            if !self.reserve.is_pending(index) {
+                self.spawn(index);
+                return Ok(());
+            }
+            if started.elapsed() >= STALL_LIMIT {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "The server stopped sending data",
+                ));
+            }
+            let wake = &self.reserve.wake;
+            self.runtime.block_on(async {
+                let _ = tokio::time::timeout(Duration::from_millis(10), wake.notified()).await;
+            });
         }
     }
 }
@@ -250,6 +599,12 @@ impl<S: BlockSource> Read for ReadAheadReader<S> {
         let size = self.options.block_size as u64;
         let index = self.pos / size;
         self.schedule(index);
+        if !self.blocks.contains_key(&index) {
+            let started = Instant::now();
+            let waited = self.await_reserve(index);
+            self.stats.stall_seconds += started.elapsed().as_secs_f64();
+            waited?;
+        }
         let mut retries = 0;
         let mut waited = Duration::ZERO;
         loop {
@@ -327,6 +682,7 @@ impl<S: BlockSource> Drop for ReadAheadReader<S> {
         let runtime = self.runtime.clone();
         // Sources may spawn cleanup work on drop (smb-rs does).
         let _guard = runtime.enter();
+        self.reserve.shutdown();
         let mut pending = std::mem::take(&mut self.detached);
         for (_, block) in std::mem::take(&mut self.blocks) {
             if let Block::Pending(handle) = block {
@@ -401,6 +757,7 @@ mod tests {
             ReadAhead {
                 block_size: 1024,
                 blocks_ahead: 4,
+                reserve_bytes: 0,
             },
         );
         let watch = reader.watch();
@@ -426,6 +783,7 @@ mod tests {
         let options = ReadAhead {
             block_size: 4096,
             blocks_ahead: 8,
+            reserve_bytes: 0,
         };
         let (mut r, data) = reader(100_003, 0, options);
         let mut out = Vec::new();
@@ -439,6 +797,7 @@ mod tests {
         let options = ReadAhead {
             block_size: 1000,
             blocks_ahead: 4,
+            reserve_bytes: 0,
         };
         let (mut r, data) = reader(50_000, 0, options);
         let mut buf = [0u8; 1500];
@@ -464,6 +823,7 @@ mod tests {
         let options = ReadAhead {
             block_size: 1000,
             blocks_ahead: 8,
+            reserve_bytes: 0,
         };
         let (mut r, data) = reader(100_000, 20, options);
         let completed = r.source.completed.clone();
@@ -517,6 +877,7 @@ mod tests {
         let options = ReadAhead {
             block_size: 4096,
             blocks_ahead: 2,
+            reserve_bytes: 0,
         };
         let mut r = ReadAheadReader::new(runtime, source, data.len() as u64, options);
         let mut out = Vec::new();
@@ -531,6 +892,7 @@ mod tests {
         let options = ReadAhead {
             block_size: 1000,
             blocks_ahead: 16,
+            reserve_bytes: 0,
         };
         let (mut r, _) = reader(200_000, 0, options);
         let mut buf = [0u8; 1000];
@@ -559,12 +921,120 @@ mod tests {
         );
     }
 
+    fn wait_until(what: impl Fn() -> bool) -> bool {
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(5) {
+            if what() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    /// The reserve fetches past the window while active, within its cap,
+    /// stops when switched off, and the reader plays on from it without
+    /// asking the network again.
+    #[test]
+    fn reserve_fills_while_active_and_feeds_the_reader() {
+        let options = ReadAhead {
+            block_size: 1000,
+            blocks_ahead: 4,
+            reserve_bytes: 20_000,
+        };
+        let (mut r, data) = reader(100_000, 2, options);
+        let completed = r.source.completed.clone();
+        let reserve = r.reserve();
+        let mut buf = [0u8; 1000];
+        r.read_exact(&mut buf).unwrap();
+        let before = r.stats().requests;
+        // Nothing happens until the player asks.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(reserve.ranges().is_empty());
+        reserve.set_active(true);
+        // From the window's end to the cap past the read position.
+        assert!(
+            wait_until(|| reserve.ranges() == vec![(JUMP_BLOCKS * 1000, 20_000)]),
+            "{:?}",
+            reserve.ranges()
+        );
+        let fetched = completed.load(Ordering::SeqCst);
+        reserve.set_active(false);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(completed.load(Ordering::SeqCst), fetched, "kept fetching");
+        assert_eq!(
+            r.stats().requests,
+            before,
+            "the reader itself asked for nothing"
+        );
+        // Reading on through the reserve costs no requests.
+        let mut out = vec![0u8; 19_000];
+        r.read_exact(&mut out).unwrap();
+        assert_eq!(out, data[1000..20_000]);
+        // (The window looks a few blocks past the reserve's end.)
+        assert!(r.stats().requests <= before + 3, "{:?}", r.stats());
+        assert!(reserve.ranges().is_empty(), "{:?}", reserve.ranges());
+        // Past it, the window fetches as usual.
+        r.read_exact(&mut buf).unwrap();
+        assert!(r.stats().requests > before);
+        let state = r.watch().lock().unwrap().clone();
+        assert!(state.reserved.is_empty());
+        assert_eq!(state.position, 21_000);
+    }
+
+    /// A seek while filling moves the reserve along; blocks left behind
+    /// make room for the ones now wanted.
+    #[test]
+    fn reserve_follows_a_seek_and_keeps_its_cap() {
+        let options = ReadAhead {
+            block_size: 1000,
+            blocks_ahead: 2,
+            reserve_bytes: 10_000,
+        };
+        let (mut r, data) = reader(100_000, 1, options);
+        let reserve = r.reserve();
+        let mut buf = [0u8; 1000];
+        r.read_exact(&mut buf).unwrap();
+        reserve.set_active(true);
+        assert!(
+            wait_until(|| reserve.ranges() == vec![(2000, 10_000)]),
+            "{:?}",
+            reserve.ranges()
+        );
+        r.seek(SeekFrom::Start(50_000)).unwrap();
+        r.read_exact(&mut buf).unwrap();
+        // Blocks left behind go only as room is needed (a seek back finds them).
+        let holds = |range| reserve.ranges().contains(&range);
+        assert!(
+            wait_until(|| holds((52_000, 60_000))),
+            "{:?}",
+            reserve.ranges()
+        );
+        let held: u64 = reserve.ranges().iter().map(|(a, b)| b - a).sum();
+        assert!(held <= 10_000, "{:?}", reserve.ranges());
+        // Reading on moves it on; the indicator shows window and reserve.
+        r.read_exact(&mut buf).unwrap();
+        assert!(
+            wait_until(|| holds((53_000, 61_000))),
+            "{:?}",
+            reserve.ranges()
+        );
+        let state = r.watch().lock().unwrap().clone();
+        assert!(state.fetched().contains(&(50_000, 61_000)), "{state:?}");
+        assert_eq!(state.fetched_within(55_000, 70_000), 6_000);
+        r.seek(SeekFrom::Start(55_000)).unwrap();
+        r.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf[..], &data[55_000..56_000]);
+        drop(r);
+    }
+
     #[test]
     fn pipelining_hides_latency() {
         // 64 blocks at 10 ms each: ~640 ms if serial, ~40 ms with 16 in flight.
         let options = ReadAhead {
             block_size: 8192,
             blocks_ahead: 16,
+            reserve_bytes: 0,
         };
         let (mut r, _) = reader(64 * 8192, 10, options);
         let started = Instant::now();

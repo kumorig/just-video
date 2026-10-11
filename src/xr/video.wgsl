@@ -22,6 +22,9 @@ struct Eye {
     // xy: luma texture size in texels; z: debug view (0 off, 1 projection UV, 2 raw luma);
     // w: zoom (magnification for spherical and fisheye video).
     tex: vec4<f32>,
+    // x: 1 when the surround is see-through (pixels off the picture are
+    // transparent, for the runtime to fill), 0 for black.
+    surround: vec4<f32>,
 }
 
 // YUV -> R'G'B' as affine rows (xyz: coefficients, w: offset), then
@@ -211,8 +214,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Texels covered by this output pixel (still uniform control flow).
     let duv = fwidth(uv);
     let footprint = max(duv.x * eye.tex.x, duv.y * eye.tex.y);
+    let see_through = eye.surround.x > 0.5;
     if coverage <= 0.0 {
-        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        return vec4<f32>(0.0, 0.0, 0.0, select(1.0, 0.0, see_through));
     }
 
     // Minified video (8K on a 2K eye) shimmers with one bilinear sample per
@@ -260,6 +264,6 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         ) * linear;
     }
     // The swapchain is sRGB: the hardware encodes this linear value. The
-    // edge fades to the black surround.
-    return vec4<f32>(clamp(linear, vec3<f32>(0.0), vec3<f32>(1.0)) * coverage, 1.0);
+    // edge fades to the surround: black, or (premultiplied) transparent.
+    return vec4<f32>(clamp(linear, vec3<f32>(0.0), vec3<f32>(1.0)) * coverage, select(1.0, coverage, see_through));
 }

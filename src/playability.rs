@@ -39,44 +39,25 @@ impl Platform {
         match self {
             Self::SteamFrame => {
                 if !matches!(v.codec.as_str(), "h264" | "hevc" | "vp9") {
-                    return Some(format!(
-                        "{name}'s hardware video decoder doesn't support {}",
-                        codec_label(&v.codec)
-                    ));
+                    return Some(format!("no hardware {} decoding", codec_label(&v.codec)));
                 }
                 if v.bit_depth > 8 {
-                    return Some(format!(
-                        "{name}'s hardware video decoder only handles 8-bit video in the current SteamOS, and this video is {}-bit",
-                        v.bit_depth
-                    ));
+                    return Some(format!("no hardware {}-bit decoding yet", v.bit_depth));
                 }
                 if v.bit_depth == 0 && !known_8bit_profile(v) {
-                    return Some(
-                        "the video's bit depth couldn't be confirmed as 8-bit, so the hardware decoder isn't used, to be safe"
-                            .into(),
-                    );
+                    return Some("bit depth unknown".into());
                 }
                 let pix = v.pixel_format.as_deref().unwrap_or("");
                 if pix.contains("422") || pix.contains("444") {
-                    return Some(format!(
-                        "{name}'s hardware video decoder only handles 4:2:0 color video"
-                    ));
+                    return Some("no hardware decoding for 4:2:2 or 4:4:4 colour".into());
                 }
                 if v.width > 8192 || v.height > 8192 {
-                    return Some(format!(
-                        "{name}'s hardware video decoder is limited to 8192 pixels per side"
-                    ));
+                    return Some("too big for hardware decoding".into());
                 }
                 None
             }
-            Self::Desktop => {
-                (!matches!(v.codec.as_str(), "h264" | "hevc" | "av1" | "vp9")).then(|| {
-                    format!(
-                        "{name}'s hardware video decoder doesn't support {}",
-                        codec_label(&v.codec)
-                    )
-                })
-            }
+            Self::Desktop => (!matches!(v.codec.as_str(), "h264" | "hevc" | "av1" | "vp9"))
+                .then(|| format!("no hardware {} decoding on {name}", codec_label(&v.codec))),
         }
     }
 
@@ -185,7 +166,7 @@ pub fn assess(platform: Platform, video: Option<&VideoInfo>) -> Assessment {
             verdict: Verdict::Unplayable,
             title: "No video track".into(),
             summary: "No video track".into(),
-            detail: Some("This file contains no video stream.".into()),
+            detail: Some("No video stream.".into()),
             hint: None,
             software_speed: None,
         };
@@ -195,7 +176,7 @@ pub fn assess(platform: Platform, video: Option<&VideoInfo>) -> Assessment {
         return Assessment {
             platform,
             verdict: Verdict::Hardware,
-            title: format!("Plays with hardware decoding ({})", describe(v)),
+            title: format!("Hardware decoding ({})", describe(v)),
             summary: describe(v),
             detail: None,
             hint: None,
@@ -213,26 +194,23 @@ pub fn assess(platform: Platform, video: Option<&VideoInfo>) -> Assessment {
             f64::INFINITY
         }
     });
-    let name = platform.name();
     let why_hw = capitalize(&gap);
     match speed {
         None => Assessment {
             platform,
             verdict: Verdict::Software,
-            title: format!("Plays with CPU decoding ({})", describe(v)),
+            title: format!("CPU decoding ({})", describe(v)),
             summary: describe(v),
-            detail: Some(format!("{why_hw}. It is decoded on the CPU instead.")),
+            detail: Some(format!("{why_hw}.")),
             hint: None,
             software_speed: None,
         },
         Some(s) if s >= SOFTWARE_HEADROOM => Assessment {
             platform,
             verdict: Verdict::Software,
-            title: format!("Plays with CPU decoding ({})", describe(v)),
+            title: format!("CPU decoding ({})", describe(v)),
             summary: describe(v),
-            detail: Some(format!(
-                "{why_hw}. It is decoded on the CPU instead: playback is smooth but uses more battery."
-            )),
+            detail: Some(format!("{why_hw}. Uses more battery.")),
             hint: None,
             software_speed: Some(s),
         },
@@ -241,68 +219,39 @@ pub fn assess(platform: Platform, video: Option<&VideoInfo>) -> Assessment {
             verdict: Verdict::SoftwareMarginal,
             title: format!("May stutter ({})", describe(v)),
             summary: describe(v),
-            detail: Some(format!(
-                "{why_hw}. The CPU can only just keep up with this video, so playback may stutter."
-            )),
-            hint: hint(platform, v),
+            detail: Some(format!("{why_hw}. The CPU can only just keep up.")),
+            hint: None,
             software_speed: Some(s),
         },
-        Some(s) => Assessment {
-            platform,
-            verdict: Verdict::Unplayable,
-            title: format!("Can't play smoothly on {name} ({})", describe(v)),
-            summary: describe(v),
-            detail: Some(format!(
-                "{why_hw}. Decoding it on the CPU instead reaches only about {:.0}% of the speed needed, so playback would stutter badly.",
-                (s * 100.0).floor()
-            )),
-            hint: hint(platform, v),
-            software_speed: Some(s),
-        },
-    }
-}
-
-/// Suggests a variant of the same video that would play well.
-fn hint(platform: Platform, v: &VideoInfo) -> Option<String> {
-    let mut options = Vec::new();
-    let eight_bit = VideoInfo {
-        bit_depth: 8,
-        codec: if v.codec == "av1" {
-            "hevc".into()
-        } else {
-            v.codec.clone()
-        },
-        ..v.clone()
-    };
-    if platform.hardware_gap(&eight_bit).is_none() {
-        options.push(format!(
-            "an 8-bit {} version",
-            codec_label(&eight_bit.codec)
-        ));
-    }
-    if v.width.max(v.height) > 4096 {
-        let scale = 4096.0 / v.width.max(v.height) as f64;
-        let smaller = VideoInfo {
-            width: (v.width as f64 * scale) as u32,
-            height: (v.height as f64 * scale) as u32,
-            ..v.clone()
-        };
-        if matches!(
-            assess(platform, Some(&smaller)).verdict,
-            Verdict::Hardware | Verdict::Software
-        ) {
-            options.push("a 4K version".into());
+        Some(s) => {
+            // A SteamOS update may bring hardware decoding for the format;
+            // nothing will make the picture smaller.
+            let later = v.bit_depth > 8 || !matches!(v.codec.as_str(), "h264" | "hevc" | "vp9");
+            let mut detail = format!("{} would stutter horrendously.", short(v));
+            if later && platform == Platform::SteamFrame {
+                detail.push_str(" It might be available later with an update of SteamOS.");
+            }
+            Assessment {
+                platform,
+                verdict: Verdict::Unplayable,
+                title: format!("Won't play smoothly ({})", describe(v)),
+                summary: describe(v),
+                detail: Some(detail),
+                hint: None,
+                software_speed: Some(s),
+            }
         }
     }
-    (!options.is_empty()).then(|| format!("{} of this video would play.", join_or(&options)))
 }
 
-fn join_or(items: &[String]) -> String {
-    match items {
-        [one] => capitalize(one),
-        [first, rest @ ..] => format!("{} or {}", capitalize(first), rest.join(" or ")),
-        [] => String::new(),
-    }
+/// "8K 10-bit video", "8K AV1 video": what matters for the verdict.
+fn short(v: &VideoInfo) -> String {
+    let what = if v.bit_depth > 8 {
+        format!("{}-bit", v.bit_depth)
+    } else {
+        codec_label(&v.codec)
+    };
+    format!("{} {what} video", resolution_label(v))
 }
 
 fn capitalize(s: &str) -> String {
@@ -355,11 +304,12 @@ mod tests {
         assert_eq!(a.verdict, Verdict::Unplayable);
         let detail = a.detail.unwrap();
         assert!(a.title.contains("8K 60 fps 10-bit HEVC"), "{}", a.title);
-        assert!(detail.contains("only handles 8-bit video"), "{detail}");
-        // 1.5e9 / (8192*4096*59.94) ≈ 0.746 → "74%" (measured: 0.8×)
-        assert!(detail.contains("74%"), "{detail}");
-        let hint = a.hint.unwrap();
-        assert!(hint.contains("8-bit HEVC") && hint.contains("4K"), "{hint}");
+        assert_eq!(
+            detail,
+            "8K 10-bit video would stutter horrendously. It might be available later with an update of SteamOS."
+        );
+        // 1.5e9 / (8192*4096*59.94) ≈ 0.746 (measured: 0.8×)
+        assert!((a.software_speed.unwrap() - 0.746).abs() < 0.01);
     }
 
     #[test]
@@ -371,10 +321,14 @@ mod tests {
             frame(&video("av1", 3840, 2160, 10, 30.0)).verdict,
             Verdict::Software
         );
-        // AV1 8K60: 0.8e9 / 2.0e9 → unplayable, suggests HEVC 8-bit.
+        // AV1 8K60: 0.8e9 / 2.0e9 → unplayable.
         let av1 = frame(&video("av1", 7680, 3840, 10, 60.0));
         assert_eq!(av1.verdict, Verdict::Unplayable);
-        assert!(av1.hint.unwrap().contains("8-bit HEVC"));
+        assert!(
+            av1.detail
+                .unwrap()
+                .starts_with("8K 10-bit video would stutter")
+        );
     }
 
     #[test]
@@ -396,7 +350,7 @@ mod tests {
         v.profile = Some("Main 10".into());
         let a = frame(&v);
         assert_ne!(a.verdict, Verdict::Hardware);
-        assert!(a.detail.unwrap().contains("couldn't be confirmed"));
+        assert!(a.detail.unwrap().contains("Bit depth unknown"));
         v.profile = Some("Main".into());
         assert_eq!(frame(&v).verdict, Verdict::Hardware);
         let mut chroma = video("h264", 1920, 1080, 8, 30.0);

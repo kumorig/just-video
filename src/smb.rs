@@ -67,7 +67,7 @@ impl FromStr for SmbUrl {
             .iter()
             .any(|s| *s == ".." || *s == "." || s.contains('\\'))
         {
-            bail!("SMB paths may not contain '.', '..' or backslashes");
+            bail!("Paths can't contain '.', '..' or backslashes.");
         }
         Ok(Self {
             domain,
@@ -180,7 +180,10 @@ fn run_with_deadline<T>(
 ) -> anyhow::Result<T> {
     runtime
         .block_on(async { tokio::time::timeout(REQUEST_DEADLINE, future).await })
-        .map_err(|_| anyhow::anyhow!("The server did not answer ({what})"))?
+        .map_err(|_| {
+            eprintln!("SMB: no answer within {REQUEST_DEADLINE:?} ({what})");
+            anyhow::anyhow!("The server did not answer.")
+        })?
 }
 
 impl SmbSession {
@@ -514,23 +517,126 @@ impl Drop for SmbSession {
 
 /// Turns SMB status codes from changing files into plain explanations.
 fn explain_write_error(message: &str) -> anyhow::Error {
-    let m = message.to_ascii_lowercase();
-    let text = if m.contains("0xc0000022") {
-        "The server doesn't allow changing this (you have no write permission here)."
-    } else if m.contains("0xc0000035") {
-        "Something with that name already exists."
-    } else if m.contains("0xc00000d4") {
-        "Choose a folder on the same filesystem"
-    } else if m.contains("0xc0000101") {
-        "The folder isn't empty. Only empty folders can be deleted."
-    } else if m.contains("0xc0000043") {
-        "The file is in use (maybe playing somewhere). Try again later."
-    } else if m.contains("0xc0000034") || m.contains("0xc000003a") {
-        "It's no longer there (renamed or deleted elsewhere)."
-    } else {
-        return anyhow::anyhow!("{message}");
-    };
-    anyhow::anyhow!("{text}")
+    anyhow::anyhow!("{}", explain(&anyhow::anyhow!("{message}")))
+}
+
+/// One short sentence for an error, from whatever the connection, the
+/// server or this crate said; the details stay in the log.
+pub fn explain(error: &anyhow::Error) -> String {
+    let text = format!("{error:#}");
+    let m = text.to_ascii_lowercase();
+    let known: &[(&[&str], &str)] = &[
+        (
+            &[
+                "0xc000006d",
+                "0xc000006a",
+                "logon_failure",
+                "wrong_password",
+            ],
+            "Wrong user name or password.",
+        ),
+        (&["0xc0000064", "no_such_user"], "No such user."),
+        (
+            &[
+                "0xc0000234",
+                "0xc0000071",
+                "0xc000015b",
+                "0xc0000072",
+                "account_locked",
+                "password_expired",
+                "logon_type_not_granted",
+                "account_disabled",
+            ],
+            "This account can't sign in.",
+        ),
+        (&["0xc0000022", "access_denied"], "No permission."),
+        (&["0xc00000cc", "bad_network_name"], "No such share."),
+        (
+            &[
+                "0xc0000034",
+                "0xc000003a",
+                "object_name_not_found",
+                "object_path_not_found",
+            ],
+            "No longer there.",
+        ),
+        (&["0xc0000035", "object_name_collision"], "Already exists."),
+        (
+            &["0xc0000043", "sharing_violation"],
+            "In use. Try again later.",
+        ),
+        (&["0xc0000101", "directory_not_empty"], "Folder not empty."),
+        (&["0xc00000d4", "not_same_device"], "Same filesystem only."),
+        (&["connection refused"], "Nothing answers on the SMB port."),
+        (
+            &[
+                "lookup",
+                "resolve",
+                "no such host",
+                "name or service not known",
+                "nodename nor servname",
+            ],
+            "Can't find that address.",
+        ),
+        (
+            &[
+                "network is unreachable",
+                "no route to host",
+                "network unreachable",
+            ],
+            "No network.",
+        ),
+        (
+            &["timed out", "did not answer", "stopped sending"],
+            "The server did not answer.",
+        ),
+        (
+            &[
+                "connection reset",
+                "broken pipe",
+                "connection is stopped",
+                "unexpected eof",
+                "connection closed",
+                "channel recv",
+            ],
+            "The connection dropped.",
+        ),
+        (
+            &["signature verification", "negotiation error"],
+            "The server's SMB settings aren't supported.",
+        ),
+    ];
+    for (needles, plain) in known {
+        if needles.iter().any(|n| m.contains(n)) {
+            return plain.to_string();
+        }
+    }
+    // Otherwise the innermost message, without library prefixes.
+    let mut root = error.root_cause().to_string();
+    for prefix in [
+        "IO Error: ",
+        "Transport error: ",
+        "Other error: ",
+        "Negotiation error: ",
+        "Server returned an error message with status: ",
+        "Unexpected message status: ",
+        "SMB message error: ",
+        "SMB FSCC error: ",
+    ] {
+        if let Some(rest) = root.strip_prefix(prefix) {
+            root = rest.to_string();
+        }
+    }
+    let root = root.trim().trim_end_matches('.');
+    if root.is_empty() {
+        return "Something went wrong.".into();
+    }
+    let mut chars = root.chars();
+    let first = chars
+        .next()
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_default();
+    format!("{first}{}.", chars.as_str())
 }
 
 /// An open SMB file as a read-ahead block source.

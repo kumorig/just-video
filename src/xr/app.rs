@@ -158,18 +158,21 @@ fn browser_panel(place: &Placement) -> Panel {
     }
 }
 
-/// The handle below the browser (a white bar, as under the Steam
-/// dashboard): point at it and hold select to move the browser.
-fn handle_panel(browser: &Panel) -> Panel {
-    let width = browser.size[0] * 0.22;
+/// The handle below a panel (a white bar, as under the Steam dashboard):
+/// point at it and hold select to move the panel. Or above it, for a panel
+/// hanging so low that below would be out of sight.
+fn handle_panel(panel: &Panel, above: bool) -> Panel {
+    let width = panel.size[0] * 0.22;
     let height = width * HANDLE_PX[1] as f32 / HANDLE_PX[0] as f32;
-    let [_, up, _] = browser.basis();
-    let drop = browser.size[1] / 2.0 + browser.size[1] * 0.035 + height / 2.0;
+    let [_, up, _] = panel.basis();
+    let gap = (panel.size[1] * 0.035).max(panel.size[0] * 0.012);
+    let drop = panel.size[1] / 2.0 + gap + height / 2.0;
+    let drop = if above { -drop } else { drop };
     Panel {
-        center: [0, 1, 2].map(|i| browser.center[i] - up[i] * drop),
+        center: [0, 1, 2].map(|i| panel.center[i] - up[i] * drop),
         size: [width, height],
         pixels: HANDLE_PX,
-        ..*browser
+        ..*panel
     }
 }
 
@@ -193,10 +196,15 @@ fn handle_image(opacity: f32) -> Vec<u8> {
 /// Preferred distance of the control bar; it looks as big as 1.2 m wide at 1 m.
 const CONTROLS_DISTANCE: f32 = 1.8;
 
-/// The control bar for VR180/360: [`CONTROLS_DISTANCE`] ahead of the head,
-/// below eye level, tilted towards it.
-fn controls_panel(head: &xr::Posef) -> Panel {
-    let d = CONTROLS_DISTANCE;
+/// Where the VR180/360 control bar starts: [`CONTROLS_DISTANCE`] ahead of
+/// the head, this far below eye level (radians), orbiting the head when
+/// dragged by its handle, like the browser.
+const VR_BAR_PITCH: f32 = -0.4;
+/// Hanging lower than this, the bar's handle goes above it, where it can
+/// still be seen.
+const LOW_BAR_PITCH: f32 = -0.6;
+
+fn vr_bar_placement(head: &xr::Posef) -> Placement {
     let q = head.orientation;
     // Forward (-Z) of the head, flattened to the horizon.
     let forward = [
@@ -204,17 +212,26 @@ fn controls_panel(head: &xr::Posef) -> Panel {
         0.0,
         -(1.0 - 2.0 * (q.x * q.x + q.y * q.y)),
     ];
-    let yaw = (-forward[0]).atan2(-forward[2]);
-    let (sy, cy) = yaw.sin_cos();
-    let p = head.position;
+    Placement {
+        yaw: (-forward[0]).atan2(-forward[2]),
+        pitch: VR_BAR_PITCH,
+        distance: CONTROLS_DISTANCE / VR_BAR_PITCH.cos(),
+        curved: false,
+        zoom: 1.0,
+        offset: 0.0,
+        pivot: [head.position.x, head.position.y, head.position.z],
+    }
+}
+
+/// The VR180/360 control bar where it has been dragged, facing the head
+/// and keeping its apparent size at any distance.
+fn vr_bar_panel(place: &Placement) -> Panel {
+    let w = 1.2 * place.distance * VR_BAR_PITCH.cos();
     Panel {
-        center: [p.x - sy * d, p.y - 0.42 * d, p.z - cy * d],
-        yaw,
-        tilt: -0.45,
-        size: [
-            1.2 * d,
-            1.2 * d * controls::HEIGHT as f32 / controls::WIDTH as f32,
-        ],
+        center: place.center(),
+        yaw: place.yaw,
+        tilt: place.pitch,
+        size: [w, w * controls::HEIGHT as f32 / controls::WIDTH as f32],
         pixels: [controls::WIDTH, controls::HEIGHT],
     }
 }
@@ -834,7 +851,6 @@ pub fn run(
     renderer.upload_quad(&mut handle, &handle_image(0.55))?;
     let mut handle_hot = renderer.create_quad(&ctx, HANDLE_PX[0], HANDLE_PX[1])?;
     renderer.upload_quad(&mut handle_hot, &handle_image(1.0))?;
-    let mut handle_lit = false;
 
     let mut mode = match initial {
         Some(playback) => Mode::Playing(Box::new(playback)),
@@ -851,6 +867,11 @@ pub fn run(
     let mut resume_saved_at = Instant::now();
     let mut screenshot = options.play.screenshot.clone();
     let mut placement = Placement::new(&options.view);
+    // The VR180/360 control bar, once opened; dragged by its handle.
+    let mut bar_place: Option<Placement> = None;
+    let mut bar_press: Option<Press> = None;
+    // Flat screens: what shows around the picture (see `eye_params`).
+    let mut see_through = crate::config::see_through();
     let mut browser_place = browser_placement([0.0; 3]);
     let mut controls_panel_at: Option<Panel> = None;
     let mut controls_drawn: Option<(controls::State, controls::Hit)> = None;
@@ -988,6 +1009,10 @@ pub fn run(
         }
 
         let mut cursor_at: Option<(Panel, f32, f32)> = None;
+        // The VR180/360 bar's handle this frame, and whether a handle is
+        // pointed at or held (drawn brighter).
+        let mut bar_handle_at: Option<Panel> = None;
+        let handle_lit: bool;
         // A cursor on the video itself: position, aim yaw/pitch, distance from the eye.
         let mut video_cursor: Option<([f32; 3], f32, f32, f32)> = None;
         // Every frame submits a projection layer (the video, or a dark backdrop
@@ -1022,6 +1047,7 @@ pub fn run(
                     );
                     resume_saved_at = Instant::now();
                     playback.set_buffer(opened.buffer);
+                    playback.set_reserve(opened.reserve);
                     playback.add_external_subtitles(opened.external_subtitles);
                     playback.image = opened.image;
                     renderer.set_adjust(&playback.image);
@@ -1033,7 +1059,7 @@ pub fn run(
                     continue;
                 }
                 let browser_at = browser_panel(&browser_place);
-                let handle_at = handle_panel(&browser_at);
+                let handle_at = handle_panel(&browser_at, false);
                 let point = ray.and_then(|r| browser_at.hit(r));
                 let on_handle = ray.and_then(|r| handle_at.hit(r));
                 // Moving the browser: select held on its handle, or the grip
@@ -1224,15 +1250,27 @@ pub fn run(
                 // A screen's control bar moves with it (dragged, zoomed, curved).
                 if curved_applies && controls_panel_at.is_some() {
                     controls_panel_at = Some(screen_controls_panel(&placement, screen));
+                } else if controls_panel_at.is_some()
+                    && let Some(head) = views.first()
+                {
+                    // VR180/360: where it was put (dragging moves it).
+                    let place = bar_place.get_or_insert_with(|| vr_bar_placement(&head.pose));
+                    controls_panel_at = Some(vr_bar_panel(place));
                 }
                 let ui_state = controls::State {
                     paused: playback.paused(),
                     position: playback.position().floor(),
                     duration: playback.duration,
                     buffered: playback.buffered(),
+                    reserve: playback.reserve_status().map(|r| controls::Reserve {
+                        on: r.on,
+                        held: r.held,
+                        goal: r.goal,
+                    }),
                     has_previous: navigator.as_ref().is_some_and(|n| n.has_adjacent(-1)),
                     has_next: navigator.as_ref().is_some_and(|n| n.has_adjacent(1)),
                     curved: curved_applies.then_some(placement.curved),
+                    see_through,
                     format: (playback.layout.projection, playback.layout.stereo),
                     favourites: favourites.clone(),
                     swap_eyes: playback.layout.swap_eyes,
@@ -1267,6 +1305,75 @@ pub fn run(
                     bar_hit
                 };
 
+                // VR180/360: the bar's handle, under it, or above when it
+                // hangs low (above the dialog, if one is open).
+                if !curved_applies && let Some(bar) = controls_panel_at {
+                    let low = bar_place.is_some_and(|p| p.pitch < LOW_BAR_PITCH);
+                    bar_handle_at = Some(match (low, dialog_at) {
+                        (true, Some(dialog)) => handle_panel(&dialog, true),
+                        (true, None) => handle_panel(&bar, true),
+                        (false, _) => handle_panel(&bar, false),
+                    });
+                }
+                let on_bar_handle = bar_handle_at.and_then(|h| ray.and_then(|r| h.hit(r)));
+                // Moving the bar: select held on its handle, or the grip held
+                // while pointing at it; the stick then moves it nearer or farther.
+                let grab_bar = bar_handle_at.is_some()
+                    && ((on_bar_handle.is_some() && buttons.select[active_hand])
+                        || (buttons.grip && (control_point.is_some() || on_bar_handle.is_some())));
+                if grab_bar
+                    && press.is_none()
+                    && control_press.is_none()
+                    && bar_press.is_none()
+                    && let Some(r) = buttons.rays[active_hand].as_ref()
+                    && let Some(place) = bar_place.as_mut()
+                {
+                    let (yaw, pitch) = aim_angles(r);
+                    // From the handle it moves at once; by grip after a small move.
+                    let dragging = on_bar_handle.is_some() && buttons.select[active_hand];
+                    if dragging {
+                        place.anchor_at(head_position(&views));
+                    }
+                    bar_press = Some(Press {
+                        hand: active_hand,
+                        since: now,
+                        yaw,
+                        pitch,
+                        start: *place,
+                        dragging,
+                    });
+                }
+                let mut bar_moving = false;
+                if let Some(p) = &mut bar_press
+                    && let Some(place) = bar_place.as_mut()
+                {
+                    let held = buttons.select_held[p.hand] || buttons.grip;
+                    match (held, buttons.rays[p.hand].as_ref()) {
+                        (true, Some(r)) => {
+                            let (yaw, pitch) = aim_angles(r);
+                            let (dyaw, dpitch) = (wrap_angle(yaw - p.yaw), pitch - p.pitch);
+                            if !p.dragging
+                                && (dyaw.abs() > DRAG_THRESHOLD || dpitch.abs() > DRAG_THRESHOLD)
+                            {
+                                p.dragging = true;
+                                place.anchor_at(head_position(&views));
+                                (p.yaw, p.pitch, p.start) = (yaw, pitch, *place);
+                            } else if p.dragging {
+                                place.yaw = p.start.yaw + dyaw;
+                                place.pitch = (p.start.pitch + dpitch)
+                                    .clamp(-super::player::MAX_PITCH, super::player::MAX_PITCH);
+                                if buttons.scroll != 0.0 {
+                                    place.distance = (place.distance + buttons.scroll * 1.5 * dt)
+                                        .clamp(1.0, 5.0);
+                                }
+                            }
+                            bar_moving = p.dragging;
+                        }
+                        _ => bar_press = None,
+                    }
+                }
+                handle_lit = on_bar_handle.is_some() || bar_moving;
+
                 // Controls act on release, so buttons with a long press can
                 // tell the two apart; the seek bar acts at once.
                 let mut clicked: Option<controls::Hit> = None;
@@ -1284,7 +1391,12 @@ pub fn run(
                         control_press = None;
                     }
                 }
-                if buttons.select[active_hand] && press.is_none() && control_press.is_none() {
+                if buttons.select[active_hand]
+                    && press.is_none()
+                    && control_press.is_none()
+                    && bar_press.is_none()
+                    && on_bar_handle.is_none()
+                {
                     if control_point.is_some() {
                         if let controls::Hit::Seek(_) = control_hit {
                             clicked = Some(control_hit);
@@ -1343,7 +1455,11 @@ pub fn run(
                                     None if curved_applies => {
                                         Some(screen_controls_panel(&placement, screen))
                                     }
-                                    None => views.first().map(|v| controls_panel(&v.pose)),
+                                    None => views.first().map(|v| {
+                                        let place = bar_place
+                                            .get_or_insert_with(|| vr_bar_placement(&v.pose));
+                                        vr_bar_panel(place)
+                                    }),
                                 };
                                 dialog = None;
                                 caption_edit = false;
@@ -1361,6 +1477,7 @@ pub fn run(
                 let mut captions_changed = false;
                 match clicked {
                     Some(controls::Hit::PlayPause) => playback.toggle_pause(now),
+                    Some(controls::Hit::Reserve) => playback.toggle_reserve(now),
                     Some(controls::Hit::Seek(f)) => playback.seek(f as f64 * playback.duration),
                     Some(controls::Hit::Previous) => switch_video = Some(-1),
                     Some(controls::Hit::Next) => switch_video = Some(1),
@@ -1409,6 +1526,12 @@ pub fn run(
                     }
                     Some(controls::Hit::Pick(i)) => set_format(playback, controls::FORMATS[i]),
                     Some(controls::Hit::Curved) => placement.curved = !placement.curved,
+                    Some(controls::Hit::SeeThrough) => {
+                        see_through = !see_through;
+                        if let Err(e) = crate::config::save_see_through(see_through) {
+                            eprintln!("Can't save the surround setting: {e:#}");
+                        }
+                    }
                     Some(controls::Hit::SwapEyes) => {
                         playback.layout.swap_eyes = !playback.layout.swap_eyes;
                         save_layout(playing_key.as_ref(), &playback.layout, &playback.image);
@@ -1494,13 +1617,15 @@ pub fn run(
                     controls_drawn = None;
                 }
                 if buttons.reset {
-                    // Ahead of the head, wherever it is now.
+                    // Ahead of the head, wherever it is now; the VR bar too.
                     placement = Placement {
                         curved: placement.curved,
                         pivot: head_position(&views),
                         ..Placement::new(&options.view)
                     };
                     press = None;
+                    bar_place = None;
+                    bar_press = None;
                 }
                 // The sticks zoom, except while dragging, when they move the
                 // screen nearer or farther.
@@ -1534,6 +1659,10 @@ pub fn run(
                     }
                     if let Some((p, (x, y))) = control_point {
                         cursor_at = Some((p, x, y));
+                    } else if let (Some((x, y)), Some(h)) = (on_bar_handle, bar_handle_at)
+                        && !bar_moving
+                    {
+                        cursor_at = Some((h, x, y));
                     } else if let (Some(r), Some(head)) = (ray, views.first()) {
                         // Menu open: also show where the ray meets the video.
                         let screen = screen_size(
@@ -1653,6 +1782,7 @@ pub fn run(
                         &options.view,
                         &placement,
                         playback.image.rotation,
+                        see_through,
                     );
                     renderer.draw_eye(eye, index, &params, show);
                 }
@@ -1678,6 +1808,11 @@ pub fn run(
 
         // Overlay layers to show this frame, back to front.
         let mut overlays: Vec<Overlay> = Vec::new();
+        // Whether this frame's eye images have a transparent surround.
+        let see_through_now = match &mode {
+            Mode::Playing(p) => see_through && p.layout.projection == Projection::Flat,
+            Mode::Browser => false,
+        };
         match &mode {
             Mode::Browser => {
                 let browser_at = browser_panel(&browser_place);
@@ -1688,7 +1823,7 @@ pub fn run(
                         browser_at.size,
                         false,
                     ));
-                    let bar = handle_panel(&browser_at);
+                    let bar = handle_panel(&browser_at, false);
                     let image = if handle_lit { &handle_hot } else { &handle };
                     overlays.push(Overlay::quad(image, bar.pose(), bar.size, true));
                 }
@@ -1728,6 +1863,10 @@ pub fn run(
                             above.size,
                             false,
                         ));
+                    }
+                    if let Some(bar) = bar_handle_at {
+                        let image = if handle_lit { &handle_hot } else { &handle };
+                        overlays.push(Overlay::quad(image, bar.pose(), bar.size, true));
                     }
                 }
                 if let Some((pose, size)) = progress_at.filter(|(_, s)| s[0] > 0.0) {
@@ -1806,9 +1945,18 @@ pub fn run(
         } else {
             Vec::new()
         };
+        // A flat screen with a see-through surround leaves the rest of the
+        // eye image transparent, and the layer says so, so the runtime can
+        // show passthrough (or its environment) there as it does around the
+        // browser.
         let projection = xr::CompositionLayerProjection::new()
             .space(&space)
             .views(&projection_views);
+        let projection = if see_through_now {
+            projection.layer_flags(xr::CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA)
+        } else {
+            projection
+        };
         let built: Vec<Built> = overlays
             .iter()
             .map(|o| match o.shape {
@@ -2085,9 +2233,15 @@ mod tests {
             position: 754.0,
             duration: 5530.0,
             buffered: vec![(754.0, 760.0)],
+            reserve: Some(controls::Reserve {
+                on: false,
+                held: 0,
+                goal: 1 << 30,
+            }),
             has_previous: true,
             has_next: true,
             curved: Some(false),
+            see_through: true,
             format: controls::FORMATS[0],
             favourites: vec![controls::FORMATS[0]],
             swap_eyes: false,
@@ -2155,7 +2309,7 @@ mod tests {
                 screen,
                 Default::default(),
             );
-            let bar_panel = controls_panel(&xr::Posef::IDENTITY);
+            let bar_panel = vr_bar_panel(&vr_bar_placement(&xr::Posef::IDENTITY));
             render_scene(
                 &dir.join(format!("{name}.png")),
                 (0.0, -0.1),
@@ -2212,6 +2366,41 @@ mod tests {
     }
 
     #[test]
+    fn vr_bar_keeps_its_apparent_size_and_handle_side() {
+        let head = xr::Posef {
+            position: xr::Vector3f {
+                x: 0.0,
+                y: 1.6,
+                z: 0.0,
+            },
+            ..xr::Posef::IDENTITY
+        };
+        let place = vr_bar_placement(&head);
+        let bar = vr_bar_panel(&place);
+        // Ahead at the control distance, below eye level, facing the head.
+        assert!(
+            (bar.center[2] + CONTROLS_DISTANCE).abs() < 1e-3,
+            "{:?}",
+            bar.center
+        );
+        assert!(bar.center[1] < 1.6 - 0.5, "{:?}", bar.center);
+        assert!((bar.size[0] - 1.2 * CONTROLS_DISTANCE).abs() < 1e-3);
+        // Pushed farther away it grows to look the same size.
+        let far = vr_bar_panel(&Placement {
+            distance: place.distance * 2.0,
+            ..place
+        });
+        assert!((far.size[0] - 2.0 * bar.size[0]).abs() < 1e-3);
+        // The handle hangs below, or sits above a bar dragged low.
+        let [_, up, _] = bar.basis();
+        let below = handle_panel(&bar, false);
+        let above = handle_panel(&bar, true);
+        let d = |h: &Panel| dot([0, 1, 2].map(|i| h.center[i] - bar.center[i]), up);
+        assert!(d(&below) < -bar.size[1] / 2.0);
+        assert!(d(&above) > bar.size[1] / 2.0);
+    }
+
+    #[test]
     fn browser_handle_hangs_below_the_panel() {
         let mut place = browser_placement([0.0, 1.6, 0.0]);
         place.yaw = 0.5;
@@ -2219,7 +2408,7 @@ mod tests {
         let panel = browser_panel(&place);
         // Apparent size is kept: 1.5x the distance, 1.5x the size.
         assert!((panel.size[0] - BROWSER_SIZE[0] * 1.5).abs() < 1e-3);
-        let handle = handle_panel(&panel);
+        let handle = handle_panel(&panel, false);
         let [_, up, normal] = panel.basis();
         let d = [0, 1, 2].map(|i| handle.center[i] - panel.center[i]);
         assert!(dot(d, up) < -panel.size[1] / 2.0, "below the bottom edge");

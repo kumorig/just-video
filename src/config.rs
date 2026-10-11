@@ -287,6 +287,29 @@ struct Settings {
     favourite_formats: Option<Vec<Format>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     captions: Option<CaptionSettings>,
+    /// Flat screens: the surroundings show around the picture (passthrough
+    /// or the runtime's environment) rather than black.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    see_through: Option<bool>,
+    /// Most the reader buffers ahead while paused, in MiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reserve_mib: Option<u64>,
+}
+
+/// Choices for how much to buffer ahead while paused (bytes).
+pub const RESERVE_PRESETS: [u64; 5] = [256 << 20, 512 << 20, 1 << 30, 2 << 30, 4 << 30];
+
+pub fn reserve_bytes() -> u64 {
+    read_json::<Settings>("settings.json")
+        .ok()
+        .and_then(|s| s.reserve_mib)
+        .map_or(crate::readahead::RESERVE_BYTES, |mib| mib << 20)
+}
+
+pub fn save_reserve_bytes(bytes: u64) -> anyhow::Result<()> {
+    let mut settings: Settings = read_json("settings.json")?;
+    settings.reserve_mib = Some(bytes >> 20);
+    write_json("settings.json", &settings, false)
 }
 
 /// Subtitle size and position, the same for every video.
@@ -312,6 +335,19 @@ pub fn caption_settings() -> CaptionSettings {
         .ok()
         .and_then(|s| s.captions)
         .unwrap_or_default()
+}
+
+pub fn see_through() -> bool {
+    read_json::<Settings>("settings.json")
+        .ok()
+        .and_then(|s| s.see_through)
+        .unwrap_or(true)
+}
+
+pub fn save_see_through(see_through: bool) -> anyhow::Result<()> {
+    let mut settings: Settings = read_json("settings.json")?;
+    settings.see_through = Some(see_through);
+    write_json("settings.json", &settings, false)
 }
 
 pub fn save_caption_settings(captions: CaptionSettings) -> anyhow::Result<()> {

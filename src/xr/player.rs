@@ -173,16 +173,16 @@ mod tests {
         let state = crate::readahead::Buffered {
             position: 1_000_000,
             len: 10_000_000,
-            ranges: vec![
-                (1_000_000, 1_500_000),
-                (1_500_000, 2_000_000),
-                (5_000_000, 5_200_000),
-            ],
+            ranges: vec![(1_000_000, 1_500_000), (1_500_000, 2_000_000)],
+            reserved: vec![(5_000_000, 5_200_000)],
         };
         // 100 s video: 100 000 bytes per second; playing at 12.5 s.
         let ranges = buffered_seconds(&state, 12.5, 100.0);
         assert_eq!(ranges, vec![(12.0, 23.0), (52.0, 55.0)]);
         assert!(buffered_seconds(&state, 12.5, 0.0).is_empty());
+        // Held ahead: the window and the reserve, up to the cap.
+        assert_eq!(reserve_progress(&state, 4_000_000), (1_000_000, 4_000_000));
+        assert_eq!(reserve_progress(&state, 1 << 30), (1_200_000, 9_000_000));
     }
 
     #[test]
@@ -242,7 +242,7 @@ fn buffered_seconds(
         (position + (byte as f64 - state.position as f64) * per_byte).clamp(0.0, duration)
     };
     let mut out: Vec<(f64, f64)> = Vec::new();
-    for &(a, b) in &state.ranges {
+    for (a, b) in state.fetched() {
         let (from, to) = (at(a).floor(), at(b).ceil().min(duration));
         if to <= from {
             continue;
@@ -253,6 +253,24 @@ fn buffered_seconds(
         }
     }
     out
+}
+
+/// Bytes held from the read position on, and how many the reserve aims
+/// for there: the rest of the file, up to `cap`.
+fn reserve_progress(state: &crate::readahead::Buffered, cap: u64) -> (u64, u64) {
+    let goal = state.len.saturating_sub(state.position).min(cap);
+    let held = state.fetched_within(state.position, state.position + goal);
+    (held, goal)
+}
+
+/// The reserve as the control bar shows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReserveStatus {
+    /// Filling (or full): the player is paused for it.
+    pub on: bool,
+    /// Bytes held ahead, and the bytes it aims for.
+    pub held: u64,
+    pub goal: u64,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -641,6 +659,9 @@ pub struct Playback {
     pub stats: PlayStats,
     /// The network reader's buffer, when playing from a share.
     buffer: Option<crate::readahead::BufferWatch>,
+    /// The reader's reserve (see [`Playback::toggle_reserve`]).
+    reserve: Option<Arc<crate::readahead::Reserve>>,
+    reserve_on: bool,
 }
 
 impl Playback {
@@ -741,12 +762,59 @@ impl Playback {
             paused_at: None,
             stats: PlayStats::default(),
             buffer: None,
+            reserve: None,
+            reserve_on: false,
         }
     }
 
     /// Shows the network reader's buffer on the seek bar.
     pub fn set_buffer(&mut self, buffer: crate::readahead::BufferWatch) {
         self.buffer = Some(buffer);
+    }
+
+    /// Offers buffering ahead while paused (see [`Playback::toggle_reserve`]).
+    pub fn set_reserve(&mut self, reserve: Arc<crate::readahead::Reserve>) {
+        self.reserve = Some(reserve);
+    }
+
+    /// Buffering ahead: on, the video pauses and the reader fetches on from
+    /// here, up to a gigabyte, so the rest can play without the network.
+    /// Off again by hand, or by playing on (see [`Playback::toggle_pause`]):
+    /// fetching ahead while playing once starved playback over Wi-Fi.
+    pub fn toggle_reserve(&mut self, now: i64) {
+        let Some(reserve) = &self.reserve else {
+            return;
+        };
+        // (A reserve that gave up on a failing server shows as off.)
+        if self.reserve_on && reserve.is_active() {
+            self.set_reserve_on(false);
+            return;
+        }
+        if !self.paused() {
+            self.toggle_pause(now);
+        }
+        self.set_reserve_on(true);
+    }
+
+    fn set_reserve_on(&mut self, on: bool) {
+        self.reserve_on = on;
+        if let Some(reserve) = &self.reserve {
+            reserve.set_active(on);
+        }
+    }
+
+    pub fn reserve_status(&self) -> Option<ReserveStatus> {
+        let (reserve, buffer) = (self.reserve.as_ref()?, self.buffer.as_ref()?);
+        let state = buffer.lock().ok()?.clone();
+        let (held, goal) = reserve_progress(&state, reserve.capacity());
+        // Whole MiB: the bar needn't redraw for every read.
+        let mib = |bytes: u64| bytes >> 20 << 20;
+        Some(ReserveStatus {
+            // The reserve gives up when the server keeps failing.
+            on: self.reserve_on && reserve.is_active(),
+            held: mib(held.min(goal)),
+            goal: mib(goal).max(1),
+        })
     }
 
     /// Stretches of the video already fetched, in seconds (sorted). Bytes
@@ -944,6 +1012,8 @@ impl Playback {
                 if let Some(start) = &mut self.clock_start {
                     *start += now - at;
                 }
+                // Playing on ends buffering ahead; what it holds stays.
+                self.set_reserve_on(false);
             }
             None => self.paused_at = Some(now),
         }
@@ -1135,6 +1205,7 @@ pub fn screen_size(
 }
 
 /// Shader parameters for one eye.
+#[allow(clippy::too_many_arguments)]
 pub fn eye_params(
     view: &xr::View,
     eye: usize,
@@ -1143,6 +1214,7 @@ pub fn eye_params(
     options: &ViewOptions,
     placement: &Placement,
     quarter_turns: u8,
+    see_through: bool,
 ) -> EyeParams {
     let (w, h) = (tex.0 as f32, tex.1 as f32);
     let screen = screen_size(tex, layout.stereo, options, placement.zoom, quarter_turns);
@@ -1190,5 +1262,16 @@ pub fn eye_params(
             if spherical { placement.offset } else { 0.0 },
         ],
         tex: [w, h, options.debug_view as f32, placement.zoom],
+        // Only a screen has a surround; spherical video fills the view.
+        surround: [
+            if see_through && layout.projection == Projection::Flat {
+                1.0
+            } else {
+                0.0
+            },
+            0.0,
+            0.0,
+            0.0,
+        ],
     }
 }

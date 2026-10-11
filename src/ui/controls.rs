@@ -2,9 +2,14 @@
 //!
 //! ```text
 //! [⏮][▶][⏭]                               [CC]    [▭]     [☀]
-//!                                          English 180° 3D  Image
+//!    [⤓] 412 MB of 1 GB                   English 180° 3D  Image
 //! 12:34 / 1:32:10  ━━━━━━━━━━●──────────────────────────────────
 //! ```
+//!
+//! The small button under play buffers ahead: a click pauses the video and
+//! fetches up to a gigabyte on from here (only while paused, so that
+//! playback never competes with it for the network); play, or another
+//! click, stops it. The seek bar shows the stretch held.
 //!
 //! CC: a click turns subtitles on/off, a long press opens the audio and
 //! subtitle dialog (tracks, and a way into subtitle editing: the bar then
@@ -94,6 +99,8 @@ pub enum Hit {
     Previous,
     PlayPause,
     Next,
+    /// Buffer ahead while paused, on or off.
+    Reserve,
     /// Fraction of the duration.
     Seek(f32),
     /// CC: click toggles subtitles, long press opens the track dialog.
@@ -121,6 +128,8 @@ pub enum Hit {
     /// A format (index into [`FORMATS`]); long press stars it.
     Pick(usize),
     Curved,
+    /// Flat screens: surroundings visible around the picture, or black.
+    SeeThrough,
     SwapEyes,
     Brightness(i8),
     Contrast(i8),
@@ -139,6 +148,16 @@ impl Hit {
     }
 }
 
+/// Buffering ahead while paused (see the module docs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reserve {
+    pub on: bool,
+    /// Bytes held from here on, and how many it aims for (the rest of the
+    /// video, up to the cap).
+    pub held: u64,
+    pub goal: u64,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct State {
     pub paused: bool,
@@ -146,10 +165,14 @@ pub struct State {
     pub duration: f64,
     /// Stretches already fetched from the network, in seconds.
     pub buffered: Vec<(f64, f64)>,
+    /// None for a local file, which needs no buffering.
+    pub reserve: Option<Reserve>,
     pub has_previous: bool,
     pub has_next: bool,
     /// None when the curve toggle does not apply (VR180/360).
     pub curved: Option<bool>,
+    /// Flat screens: the surroundings show around the picture.
+    pub see_through: bool,
     pub format: Format,
     pub favourites: Vec<Format>,
     pub swap_eyes: bool,
@@ -185,6 +208,10 @@ pub const PROGRESS_H: f32 = 3.0;
 const PREVIOUS: Rect = (24.0, 16.0, 96.0, 92.0);
 const PLAY: Rect = (136.0, 16.0, 96.0, 92.0);
 const NEXT: Rect = (248.0, 16.0, 96.0, 92.0);
+/// Under play: half a button, for buffering ahead.
+const RESERVE: Rect = (136.0, 116.0, 96.0, 36.0);
+/// What the reserve is doing, beside its button.
+const RESERVE_LABEL: Rect = (248.0, 116.0, 440.0, 36.0);
 const CAPTIONS: Rect = (818.0, 16.0, 96.0, 92.0);
 const SCREEN: Rect = (948.0, 16.0, 96.0, 92.0);
 const IMAGE: Rect = (1078.0, 16.0, 96.0, 92.0);
@@ -222,6 +249,7 @@ pub fn hit(state: &State, x: f32, y: f32) -> Hit {
         (PREVIOUS, Hit::Previous, state.has_previous),
         (PLAY, Hit::PlayPause, true),
         (NEXT, Hit::Next, state.has_next),
+        (RESERVE, Hit::Reserve, state.reserve.is_some()),
         (CAPTIONS, Hit::Captions, can_caption),
         (SCREEN, Hit::Screen, true),
         (IMAGE, Hit::Image, true),
@@ -329,6 +357,11 @@ fn dialog_buttons(state: &State) -> Vec<(Hit, Rect, bool)> {
                 (608.0, 420.0, 568.0, 72.0),
                 state.format.1 != Stereo::Mono,
             ));
+            out.push((
+                Hit::SeeThrough,
+                (24.0, 508.0, 568.0, 72.0),
+                state.curved.is_some(),
+            ));
         }
         Some(Dialog::Image) => {
             for (i, (minus, plus)) in [
@@ -363,6 +396,17 @@ pub fn dialog_hit(state: &State, x: f32, y: f32) -> Hit {
         .into_iter()
         .find(|(_, r, enabled)| *enabled && inside(*r, x, y))
         .map_or(Hit::Nothing, |(hit, _, _)| hit)
+}
+
+/// "412 MB", "1.5 GB".
+pub fn format_size(bytes: u64) -> String {
+    let mib = bytes as f64 / (1u64 << 20) as f64;
+    if mib >= 1000.0 {
+        let gb = format!("{:.1}", mib / 1024.0);
+        format!("{} GB", gb.strip_suffix(".0").unwrap_or(&gb))
+    } else {
+        format!("{mib:.0} MB")
+    }
 }
 
 pub fn format_time(seconds: f64) -> String {
@@ -441,6 +485,21 @@ fn star(c: &mut Canvas, cx: f32, cy: f32, r: f32, color: Rgb) {
     }
 }
 
+/// Buffer ahead: an arrow down into a tray.
+fn reserve_icon(c: &mut Canvas, cx: f32, cy: f32, color: Rgb) {
+    c.rect(cx - 2.0, cy - 13.0, 4.0, 10.0, 1.0, color);
+    // The arrowhead, from horizontal strips.
+    let steps = 16;
+    for i in 0..steps {
+        let t = i as f32 / steps as f32;
+        let half = 8.0 * (1.0 - t);
+        c.rect(cx - half, cy - 4.0 + t * 8.0, half * 2.0, 0.75, 0.0, color);
+    }
+    c.rect(cx - 12.0, cy + 5.0, 3.0, 8.0, 1.0, color);
+    c.rect(cx + 9.0, cy + 5.0, 3.0, 8.0, 1.0, color);
+    c.rect(cx - 12.0, cy + 10.0, 24.0, 3.0, 1.0, color);
+}
+
 /// A screen: a frame on a stand.
 fn screen_icon(c: &mut Canvas, cx: f32, cy: f32, color: Rgb, fill: Rgb) {
     c.rect(cx - 26.0, cy - 20.0, 52.0, 32.0, 4.0, color);
@@ -514,6 +573,52 @@ pub fn render(state: &State, fonts: &mut Fonts, hover: Hit) -> Canvas {
                 triangle(&mut c, cx - 18.0, cy, 30.0, 36.0, false, color);
                 c.rect(cx + 13.0, cy - 18.0, 7.0, 36.0, 2.0, color);
             }
+        }
+    }
+
+    // Buffering ahead: lit while on, with a line along its foot that grows
+    // as the reserve fills.
+    if let Some(reserve) = state.reserve {
+        let hovered = hover == Hit::Reserve;
+        let (x, y, w, h) = RESERVE;
+        let color = if reserve.on {
+            ACCENT
+        } else if hovered {
+            HOVER
+        } else {
+            BUTTON
+        };
+        c.rect(x, y, w, h, 12.0, color);
+        reserve_icon(&mut c, x + w / 2.0, y + h / 2.0 - 2.0, TEXT);
+        if reserve.on {
+            let done = (reserve.held as f32 / reserve.goal.max(1) as f32).clamp(0.0, 1.0);
+            let (lx, lw) = (x + 12.0, w - 24.0);
+            c.rect(lx, y + h - 7.0, lw, 3.0, 1.5, HOVER);
+            c.rect(lx, y + h - 7.0, (lw * done).max(3.0), 3.0, 1.5, TEXT);
+        }
+        let label = match (reserve.on, hovered) {
+            (true, _) if reserve.held >= reserve.goal => {
+                format!("{} buffered", format_size(reserve.goal))
+            }
+            (true, _) => format!(
+                "Buffering… {} of {}",
+                format_size(reserve.held),
+                format_size(reserve.goal)
+            ),
+            (false, true) => "Buffer ahead while paused".to_string(),
+            (false, false) => String::new(),
+        };
+        if !label.is_empty() {
+            let (lx, ly, lw, lh) = RESERVE_LABEL;
+            fonts.draw(
+                &mut c,
+                &label,
+                lx,
+                ly + lh / 2.0 + 22.0 * 0.36,
+                22.0,
+                SUBTLE,
+                lw,
+            );
         }
     }
 
@@ -711,6 +816,15 @@ pub fn render_dialog(state: &State, fonts: &mut Fonts, hover: Hit) -> Canvas {
                 .to_string(),
                 state.curved == Some(true),
             ),
+            Hit::SeeThrough => (
+                (if state.see_through {
+                    "Around the screen: see-through"
+                } else {
+                    "Around the screen: black"
+                })
+                .to_string(),
+                state.see_through,
+            ),
             Hit::SwapEyes => ("Swap eyes".to_string(), state.swap_eyes),
             Hit::Brightness(d) | Hit::Contrast(d) | Hit::Saturation(d) => {
                 ((if d < 0 { "−" } else { "+" }).to_string(), false)
@@ -755,9 +869,11 @@ mod tests {
             position: 30.0,
             duration: 120.0,
             buffered: vec![(30.0, 34.0)],
+            reserve: None,
             has_previous: true,
             has_next: false,
             curved: Some(false),
+            see_through: true,
             format: FORMATS[0],
             favourites: vec![FORMATS[0], FORMATS[3]],
             swap_eyes: false,
@@ -802,6 +918,33 @@ mod tests {
         };
         let (x, y) = center(CAPTIONS);
         assert_eq!(hit(&with_subs, x, y), Hit::Captions);
+    }
+
+    #[test]
+    fn reserve_button_only_for_network_files() {
+        let (x, y) = center(RESERVE);
+        assert_eq!(hit(&state(), x, y), Hit::Nothing);
+        let network = State {
+            reserve: Some(Reserve {
+                on: true,
+                held: 300 << 20,
+                goal: 1 << 30,
+            }),
+            ..state()
+        };
+        assert_eq!(hit(&network, x, y), Hit::Reserve);
+        // It sits between the play button and the seek row.
+        assert!(RESERVE.1 >= PLAY.1 + PLAY.3 && RESERVE.1 + RESERVE.3 < SEEK.1 - 10.0);
+        let mut fonts = Fonts::load().expect("fonts");
+        let canvas = render(&network, &mut fonts, Hit::Reserve);
+        assert_eq!(canvas.pixels.len(), (WIDTH * HEIGHT * 4) as usize);
+    }
+
+    #[test]
+    fn sizes_read_naturally() {
+        assert_eq!(format_size(412 << 20), "412 MB");
+        assert_eq!(format_size(1 << 30), "1 GB");
+        assert_eq!(format_size(1536 << 20), "1.5 GB");
     }
 
     #[test]
