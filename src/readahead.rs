@@ -530,18 +530,6 @@ impl<S: BlockSource> ReadAheadReader<S> {
             self.stats.discarded_blocks += 1;
         }
         self.detached.retain(|h| !h.is_finished());
-        // The reserve fills on from the window's end (or past blocks still
-        // held from before a jump back, rather than fetching them twice).
-        let held_to = self
-            .blocks
-            .keys()
-            .next_back()
-            .map_or(end, |k| (k + 1).max(end));
-        self.reserve.position.store(current, Ordering::SeqCst);
-        self.reserve.fill_from.store(held_to, Ordering::SeqCst);
-        if self.reserve.is_active() {
-            self.reserve.wake.notify_waiters();
-        }
         // Detached reads count against the window, so seeking around cannot
         // pile up requests; the blocks needed first are always requested.
         for index in current..end {
@@ -561,6 +549,19 @@ impl<S: BlockSource> ReadAheadReader<S> {
                 break;
             }
             self.spawn(index);
+        }
+        // The reserve fills on from the first block the window doesn't hold
+        // (not from `end`: with many reads in flight the loop above stops
+        // short of it, and a gap nobody fetched would end offline playback
+        // a few blocks in).
+        let mut held_to = current;
+        while self.blocks.contains_key(&held_to) {
+            held_to += 1;
+        }
+        self.reserve.position.store(current, Ordering::SeqCst);
+        self.reserve.fill_from.store(held_to, Ordering::SeqCst);
+        if self.reserve.is_active() {
+            self.reserve.wake.notify_waiters();
         }
     }
 
@@ -712,6 +713,8 @@ mod tests {
         data: Vec<u8>,
         latency: Duration,
         completed: Arc<AtomicUsize>,
+        /// When set, every offset not listed takes 500x the latency.
+        fast_only: Option<Vec<u64>>,
     }
 
     impl BlockSource for Slow {
@@ -721,7 +724,11 @@ mod tests {
             len: usize,
         ) -> BoxFuture<'static, io::Result<Vec<u8>>> {
             Box::pin(async move {
-                tokio::time::sleep(self.latency).await;
+                let slow = self
+                    .fast_only
+                    .as_ref()
+                    .is_some_and(|f| !f.contains(&offset));
+                tokio::time::sleep(self.latency * if slow { 500 } else { 1 }).await;
                 self.completed.fetch_add(1, Ordering::SeqCst);
                 let start = offset as usize;
                 Ok(self.data[start..start + len].to_vec())
@@ -742,6 +749,7 @@ mod tests {
             data: data.clone(),
             latency: Duration::from_millis(latency_ms),
             completed: Arc::new(AtomicUsize::new(0)),
+            fast_only: None,
         };
         (
             ReadAheadReader::new(runtime, source, len as u64, options),
@@ -1026,6 +1034,54 @@ mod tests {
         r.read_exact(&mut buf).unwrap();
         assert_eq!(&buf[..], &data[55_000..56_000]);
         drop(r);
+    }
+
+    /// Regression: with the in-flight cap reached (right after a seek) the
+    /// window requests fewer blocks than its size; the reserve must start
+    /// at the first block not held, or a gap stops offline playback.
+    #[test]
+    fn reserve_starts_where_the_window_really_ends() {
+        let options = ReadAhead {
+            block_size: 1000,
+            blocks_ahead: 5,
+            reserve_bytes: 20_000,
+        };
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_time()
+                .build()
+                .unwrap(),
+        );
+        // Only the blocks read directly answer at once; the rest of each
+        // window stays in flight.
+        let source = Slow {
+            data: vec![0u8; 200_000],
+            latency: Duration::from_millis(1),
+            completed: Arc::new(AtomicUsize::new(0)),
+            fast_only: Some(vec![0, 50_000]),
+        };
+        let mut r = ReadAheadReader::new(runtime, source, 200_000, options);
+        let reserve = r.reserve();
+        let mut buf = [0u8; 1000];
+        r.read_exact(&mut buf).unwrap();
+        // Jump: the old window's reads stay in flight, so the new window
+        // stops short.
+        r.seek(SeekFrom::Start(50_000)).unwrap();
+        r.read_exact(&mut buf).unwrap();
+        r.schedule(51);
+        let held: Vec<u64> = r.blocks.keys().copied().collect();
+        let first_gap = (51..).find(|i| !held.contains(i)).unwrap();
+        assert!(first_gap < 56, "no gap to test: {held:?}");
+        reserve.set_active(true);
+        assert!(
+            wait_until(|| reserve
+                .ranges()
+                .first()
+                .is_some_and(|&(a, _)| a == first_gap * 1000)),
+            "{:?} (gap at {first_gap})",
+            reserve.ranges()
+        );
     }
 
     #[test]
