@@ -84,15 +84,16 @@ impl XrContext {
         let system_name = xr.system_properties(system)?.system_name;
         let views = xr.enumerate_view_configuration_views(system, VIEW_TYPE)?;
         ensure!(views.len() == 2, "Expected a stereo view configuration");
-        // Alpha blending with the surroundings (passthrough, on a headset
-        // that offers it) is preferred, so a flat screen can float in them;
-        // otherwise the runtime's first choice.
+        // The runtime's first choice (OPAQUE on the Frame). Its ALPHA_BLEND
+        // mode would show the camera through a flat screen's transparent
+        // surround whatever the headset's passthrough toggle says; in
+        // OPAQUE the runtime fills that surround with its own background
+        // (passthrough or the void, as toggled), as it does around the
+        // browser.
         let blend_modes = xr.enumerate_environment_blend_modes(system, VIEW_TYPE)?;
         let blend_mode = blend_modes
-            .iter()
+            .first()
             .copied()
-            .find(|&m| m == xr::EnvironmentBlendMode::ALPHA_BLEND)
-            .or(blend_modes.first().copied())
             .context("The runtime offers no environment blend mode")?;
         eprintln!("OpenXR: blend modes {blend_modes:?}, using {blend_mode:?}");
 
