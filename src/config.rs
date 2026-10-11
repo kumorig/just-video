@@ -294,6 +294,22 @@ struct Settings {
     /// Most the reader buffers ahead while paused, in MiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reserve_mib: Option<u64>,
+    /// Whether the control bar shows the buffer-ahead button.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    buffer_button: Option<bool>,
+}
+
+pub fn buffer_button() -> bool {
+    read_json::<Settings>("settings.json")
+        .ok()
+        .and_then(|s| s.buffer_button)
+        .unwrap_or(true)
+}
+
+pub fn save_buffer_button(shown: bool) -> anyhow::Result<()> {
+    let mut settings: Settings = read_json("settings.json")?;
+    settings.buffer_button = Some(shown);
+    write_json("settings.json", &settings, false)
 }
 
 /// Choices for how much to buffer ahead while paused (bytes).

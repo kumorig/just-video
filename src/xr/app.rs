@@ -872,6 +872,8 @@ pub fn run(
     let mut bar_press: Option<Press> = None;
     // Flat screens: what shows around the picture (see `eye_params`).
     let mut see_through = crate::config::see_through();
+    // Whether the bar offers buffering ahead.
+    let mut buffer_button = crate::config::buffer_button();
     let mut browser_place = browser_placement([0.0; 3]);
     let mut controls_panel_at: Option<Panel> = None;
     let mut controls_drawn: Option<(controls::State, controls::Hit, Option<controls::Pressing>)> =
@@ -1273,15 +1275,19 @@ pub fn run(
                     position: playback.position().floor(),
                     duration: playback.duration,
                     buffered: playback.buffered(),
-                    reserve: playback.reserve_status().map(|r| controls::Reserve {
-                        on: r.on,
-                        held: r.held,
-                        goal: r.goal,
-                    }),
+                    reserve: playback
+                        .reserve_status()
+                        .filter(|_| buffer_button)
+                        .map(|r| controls::Reserve {
+                            on: r.on,
+                            held: r.held,
+                            goal: r.goal,
+                        }),
                     has_previous: navigator.as_ref().is_some_and(|n| n.has_adjacent(-1)),
                     has_next: navigator.as_ref().is_some_and(|n| n.has_adjacent(1)),
                     curved: curved_applies.then_some(placement.curved),
                     see_through,
+                    buffer_button,
                     format: (playback.layout.projection, playback.layout.stereo),
                     favourites: favourites.clone(),
                     swap_eyes: playback.layout.swap_eyes,
@@ -1552,6 +1558,12 @@ pub fn run(
                     }
                     Some(controls::Hit::Pick(i)) => set_format(playback, controls::FORMATS[i]),
                     Some(controls::Hit::Curved) => placement.curved = !placement.curved,
+                    Some(controls::Hit::BufferButton) => {
+                        buffer_button = !buffer_button;
+                        if let Err(e) = crate::config::save_buffer_button(buffer_button) {
+                            eprintln!("Can't save the buffer button setting: {e:#}");
+                        }
+                    }
                     Some(controls::Hit::SeeThrough) => {
                         see_through = !see_through;
                         if let Err(e) = crate::config::save_see_through(see_through) {
@@ -2276,6 +2288,7 @@ mod tests {
             has_next: true,
             curved: Some(false),
             see_through: true,
+            buffer_button: true,
             format: controls::FORMATS[0],
             favourites: vec![controls::FORMATS[0]],
             swap_eyes: false,

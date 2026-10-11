@@ -130,6 +130,8 @@ pub enum Hit {
     Curved,
     /// Flat screens: surroundings visible around the picture, or black.
     SeeThrough,
+    /// Show or hide the buffer-ahead button on the bar.
+    BufferButton,
     SwapEyes,
     Brightness(i8),
     Contrast(i8),
@@ -183,6 +185,8 @@ pub struct State {
     pub curved: Option<bool>,
     /// Flat screens: the surroundings show around the picture.
     pub see_through: bool,
+    /// The buffer-ahead button is shown (`reserve` is None when hidden).
+    pub buffer_button: bool,
     pub format: Format,
     pub favourites: Vec<Format>,
     pub swap_eyes: bool,
@@ -372,6 +376,7 @@ fn dialog_buttons(state: &State) -> Vec<(Hit, Rect, bool)> {
                 (24.0, 508.0, 568.0, 72.0),
                 state.curved.is_some(),
             ));
+            out.push((Hit::BufferButton, (608.0, 508.0, 568.0, 72.0), true));
         }
         Some(Dialog::Image) => {
             for (i, (minus, plus)) in [
@@ -882,6 +887,15 @@ pub fn render_dialog(
                 .to_string(),
                 state.see_through,
             ),
+            Hit::BufferButton => (
+                (if state.buffer_button {
+                    "Buffer button: shown"
+                } else {
+                    "Buffer button: hidden"
+                })
+                .to_string(),
+                state.buffer_button,
+            ),
             Hit::SwapEyes => ("Swap eyes".to_string(), state.swap_eyes),
             Hit::Brightness(d) | Hit::Contrast(d) | Hit::Saturation(d) => {
                 ((if d < 0 { "−" } else { "+" }).to_string(), false)
@@ -937,6 +951,7 @@ mod tests {
             has_next: false,
             curved: Some(false),
             see_through: true,
+            buffer_button: true,
             format: FORMATS[0],
             favourites: vec![FORMATS[0], FORMATS[3]],
             swap_eyes: false,

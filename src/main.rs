@@ -999,6 +999,7 @@ fn main() -> anyhow::Result<()> {
                 has_next: false,
                 curved: Some(true),
                 see_through: true,
+                buffer_button: true,
                 format: controls::FORMATS[3],
                 favourites: vec![controls::FORMATS[0], controls::FORMATS[3]],
                 swap_eyes: false,
