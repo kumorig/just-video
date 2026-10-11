@@ -1036,8 +1036,21 @@ fn main() -> anyhow::Result<()> {
                 caption_edit: false,
             };
             just_video::ui::save_png(
-                &controls::render(&state, &mut fonts, controls::Hit::Seek(0.62)),
+                &controls::render(&state, &mut fonts, controls::Hit::Seek(0.62), None),
                 &dir.join("controls.png"),
+            )?;
+            // Half way into a long press on the screen button.
+            just_video::ui::save_png(
+                &controls::render(
+                    &state,
+                    &mut fonts,
+                    controls::Hit::Screen,
+                    Some(controls::Pressing {
+                        hit: controls::Hit::Screen,
+                        step: controls::PRESS_STEPS / 2,
+                    }),
+                ),
+                &dir.join("controls-press.png"),
             )?;
             // Buffering ahead done, and off with the pointer on it.
             for (name, reserve, hover) in [
@@ -1065,7 +1078,7 @@ fn main() -> anyhow::Result<()> {
                     ..state.clone()
                 };
                 just_video::ui::save_png(
-                    &controls::render(&bar, &mut fonts, hover),
+                    &controls::render(&bar, &mut fonts, hover, None),
                     &dir.join(name),
                 )?;
             }
@@ -1074,7 +1087,7 @@ fn main() -> anyhow::Result<()> {
                 ..state.clone()
             };
             just_video::ui::save_png(
-                &controls::render(&editing, &mut fonts, controls::Hit::CaptionMove(1)),
+                &controls::render(&editing, &mut fonts, controls::Hit::CaptionMove(1), None),
                 &dir.join("controls-captions.png"),
             )?;
             for (dialog, name, hover) in [
@@ -1099,7 +1112,7 @@ fn main() -> anyhow::Result<()> {
                     ..state.clone()
                 };
                 just_video::ui::save_png(
-                    &controls::render_dialog(&open, &mut fonts, hover),
+                    &controls::render_dialog(&open, &mut fonts, hover, None),
                     &dir.join(name),
                 )?;
             }

@@ -874,13 +874,15 @@ pub fn run(
     let mut see_through = crate::config::see_through();
     let mut browser_place = browser_placement([0.0; 3]);
     let mut controls_panel_at: Option<Panel> = None;
-    let mut controls_drawn: Option<(controls::State, controls::Hit)> = None;
+    let mut controls_drawn: Option<(controls::State, controls::Hit, Option<controls::Pressing>)> =
+        None;
     let mut press: Option<Press> = None;
     let mut browser_press: Option<BrowserPress> = None;
     // The control bar shows the page with every format.
     // The dialog open above the control bar, and what it last showed.
     let mut dialog: Option<controls::Dialog> = None;
-    let mut dialog_drawn: Option<(controls::State, controls::Hit)> = None;
+    let mut dialog_drawn: Option<(controls::State, controls::Hit, Option<controls::Pressing>)> =
+        None;
     // Subtitle size and position (the same for every video).
     let mut caption_settings = crate::config::caption_settings();
     let mut list_page = 0usize;
@@ -1053,6 +1055,15 @@ pub fn run(
                     renderer.set_adjust(&playback.image);
                     dialog = None;
                     caption_edit = false;
+                    // Ahead at the default size and viewpoint: the last
+                    // video's zoom, drag and inside-the-sphere offset
+                    // don't carry over.
+                    placement = Placement {
+                        curved: placement.curved,
+                        pivot: head_position(&views),
+                        ..Placement::new(&options.view)
+                    };
+                    press = None;
                     mode = Mode::Playing(Box::new(playback));
                     ctx.frame_stream
                         .end(state.predicted_display_time, ctx.blend_mode, &[])?;
@@ -1391,6 +1402,21 @@ pub fn run(
                         control_press = None;
                     }
                 }
+                // The held button, drawn pushed in; one with a long press
+                // fills up as the press runs (in steps, to limit redraws).
+                let pressing = control_press
+                    .as_ref()
+                    .filter(|cp| buttons.select_held[cp.hand])
+                    .map(|cp| {
+                        let steps = controls::PRESS_STEPS as f32;
+                        let step = if cp.hit.has_long_press() {
+                            ((now - cp.since) as f32 / LONG_PRESS_NS as f32 * steps)
+                                .clamp(0.0, steps) as u8
+                        } else {
+                            controls::PRESS_STEPS
+                        };
+                        controls::Pressing { hit: cp.hit, step }
+                    });
                 if buttons.select[active_hand]
                     && press.is_none()
                     && control_press.is_none()
@@ -1565,11 +1591,18 @@ pub fn run(
                     Some(controls::Hit::Close) => dialog = None,
                     Some(controls::Hit::Nothing) | None => {}
                 }
+                // A long press opens a button's dialog, or closes it again.
                 match long_pressed {
+                    Some(controls::Hit::Captions) if dialog == Some(controls::Dialog::Tracks) => {
+                        dialog = None;
+                    }
                     Some(controls::Hit::Captions) => {
                         dialog = Some(controls::Dialog::Tracks);
                         // Start on the page with the track shown.
                         list_page = playback.subtitle_index().map_or(0, |i| (i + 1) / 11);
+                    }
+                    Some(controls::Hit::Screen) if dialog == Some(controls::Dialog::Screen) => {
+                        dialog = None;
                     }
                     Some(controls::Hit::Screen) => dialog = Some(controls::Dialog::Screen),
                     // Star or unstar a favourite.
@@ -1645,17 +1678,18 @@ pub fn run(
                 }
 
                 if controls_panel_at.is_some() {
-                    if controls_drawn.as_ref() != Some(&(ui_state.clone(), bar_hit)) {
-                        let canvas = controls::render(&ui_state, &mut fonts, bar_hit);
+                    if controls_drawn.as_ref() != Some(&(ui_state.clone(), bar_hit, pressing)) {
+                        let canvas = controls::render(&ui_state, &mut fonts, bar_hit, pressing);
                         renderer.upload_quad(&mut controls_target, &canvas.pixels)?;
-                        controls_drawn = Some((ui_state.clone(), bar_hit));
+                        controls_drawn = Some((ui_state.clone(), bar_hit, pressing));
                     }
                     if dialog.is_some()
-                        && dialog_drawn.as_ref() != Some(&(ui_state.clone(), dialog_hit))
+                        && dialog_drawn.as_ref() != Some(&(ui_state.clone(), dialog_hit, pressing))
                     {
-                        let canvas = controls::render_dialog(&ui_state, &mut fonts, dialog_hit);
+                        let canvas =
+                            controls::render_dialog(&ui_state, &mut fonts, dialog_hit, pressing);
                         renderer.upload_quad(&mut dialog_target, &canvas.pixels)?;
-                        dialog_drawn = Some((ui_state, dialog_hit));
+                        dialog_drawn = Some((ui_state, dialog_hit, pressing));
                     }
                     if let Some((p, (x, y))) = control_point {
                         cursor_at = Some((p, x, y));
@@ -2254,7 +2288,7 @@ mod tests {
             dialog: None,
             caption_edit: false,
         };
-        let bar = controls::render(&state, &mut fonts, controls::Hit::Nothing);
+        let bar = controls::render(&state, &mut fonts, controls::Hit::Nothing, None);
         let caption =
             captions::render(&crate::subtitles::Caption::text(SAMPLE_CAPTION), &mut fonts);
         let options = ViewOptions::default();

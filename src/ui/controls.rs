@@ -158,6 +158,16 @@ pub struct Reserve {
     pub goal: u64,
 }
 
+/// A button being held: how far into its long press, in steps of
+/// [`PRESS_STEPS`]. Buttons without a long press are held at the end.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pressing {
+    pub hit: Hit,
+    pub step: u8,
+}
+
+pub const PRESS_STEPS: u8 = 24;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct State {
     pub paused: bool,
@@ -436,7 +446,9 @@ fn centered(c: &mut Canvas, fonts: &mut Fonts, label: &str, r: Rect, size: f32, 
     );
 }
 
-fn button(c: &mut Canvas, r: Rect, hovered: bool, active: bool) {
+/// A button; held, it sits a touch smaller (pushed in), and one with a
+/// long press fills from the left as the press runs.
+fn button(c: &mut Canvas, r: Rect, hovered: bool, active: bool, pressing: Option<(f32, bool)>) {
     let color = if active {
         ACCENT
     } else if hovered {
@@ -444,7 +456,28 @@ fn button(c: &mut Canvas, r: Rect, hovered: bool, active: bool) {
     } else {
         BUTTON
     };
-    c.rect(r.0, r.1, r.2, r.3, 18.0, color);
+    let Some((fraction, long)) = pressing else {
+        c.rect(r.0, r.1, r.2, r.3, 18.0, color);
+        return;
+    };
+    let inset = 3.0;
+    let (x, y, w, h) = (
+        r.0 + inset,
+        r.1 + inset,
+        r.2 - 2.0 * inset,
+        r.3 - 2.0 * inset,
+    );
+    c.rect(x, y, w, h, 16.0, color);
+    if long {
+        c.translucent_rect(x, y, w * fraction.clamp(0.0, 1.0), h, 16.0, ACCENT, 0.55);
+    }
+}
+
+/// How far `hit` is pressed, for [`button`].
+fn press_of(pressing: Option<Pressing>, hit: Hit) -> Option<(f32, bool)> {
+    pressing
+        .filter(|p| p.hit == hit)
+        .map(|p| (p.step as f32 / PRESS_STEPS as f32, hit.has_long_press()))
 }
 
 /// A right-pointing triangle from vertical strips, `h` tall at its base.
@@ -526,9 +559,10 @@ fn image_icon(c: &mut Canvas, cx: f32, cy: f32, color: Rgb) {
 }
 
 /// The bar.
-pub fn render(state: &State, fonts: &mut Fonts, hover: Hit) -> Canvas {
+pub fn render(state: &State, fonts: &mut Fonts, hover: Hit, pressing: Option<Pressing>) -> Canvas {
     let mut c = Canvas::new(WIDTH, HEIGHT);
     c.clear(BG);
+    let press = |hit| press_of(pressing, hit);
     if state.caption_edit {
         fonts.draw(
             &mut c,
@@ -542,7 +576,13 @@ pub fn render(state: &State, fonts: &mut Fonts, hover: Hit) -> Canvas {
         fonts.draw(&mut c, "B: done", 1040.0, 64.0, 26.0, SUBTLE, 140.0);
         for (i, (hit, label)) in EDIT_BUTTONS.iter().enumerate() {
             let r = edit_rect(i);
-            button(&mut c, r, hover == *hit, *hit == Hit::CaptionDone);
+            button(
+                &mut c,
+                r,
+                hover == *hit,
+                *hit == Hit::CaptionDone,
+                press(*hit),
+            );
             centered(&mut c, fonts, label, r, 32.0, TEXT);
         }
         return c;
@@ -554,7 +594,7 @@ pub fn render(state: &State, fonts: &mut Fonts, hover: Hit) -> Canvas {
         (PLAY, Hit::PlayPause, true),
         (NEXT, Hit::Next, state.has_next),
     ] {
-        button(&mut c, r, enabled && hover == hit, false);
+        button(&mut c, r, enabled && hover == hit, false, press(hit));
         let color = if enabled { TEXT } else { FAINT };
         let (cx, cy) = (r.0 + r.2 / 2.0, r.1 + r.3 / 2.0);
         match hit {
@@ -588,7 +628,11 @@ pub fn render(state: &State, fonts: &mut Fonts, hover: Hit) -> Canvas {
         } else {
             BUTTON
         };
-        c.rect(x, y, w, h, 12.0, color);
+        if press(Hit::Reserve).is_some() {
+            c.rect(x + 2.0, y + 2.0, w - 4.0, h - 4.0, 10.0, color);
+        } else {
+            c.rect(x, y, w, h, 12.0, color);
+        }
         reserve_icon(&mut c, x + w / 2.0, y + h / 2.0 - 2.0, TEXT);
         if reserve.on {
             let done = (reserve.held as f32 / reserve.goal.max(1) as f32).clamp(0.0, 1.0);
@@ -627,31 +671,33 @@ pub fn render(state: &State, fonts: &mut Fonts, hover: Hit) -> Canvas {
         let area = (r.0 - 17.0, r.1 + r.3 + 4.0, r.2 + 34.0, 30.0);
         centered(c, fonts, text, area, 22.0, SUBTLE);
     };
+    // CC only when there is something to choose: subtitles, or audio tracks.
     let can_caption = !state.subtitle_tracks.is_empty() || state.audio_tracks.len() > 1;
-    let subtitles_on = state.subtitle.is_some();
-    button(
-        &mut c,
-        CAPTIONS,
-        can_caption && hover == Hit::Captions,
-        subtitles_on,
-    );
-    centered(
-        &mut c,
-        fonts,
-        "CC",
-        CAPTIONS,
-        34.0,
-        if can_caption { TEXT } else { FAINT },
-    );
-    let caption_label = match (state.subtitle, state.subtitle_tracks.is_empty()) {
-        (Some(i), _) => state.subtitle_tracks[i].clone(),
-        (None, false) => "Off".to_string(),
-        (None, true) => "No subtitles".to_string(),
-    };
-    label_under(&mut c, fonts, CAPTIONS, &caption_label);
+    if can_caption {
+        let subtitles_on = state.subtitle.is_some();
+        button(
+            &mut c,
+            CAPTIONS,
+            hover == Hit::Captions,
+            subtitles_on,
+            press(Hit::Captions),
+        );
+        centered(&mut c, fonts, "CC", CAPTIONS, 34.0, TEXT);
+        let caption_label = match state.subtitle {
+            Some(i) => state.subtitle_tracks[i].clone(),
+            None => "Off".to_string(),
+        };
+        label_under(&mut c, fonts, CAPTIONS, &caption_label);
+    }
 
     let screen_fill = if hover == Hit::Screen { HOVER } else { BUTTON };
-    button(&mut c, SCREEN, hover == Hit::Screen, false);
+    button(
+        &mut c,
+        SCREEN,
+        hover == Hit::Screen,
+        false,
+        press(Hit::Screen),
+    );
     screen_icon(
         &mut c,
         SCREEN.0 + SCREEN.2 / 2.0,
@@ -662,7 +708,13 @@ pub fn render(state: &State, fonts: &mut Fonts, hover: Hit) -> Canvas {
     label_under(&mut c, fonts, SCREEN, &format_label(state.format));
 
     let adjusted = state.image != ImageAdjust::default();
-    button(&mut c, IMAGE, hover == Hit::Image, adjusted);
+    button(
+        &mut c,
+        IMAGE,
+        hover == Hit::Image,
+        adjusted,
+        press(Hit::Image),
+    );
     image_icon(
         &mut c,
         IMAGE.0 + IMAGE.2 / 2.0,
@@ -731,7 +783,12 @@ fn value_bar(c: &mut Canvas, fonts: &mut Fonts, y: f32, fraction: f32, label: &s
 }
 
 /// The open dialog.
-pub fn render_dialog(state: &State, fonts: &mut Fonts, hover: Hit) -> Canvas {
+pub fn render_dialog(
+    state: &State,
+    fonts: &mut Fonts,
+    hover: Hit,
+    pressing: Option<Pressing>,
+) -> Canvas {
     let mut c = Canvas::new(DIALOG_WIDTH, DIALOG_HEIGHT);
     c.clear(BG);
     let title = match state.dialog {
@@ -833,7 +890,13 @@ pub fn render_dialog(state: &State, fonts: &mut Fonts, hover: Hit) -> Canvas {
             Hit::ResetImage => ("Reset".to_string(), false),
             _ => (String::new(), false),
         };
-        button(&mut c, r, hovered, active && enabled);
+        button(
+            &mut c,
+            r,
+            hovered,
+            active && enabled,
+            press_of(pressing, hit),
+        );
         let size = if matches!(
             hit,
             Hit::Brightness(_) | Hit::Contrast(_) | Hit::Saturation(_)
@@ -936,7 +999,7 @@ mod tests {
         // It sits between the play button and the seek row.
         assert!(RESERVE.1 >= PLAY.1 + PLAY.3 && RESERVE.1 + RESERVE.3 < SEEK.1 - 10.0);
         let mut fonts = Fonts::load().expect("fonts");
-        let canvas = render(&network, &mut fonts, Hit::Reserve);
+        let canvas = render(&network, &mut fonts, Hit::Reserve, None);
         assert_eq!(canvas.pixels.len(), (WIDTH * HEIGHT * 4) as usize);
     }
 
