@@ -20,6 +20,8 @@ const ICON_ACTION_W: f32 = 84.0;
 const SCROLL_W: f32 = 64.0;
 /// Header tool buttons (e.g. "Cancel", "Delete 3").
 const TOOL_W: f32 = 220.0;
+/// An icon-only tool: a square.
+const TOOL_ICON_W: f32 = 62.0;
 const TOOL_GAP: f32 = 12.0;
 
 /// Shown top right so installs can be told apart.
@@ -125,6 +127,8 @@ impl Row {
 pub struct Tool {
     pub label: String,
     pub danger: bool,
+    /// Drawn instead of the label: a small square button.
+    pub icon: Option<Icon>,
 }
 
 impl Tool {
@@ -132,11 +136,24 @@ impl Tool {
         Self {
             label: label.into(),
             danger,
+            icon: None,
+        }
+    }
+
+    pub fn icon(icon: Icon) -> Self {
+        Self {
+            label: String::new(),
+            danger: false,
+            icon: Some(icon),
         }
     }
 
     fn width(&self) -> f32 {
-        TOOL_W
+        if self.icon.is_some() {
+            TOOL_ICON_W
+        } else {
+            TOOL_W
+        }
     }
 }
 
@@ -148,6 +165,9 @@ pub struct Dialog {
     pub buttons: Vec<String>,
     /// The primary button is destructive (drawn red).
     pub danger: bool,
+    /// The buttons are equal choices, and this one is current (lit); no
+    /// primary button then.
+    pub choice: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -211,12 +231,24 @@ fn inside((x, y, w, h): Rect, px: f32, py: f32) -> bool {
     px >= x && px <= x + w && py >= y && py <= y + h
 }
 
+/// Up to three buttons in a row; more go in two columns, the last row at
+/// the bottom.
 fn dialog_buttons(n: usize) -> Vec<Rect> {
-    let (w, h, gap) = (280.0, 80.0, 24.0);
-    let total = n as f32 * w + (n.saturating_sub(1)) as f32 * gap;
+    let (h, gap) = (80.0, 24.0);
+    let (cols, w) = if n <= 3 {
+        (n.max(1), 280.0)
+    } else {
+        (2, 400.0)
+    };
+    let rows = n.div_ceil(cols);
+    let total = cols as f32 * w + (cols - 1) as f32 * gap;
     let x0 = WIDTH as f32 / 2.0 - total / 2.0;
     (0..n)
-        .map(|i| (x0 + i as f32 * (w + gap), HEIGHT as f32 - 250.0, w, h))
+        .map(|i| {
+            let (col, row) = ((i % cols) as f32, (i / cols) as f32);
+            let y = HEIGHT as f32 - 250.0 - (rows as f32 - 1.0 - row) * (h + gap);
+            (x0 + col * (w + gap), y, w, h)
+        })
         .collect()
 }
 
@@ -411,10 +443,12 @@ fn draw_icon(canvas: &mut Canvas, icon: &Icon, cx: f32, cy: f32) {
         }
         Icon::Exit => {
             // A power symbol: a ring open at the top with a bar through the gap.
-            canvas.circle(cx, cy + 2.0, 17.0, FAINT);
-            canvas.circle(cx, cy + 2.0, 11.0, ROW_BG);
-            canvas.rect(cx - 7.0, cy - 18.0, 14.0, 14.0, 0.0, ROW_BG);
-            canvas.rect(cx - 3.0, cy - 20.0, 6.0, 22.0, 3.0, FAINT);
+            // (Drawn on the header's tool button, so the gap takes its fill.)
+            let fill = [0x2a, 0x2f, 0x38];
+            canvas.circle(cx, cy + 2.0, 17.0, SUBTLE);
+            canvas.circle(cx, cy + 2.0, 11.0, fill);
+            canvas.rect(cx - 7.0, cy - 18.0, 14.0, 14.0, 0.0, fill);
+            canvas.rect(cx - 3.0, cy - 20.0, 6.0, 22.0, 3.0, SUBTLE);
         }
     }
 }
@@ -632,6 +666,10 @@ pub fn render(
             };
             canvas.rect(x, y, tw, th, 14.0, fill);
             let (cx, cy) = (x + tw / 2.0, y + th / 2.0);
+            if let Some(icon) = &tool.icon {
+                draw_icon(&mut canvas, icon, cx, cy);
+                continue;
+            }
             let lw = fonts.measure(&tool.label, 30.0);
             fonts.draw(
                 &mut canvas,
@@ -731,7 +769,10 @@ pub fn render(
         }
         let rects = dialog_buttons(dialog.buttons.len());
         for (i, (label, rect)) in dialog.buttons.iter().zip(&rects).enumerate() {
-            let primary = i + 1 == dialog.buttons.len();
+            let primary = match dialog.choice {
+                Some(chosen) => chosen == i,
+                None => i + 1 == dialog.buttons.len(),
+            };
             let hovered = hover == Some(Hit::DialogButton(i));
             let color = match (primary, dialog.danger, hovered) {
                 (true, true, true) => [0xff, 0x6b, 0x60],
@@ -815,6 +856,7 @@ mod tests {
             body: vec![],
             buttons: vec!["Cancel".into(), "Delete".into()],
             danger: true,
+            choice: None,
         });
         let rects = dialog_buttons(2);
         let (x, y, w, h) = rects[1];

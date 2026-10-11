@@ -56,8 +56,6 @@ enum Item {
     AddServer,
     /// How much to buffer ahead while paused; opens a dialog of presets.
     BufferSize,
-    /// Closes the app; last on the top page.
-    Exit,
     Share(String),
     Dir(String),
     Video {
@@ -79,7 +77,7 @@ impl Item {
     fn name(&self) -> &str {
         match self {
             Item::Server(s) => &s.name,
-            Item::AddServer | Item::BufferSize | Item::Exit => "",
+            Item::AddServer | Item::BufferSize => "",
             Item::Share(n)
             | Item::Dir(n)
             | Item::Video { name: n, .. }
@@ -112,6 +110,8 @@ enum ToolAction {
     /// Stop loading this folder and go back up.
     CancelLoad,
     MoveHere,
+    /// Closes the app (top right of the top page).
+    Exit,
 }
 
 /// Work in progress behind the browser, for a progress bar.
@@ -355,7 +355,6 @@ impl Navigator {
         self.items = servers.into_iter().map(Item::Server).collect();
         self.items.push(Item::AddServer);
         self.items.push(Item::BufferSize);
-        self.items.push(Item::Exit);
         self.restore_scroll();
         self.rebuild_rows();
     }
@@ -437,10 +436,6 @@ impl Navigator {
                             ),
                         )
                     },
-                    Item::Exit => Row {
-                        detail: "Close just-video".into(),
-                        ..Row::new(Icon::Exit, "Exit")
-                    },
                     Item::Share(name) => Row::new(Icon::Share, name),
                     Item::Dir(name) => Row::new(Icon::Folder, name),
                     Item::Video {
@@ -512,6 +507,9 @@ impl Navigator {
                     }
                     tools
                 }
+                None if matches!(self.location, Location::Servers) => {
+                    vec![(Tool::icon(Icon::Exit), ToolAction::Exit)]
+                }
                 None => Vec::new(),
             }
         };
@@ -534,6 +532,7 @@ impl Navigator {
             body,
             buttons: vec!["OK".into()],
             danger: false,
+            choice: None,
         });
         self.purpose = Some(Purpose::Info);
         self.dirty = true;
@@ -781,6 +780,7 @@ impl Navigator {
                 }
             }
             Some(ToolAction::CancelMove) => self.moving = None,
+            Some(ToolAction::Exit) => self.exit_requested = true,
             Some(ToolAction::MoveHere) => self.move_here(),
             Some(ToolAction::CancelLoad) => {
                 self.back();
@@ -976,6 +976,7 @@ impl Navigator {
             body,
             buttons: vec!["Cancel".into(), "Delete".into()],
             danger: true,
+            choice: None,
         });
         self.purpose = Some(Purpose::Delete(indices));
         self.dirty = true;
@@ -1099,11 +1100,13 @@ impl Navigator {
                         .map(|&b| crate::ui::controls::format_size(b))
                         .collect(),
                     danger: false,
+                    choice: config::RESERVE_PRESETS
+                        .iter()
+                        .position(|&b| b == config::reserve_bytes()),
                 });
                 self.purpose = Some(Purpose::BufferSize);
                 self.dirty = true;
             }
-            (Item::Exit, _) => self.exit_requested = true,
             (Item::Share(name), Location::Shares { server }) => self.navigate(Location::Folder {
                 server,
                 share: name.clone(),
@@ -1247,6 +1250,7 @@ impl Navigator {
             body: vec!["Forgets this server and its password.".into()],
             buttons: vec!["Cancel".into(), "Remove".into()],
             danger: true,
+            choice: None,
         });
         self.purpose = Some(Purpose::RemoveServer(index));
         self.dirty = true;
@@ -1726,13 +1730,11 @@ mod tests {
     fn server_list_offers_adding_one_and_exiting() {
         let mut nav = Navigator::new(Library::start(None));
         let icons: Vec<Icon> = nav.view().rows.iter().map(|r| r.icon.clone()).collect();
-        assert_eq!(
-            &icons[icons.len() - 3..],
-            [Icon::Add, Icon::Buffer, Icon::Exit]
-        );
+        assert_eq!(&icons[icons.len() - 2..], [Icon::Add, Icon::Buffer]);
         assert_eq!(nav.view().crumbs, vec!["Just Video".to_string()]);
+        assert_eq!(nav.view().tools.len(), 1, "the exit button, top right");
         assert!(!nav.take_exit());
-        nav.click(Hit::Row(icons.len() - 1));
+        nav.click(Hit::Tool(0));
         assert!(nav.take_exit());
         assert!(!nav.take_exit(), "reported once");
     }

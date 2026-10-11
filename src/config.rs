@@ -297,7 +297,7 @@ struct Settings {
 }
 
 /// Choices for how much to buffer ahead while paused (bytes).
-pub const RESERVE_PRESETS: [u64; 5] = [256 << 20, 512 << 20, 1 << 30, 2 << 30, 4 << 30];
+pub const RESERVE_PRESETS: [u64; 4] = [512 << 20, 1 << 30, 2 << 30, 4 << 30];
 
 pub fn reserve_bytes() -> u64 {
     read_json::<Settings>("settings.json")

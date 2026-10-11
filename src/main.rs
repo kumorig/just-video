@@ -918,11 +918,8 @@ fn main() -> anyhow::Result<()> {
                         detail: "Fetched while paused, to play on without the network".into(),
                         ..Row::new(Icon::Buffer, "Buffer ahead: 1 GB")
                     },
-                    Row {
-                        detail: "Close just-video".into(),
-                        ..Row::new(Icon::Exit, "Exit")
-                    },
                 ],
+                tools: vec![Tool::icon(Icon::Exit)],
                 ..Default::default()
             };
             // Nothing held: crumbs instead of the heading, no ticks or tools.
@@ -967,10 +964,25 @@ fn main() -> anyhow::Result<()> {
                 ],
                 buttons: vec!["OK".into()],
                 danger: false,
+                choice: None,
             });
             just_video::ui::save_png(
                 &render(&dialog, &mut fonts, Some((800.0, 790.0)), true),
                 &dir.join("dialog.png"),
+            )?;
+            let mut presets = servers.clone();
+            presets.dialog = Some(Dialog {
+                title: "Buffer ahead while paused".into(),
+                body: vec!["How much the player's buffer button fetches while paused.".into()],
+                buttons: ["512 MB", "1 GB", "2 GB", "4 GB"]
+                    .map(String::from)
+                    .to_vec(),
+                danger: false,
+                choice: Some(1),
+            });
+            just_video::ui::save_png(
+                &render(&presets, &mut fonts, Some((1000.0, 700.0)), true),
+                &dir.join("dialog-buffer.png"),
             )?;
             use just_video::ui::controls;
             let state = controls::State {
