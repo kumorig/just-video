@@ -29,13 +29,17 @@ libc = "0.2"
 libloading = "0.9"
 openxr = "0.21"
 png = "0.18"
-fontdue = "0.9"
+ttf-parser = { version = "0.25", default-features = false, features = ["std"] }
 ctrlc = "3"
 rpassword = "7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 smb = "0.12"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+
+[dev-dependencies]
+# Reference rasterizer for the glyph tests (src/ui/glyphs.rs).
+fontdue = "0.9"
 
 [build-dependencies]
 naga = { version = "30", features = ["wgsl-in", "spv-out"] }

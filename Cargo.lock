@@ -1376,6 +1376,7 @@ dependencies = [
  "serde_json",
  "smb",
  "tokio",
+ "ttf-parser",
 ]
 
 [[package]]
