@@ -49,18 +49,30 @@ impl XrContext {
         );
         // Native Steam Frame controller bindings (otherwise SteamVR remaps Index ones).
         const FRAME_CONTROLLER: &str = "XR_VALVE_frame_controller_interaction";
+        // The crate keeps unknown extension names NUL-terminated (it
+        // passes them to the runtime as they are), so the name is cut
+        // there to compare, and requested with its NUL.
+        let name = |e: &[u8]| {
+            e.split(|b| *b == 0)
+                .next()
+                .unwrap_or(&[])
+                .trim_ascii()
+                .to_vec()
+        };
         if available
             .other
             .iter()
-            .any(|e| e.as_slice() == FRAME_CONTROLLER.as_bytes())
+            .any(|e| name(e) == FRAME_CONTROLLER.as_bytes())
         {
-            extensions.other.push(FRAME_CONTROLLER.into());
+            extensions
+                .other
+                .push(format!("{FRAME_CONTROLLER}\0").into_bytes());
             eprintln!("OpenXR: enabled {FRAME_CONTROLLER}");
         } else {
             let names: Vec<String> = available
                 .other
                 .iter()
-                .map(|e| String::from_utf8_lossy(e).into_owned())
+                .map(|e| String::from_utf8_lossy(&name(e)).into_owned())
                 .collect();
             eprintln!(
                 "OpenXR: runtime does not offer {FRAME_CONTROLLER} (offers {})",
