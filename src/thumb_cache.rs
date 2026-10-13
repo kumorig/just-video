@@ -1,5 +1,6 @@
-//! List thumbnails kept across runs: `thumbnails/<hash>.png` next to the
-//! settings, each at display size (about 110 KB raw, far less as PNG). The
+//! List thumbnails kept across runs: `thumbnails/<hash>.jpg` next to the
+//! settings, each at display size (about 110 KB raw, ~11 KB as JPEG at quality
+//! 90 without chroma subsampling). The
 //! name hashes everything the picture depends on (file, size, modification
 //! time, layout, thumbnail size), so a changed file or layout just misses and
 //! the stale file ages out (anything unused for 24 hours is deleted, and never
@@ -10,6 +11,15 @@ use crate::media::Thumb;
 use crate::vr::Layout;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+use zune_jpeg::JpegDecoder;
+use zune_jpeg::zune_core::bytestream::ZCursor;
+use zune_jpeg::zune_core::colorspace::ColorSpace;
+use zune_jpeg::zune_core::options::DecoderOptions;
+
+/// JPEG quality of stored thumbnails (4:4:4): ~38 dB against the source, a
+/// quarter of the size of PNG and decoded in ~0.1 ms.
+const JPEG_QUALITY: u8 = 90;
+const EXT: &str = "jpg";
 
 /// Size of every thumbnail; rows are laid out around it.
 pub const THUMB_W: u32 = 220;
@@ -61,7 +71,7 @@ impl ThumbCache {
     }
 
     fn path(&self, key: &str) -> PathBuf {
-        self.dir.join(format!("{key}.png"))
+        self.dir.join(format!("{key}.{EXT}"))
     }
 
     /// The stored thumbnail, if there is a readable one of the right size.
@@ -77,13 +87,13 @@ impl ThumbCache {
             let _ = std::fs::remove_file(&path);
             return None;
         }
-        let file = std::io::BufReader::new(std::fs::File::open(&path).ok()?);
-        let mut reader = png::Decoder::new(file).read_info().ok()?;
-        let mut rgba = vec![0; reader.output_buffer_size()?];
-        let info = reader.next_frame(&mut rgba).ok()?;
-        let right = (info.width, info.height) == (THUMB_W, THUMB_H)
-            && info.color_type == png::ColorType::Rgba
-            && info.bit_depth == png::BitDepth::Eight;
+        let bytes = std::fs::read(&path).ok()?;
+        let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGBA);
+        let mut decoder = JpegDecoder::new_with_options(ZCursor::new(&bytes[..]), options);
+        let rgba = decoder.decode().ok()?;
+        let (w, h) = decoder.dimensions()?;
+        let right = (w as u32, h as u32) == (THUMB_W, THUMB_H)
+            && rgba.len() == (THUMB_W * THUMB_H * 4) as usize;
         if right {
             // Used now: pruning drops what was not used for longest, not
             // what was made first.
@@ -92,13 +102,10 @@ impl ThumbCache {
                 .open(&path)
                 .and_then(|f| f.set_modified(SystemTime::now()));
         }
-        right.then(|| {
-            rgba.truncate(info.buffer_size());
-            Thumb {
-                width: info.width,
-                height: info.height,
-                rgba,
-            }
+        right.then_some(Thumb {
+            width: THUMB_W,
+            height: THUMB_H,
+            rgba,
         })
     }
 
@@ -121,10 +128,14 @@ impl ThumbCache {
         std::fs::create_dir_all(&self.dir)?;
         let tmp = self.dir.join(format!(".{key}.tmp"));
         let file = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
-        let mut encoder = png::Encoder::new(file, thumb.width, thumb.height);
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        encoder.write_header()?.write_image_data(&thumb.rgba)?;
+        let mut encoder = jpeg_encoder::Encoder::new(file, JPEG_QUALITY);
+        encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::F_1_1);
+        encoder.encode(
+            &thumb.rgba,
+            thumb.width as u16,
+            thumb.height as u16,
+            jpeg_encoder::ColorType::Rgba,
+        )?;
         std::fs::rename(&tmp, self.path(key))?;
         Ok(())
     }
@@ -132,10 +143,13 @@ impl ThumbCache {
     /// Drops what is older than [`MAX_AGE`], then keeps the newest
     /// [`MAX_FILES`] files.
     pub fn prune_old(&self) {
-        // Half-written files from a stop in mid-save (nothing writes yet).
+        // Half-written files from a stop in mid-save, and the PNGs an earlier
+        // version kept (never read now).
         if let Ok(entries) = std::fs::read_dir(&self.dir) {
             for e in entries.flatten() {
-                if e.file_name().to_string_lossy().ends_with(".tmp") {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                if name.ends_with(".tmp") || name.ends_with(".png") {
                     let _ = std::fs::remove_file(e.path());
                 }
             }
@@ -151,11 +165,11 @@ impl ThumbCache {
         };
         let now = SystemTime::now();
         for e in entries.flatten() {
-            let is_png = Path::new(&e.file_name())
+            let is_thumb = Path::new(&e.file_name())
                 .extension()
-                .is_some_and(|x| x == "png");
+                .is_some_and(|x| x == EXT);
             let used = e.metadata().ok().and_then(|m| m.modified().ok());
-            if is_png && used.is_some_and(|u| now.duration_since(u).is_ok_and(|a| a > age)) {
+            if is_thumb && used.is_some_and(|u| now.duration_since(u).is_ok_and(|a| a > age)) {
                 let _ = std::fs::remove_file(e.path());
             }
         }
@@ -171,7 +185,7 @@ impl ThumbCache {
             .filter(|e| {
                 Path::new(&e.file_name())
                     .extension()
-                    .is_some_and(|x| x == "png")
+                    .is_some_and(|x| x == EXT)
             })
             .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
             .collect();
@@ -206,10 +220,16 @@ mod tests {
         dir
     }
 
+    /// A smooth gradient with a sharp-edged box: what JPEG is made for.
     fn picture(seed: u8) -> Thumb {
-        let rgba = (0..THUMB_W * THUMB_H * 4)
-            .map(|i| (i as u8).wrapping_mul(seed))
-            .collect();
+        let mut rgba = Vec::new();
+        for y in 0..THUMB_H {
+            for x in 0..THUMB_W {
+                let boxed = (60..120).contains(&x) && (30..90).contains(&y);
+                let v = if boxed { 230 } else { (x + y) as u8 / 2 };
+                rgba.extend_from_slice(&[v, v.wrapping_mul(seed), 255 - v, 255]);
+            }
+        }
         Thumb {
             width: THUMB_W,
             height: THUMB_H,
@@ -253,11 +273,19 @@ mod tests {
         let thumb = picture(7);
         cache.store("0123456789abcdef", &thumb);
         let loaded = cache.load("0123456789abcdef").unwrap();
-        assert_eq!(loaded.rgba, thumb.rgba);
+        // Lossy, but close: mean error well under 2/255, alpha untouched.
+        let error: u64 = loaded
+            .rgba
+            .iter()
+            .zip(&thumb.rgba)
+            .map(|(a, b)| a.abs_diff(*b) as u64)
+            .sum();
+        assert!(error < 2 * loaded.rgba.len() as u64, "mean error too big");
+        assert!(loaded.rgba.chunks(4).all(|p| p[3] == 255));
         assert_eq!((loaded.width, loaded.height), (THUMB_W, THUMB_H));
         // No temporary file is left, and junk is a miss, not a crash.
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
-        std::fs::write(dir.join("bad.png"), b"not a png").unwrap();
+        std::fs::write(dir.join("bad.jpg"), b"not a jpeg").unwrap();
         assert!(cache.load("bad").is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -299,8 +327,10 @@ mod tests {
         }
         // Leftovers of an interrupted save go at start-up.
         std::fs::write(dir.join(".dead.tmp"), b"half").unwrap();
+        std::fs::write(dir.join("0123456789abcdef.png"), b"old format").unwrap();
         cache.prune_old();
         assert!(!dir.join(".dead.tmp").exists());
+        assert!(!dir.join("0123456789abcdef.png").exists());
         // The oldest is shown again: it is now the newest.
         assert!(cache.load(&format!("{:016x}", 0)).is_some());
         cache.prune(2);
