@@ -927,6 +927,21 @@ fn move_entries(
     result
 }
 
+/// Holds a probe while a video opens or plays: probes read other files over
+/// the same link (and disks), slowing the video. False when the probe's
+/// folder was left meanwhile.
+fn wait_for_quiet(current: &AtomicU64, generation: u64, opening: &AtomicU64) -> bool {
+    loop {
+        if generation != current.load(Ordering::Relaxed) {
+            return false;
+        }
+        if opening.load(Ordering::SeqCst) == 0 && crate::media::open_decoders() == 0 {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 impl Library {
     #[cfg(test)]
     pub(crate) fn for_test() -> (Self, mpsc::Receiver<Request>, mpsc::Sender<Response>) {
@@ -948,22 +963,33 @@ impl Library {
     pub fn start(hw: Option<&'static str>) -> Self {
         let sessions: Sessions = Default::default();
         let probe_generation = Arc::new(AtomicU64::new(0));
+        // Videos being opened right now (see `wait_for_quiet`).
+        let opening = Arc::new(AtomicU64::new(0));
         let (response_tx, responses) = mpsc::channel();
         let mut senders = Vec::new();
         for name in ["library", "probe"] {
             let (tx, rx) = mpsc::channel::<Request>();
             let (sessions, out) = (sessions.clone(), response_tx.clone());
             let current = probe_generation.clone();
+            let opening = opening.clone();
             std::thread::Builder::new()
                 .name(name.into())
                 .spawn(move || {
                     for request in rx {
                         if let Request::Probe { generation, .. } = &request
-                            && *generation != current.load(Ordering::Relaxed)
+                            && !wait_for_quiet(&current, *generation, &opening)
                         {
                             continue;
                         }
-                        if out.send(handle(request, &sessions, hw)).is_err() {
+                        let open = matches!(request, Request::Open { .. });
+                        if open {
+                            opening.fetch_add(1, Ordering::SeqCst);
+                        }
+                        let response = handle(request, &sessions, hw);
+                        if open {
+                            opening.fetch_sub(1, Ordering::SeqCst);
+                        }
+                        if out.send(response).is_err() {
                             return;
                         }
                     }
