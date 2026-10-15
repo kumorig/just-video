@@ -1070,8 +1070,12 @@ pub fn run(
                         1.0,
                     );
                     resume_saved_at = Instant::now();
-                    playback.set_buffer(opened.buffer);
-                    playback.set_reserve(opened.reserve);
+                    if let Some(buffer) = opened.buffer {
+                        playback.set_buffer(buffer);
+                    }
+                    if let Some(reserve) = opened.reserve {
+                        playback.set_reserve(reserve);
+                    }
                     playback.add_external_subtitles(opened.external_subtitles);
                     playback.image = opened.image;
                     renderer.set_adjust(&playback.image);

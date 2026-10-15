@@ -10,6 +10,7 @@ use super::browser::{Action, Dialog, Hit, Icon, Row, Tool, View, format_size};
 use super::form::{self, Field, Form, Key};
 use crate::config::{self, Server};
 use crate::library::{Library, Listing, MoveSelection, Opened, Path, Request, Response};
+use crate::local;
 use crate::playability::{Assessment, Verdict};
 use crate::smb::SmbUrl;
 use std::collections::HashSet;
@@ -395,7 +396,10 @@ impl Navigator {
             eprintln!("Can't read saved servers: {e:#}");
             Vec::new()
         });
-        self.items = servers.into_iter().map(Item::Server).collect();
+        self.items = std::iter::once(local::server())
+            .chain(servers)
+            .map(Item::Server)
+            .collect();
         self.items.push(Item::AddServer);
         self.items.push(Item::Settings);
         if self.settings_open {
@@ -507,6 +511,12 @@ impl Navigator {
             .enumerate()
             .map(|(i, item)| {
                 let mut row = match item {
+                    // The headset itself: browsed like a server, but it can't
+                    // be edited or removed.
+                    Item::Server(s) if local::is_local(s) => Row {
+                        detail: "Videos, Downloads, home folder, SD card and USB drives".into(),
+                        ..Row::new(Icon::Server, &s.name)
+                    },
                     Item::Server(s) => Row {
                         detail: s.url.clone(),
                         actions: if selecting.is_some_and(|sel| sel.contains(&i)) {
@@ -1148,6 +1158,7 @@ impl Navigator {
             return;
         }
         match self.items.get(index) {
+            Some(Item::Server(s)) if local::is_local(s) => return,
             Some(Item::Server(_)) => {
                 self.selecting = Some(HashSet::from([index]));
             }
@@ -2014,6 +2025,18 @@ mod tests {
         nav.click(Hit::Tool(0));
         assert!(nav.take_exit());
         assert!(!nav.take_exit(), "reported once");
+    }
+
+    #[test]
+    fn server_list_starts_with_the_headset() {
+        let mut nav = Navigator::new(Library::start(None));
+        assert_eq!(nav.view().rows[0].label, "This headset");
+        nav.long_press(0);
+        assert!(
+            nav.selecting.is_none(),
+            "the headset can't be edited or removed"
+        );
+        assert!(nav.view().rows[0].actions.is_empty());
     }
 
     #[test]

@@ -8,6 +8,7 @@ pub mod decode;
 pub mod inventory;
 #[cfg(feature = "decode")]
 pub mod library;
+pub mod local;
 #[cfg(feature = "decode")]
 pub mod media;
 #[cfg(feature = "decode")]

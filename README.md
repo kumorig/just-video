@@ -39,7 +39,8 @@ The same steps work from a Mac: the build cross-compiles with zig, and
 ## Run
 
 Start **Just Video** from the Steam library on the Frame, choose **Add server**
-and enter your SMB server's address and login.
+and enter your SMB server's address and login. Videos on the Frame itself are
+under **This headset**: Videos, Downloads, the home folder, SD card and USB drives.
 
 ## Controls
 
