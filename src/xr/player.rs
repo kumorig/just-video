@@ -545,7 +545,7 @@ fn audio_label(index: usize, t: &crate::media::AudioTrackInfo) -> String {
     let mut label = t
         .language
         .as_deref()
-        .map(language_name)
+        .map(crate::subtitles::language_name)
         .unwrap_or_else(|| format!("Track {}", index + 1));
     match t.title.as_deref() {
         Some(title) if !title.eq_ignore_ascii_case(&label) => label = format!("{label} · {title}"),
@@ -570,63 +570,16 @@ fn audio_label(index: usize, t: &crate::media::AudioTrackInfo) -> String {
 enum SubtitleSource {
     /// Index into the file's subtitle streams; cues arrive while decoding.
     Embedded(usize),
-    /// A .srt file next to the video.
-    External(Cues),
+    /// A .srt file found with the video; fetched when first chosen.
+    External {
+        path: crate::library::Path,
+        cues: Option<Cues>,
+    },
 }
 
 struct SubtitleTrack {
     label: String,
     source: SubtitleSource,
-}
-
-/// "English", "Svenska"… for common ISO 639-2 codes; the code otherwise.
-fn language_name(code: &str) -> String {
-    let name = match code.to_ascii_lowercase().as_str() {
-        "eng" | "en" => "English",
-        "swe" | "sv" => "Swedish",
-        "nor" | "nob" | "no" => "Norwegian",
-        "dan" | "da" => "Danish",
-        "fin" | "fi" => "Finnish",
-        "ger" | "deu" | "de" => "German",
-        "fre" | "fra" | "fr" => "French",
-        "spa" | "es" => "Spanish",
-        "ita" | "it" => "Italian",
-        "por" | "pt" => "Portuguese",
-        "dut" | "nld" | "nl" => "Dutch",
-        "pol" | "pl" => "Polish",
-        "rus" | "ru" => "Russian",
-        "jpn" | "ja" => "Japanese",
-        "kor" | "ko" => "Korean",
-        "chi" | "zho" | "zh" => "Chinese",
-        "ara" | "ar" => "Arabic",
-        "est" | "et" => "Estonian",
-        "lav" | "lv" => "Latvian",
-        "lit" | "lt" => "Lithuanian",
-        "ukr" | "uk" => "Ukrainian",
-        "hin" | "hi" => "Hindi",
-        "tam" | "ta" => "Tamil",
-        "tel" | "te" => "Telugu",
-        "cze" | "ces" | "cs" => "Czech",
-        "slo" | "slk" | "sk" => "Slovak",
-        "slv" | "sl" => "Slovenian",
-        "hun" | "hu" => "Hungarian",
-        "rum" | "ron" | "ro" => "Romanian",
-        "bul" | "bg" => "Bulgarian",
-        "hrv" | "hr" => "Croatian",
-        "srp" | "sr" => "Serbian",
-        "gre" | "ell" | "el" => "Greek",
-        "tur" | "tr" => "Turkish",
-        "heb" | "he" => "Hebrew",
-        "tha" | "th" => "Thai",
-        "vie" | "vi" => "Vietnamese",
-        "ind" | "id" => "Indonesian",
-        "may" | "msa" | "ms" => "Malay",
-        "ice" | "isl" | "is" => "Icelandic",
-        "cat" | "ca" => "Catalan",
-        "per" | "fas" | "fa" => "Persian",
-        _ => return code.to_string(),
-    };
-    name.to_string()
 }
 
 pub struct Playback {
@@ -640,6 +593,8 @@ pub struct Playback {
     embedded_cues: Arc<Mutex<Cues>>,
     /// Briefly shown instead of subtitles ("Subtitles: English"), until then.
     subtitle_notice: Option<(String, Instant)>,
+    /// The external track whose file is being fetched.
+    subtitle_fetching: Option<usize>,
     audio_labels: Vec<String>,
     audio_track: Option<usize>,
     decode: DecodeThread,
@@ -681,7 +636,7 @@ impl Playback {
                 let mut label = t
                     .language
                     .as_deref()
-                    .map(language_name)
+                    .map(crate::subtitles::language_name)
                     .unwrap_or_else(|| format!("Track {}", i + 1));
                 if let Some(title) = t
                     .title
@@ -746,6 +701,7 @@ impl Playback {
             subtitle,
             embedded_cues,
             subtitle_notice: None,
+            subtitle_fetching: None,
             audio_labels,
             audio_track,
             audio,
@@ -832,20 +788,74 @@ impl Playback {
         buffered_seconds(&state, self.position(), self.duration)
     }
 
-    /// Adds subtitle files found next to the video; the first one is shown
-    /// (a file placed next to a video is usually there to be used).
+    /// Adds the subtitle files found with the video; the first one is shown
+    /// (a file placed next to a video is usually there to be used). Their
+    /// text is fetched when chosen: see [`Playback::take_subtitle_fetch`].
     pub fn add_external_subtitles(&mut self, files: Vec<crate::library::ExternalSubtitles>) {
         if files.is_empty() {
             return;
         }
         let count = files.len();
         let external = files.into_iter().map(|f| SubtitleTrack {
-            label: f.name.clone(),
-            source: SubtitleSource::External(Cues::new(f.cues)),
+            label: f.label,
+            source: SubtitleSource::External {
+                path: f.path,
+                cues: None,
+            },
         });
         self.subtitle_tracks.splice(0..0, external);
         self.subtitle = self.subtitle.map(|i| i + count);
         self.select_subtitle(Some(0), false);
+    }
+
+    /// The external track to fetch, once: the chosen one whose file hasn't
+    /// been read yet. The owner fetches it and calls [`Playback::subtitle_loaded`].
+    pub fn take_subtitle_fetch(&mut self) -> Option<(usize, crate::library::Path)> {
+        let i = self.subtitle?;
+        if self.subtitle_fetching == Some(i) {
+            return None;
+        }
+        let path = match &self.subtitle_tracks[i].source {
+            SubtitleSource::External { path, cues: None } => path.clone(),
+            _ => return None,
+        };
+        self.subtitle_fetching = Some(i);
+        self.notice("Loading subtitles…".to_string(), Duration::from_secs(20));
+        Some((i, path))
+    }
+
+    /// The text of external track `index`, or why it couldn't be read.
+    pub fn subtitle_loaded(
+        &mut self,
+        index: usize,
+        result: Result<Vec<crate::subtitles::Cue>, String>,
+    ) {
+        if self.subtitle_fetching == Some(index) {
+            self.subtitle_fetching = None;
+        }
+        let Some(track) = self.subtitle_tracks.get_mut(index) else {
+            return;
+        };
+        let SubtitleSource::External { cues, .. } = &mut track.source else {
+            return;
+        };
+        let chosen = self.subtitle == Some(index);
+        match result {
+            Ok(loaded) => {
+                *cues = Some(Cues::new(loaded));
+                if chosen {
+                    let text = format!("Subtitles: {}", track.label);
+                    self.notice(text, Duration::from_millis(1800));
+                }
+            }
+            Err(e) => {
+                eprintln!("Subtitles: can't read {}: {e}", track.label);
+                if chosen {
+                    self.select_subtitle(None, false);
+                }
+                self.notice(format!("Can't load subtitles: {e}"), Duration::from_secs(3));
+            }
+        }
     }
 
     pub fn has_subtitles(&self) -> bool {
@@ -885,7 +895,12 @@ impl Playback {
             let _ = self.decode.subtitle_track.send(after);
         }
         self.subtitle = index;
-        if announce {
+        // A file still to be fetched announces itself once it has arrived.
+        let fetching = matches!(
+            index.map(|i| &self.subtitle_tracks[i].source),
+            Some(SubtitleSource::External { cues: None, .. })
+        );
+        if announce && !fetching {
             let text = match index {
                 Some(i) => format!("Subtitles: {}", self.subtitle_tracks[i].label),
                 None => "Subtitles off".to_string(),
@@ -964,7 +979,10 @@ impl Playback {
         }
         let time = self.position();
         match &self.subtitle_tracks.get(self.subtitle?)?.source {
-            SubtitleSource::External(cues) => cues.caption(time),
+            SubtitleSource::External {
+                cues: Some(cues), ..
+            } => cues.caption(time),
+            SubtitleSource::External { cues: None, .. } => None,
             SubtitleSource::Embedded(_) => self.embedded_cues.lock().expect("cues").caption(time),
         }
     }
@@ -1263,7 +1281,11 @@ pub fn eye_params(
         // Only a screen has a surround, left transparent for the runtime to
         // fill (passthrough, or its environment); spherical video fills the view.
         surround: [
-            if layout.projection == Projection::Flat { 1.0 } else { 0.0 },
+            if layout.projection == Projection::Flat {
+                1.0
+            } else {
+                0.0
+            },
             0.0,
             0.0,
             0.0,

@@ -1718,6 +1718,17 @@ pub fn run(
                     }
                 }
 
+                // External subtitle files are fetched when chosen.
+                if let Some(nav) = navigator.as_mut() {
+                    nav.poll_while_playing();
+                    if let Some((track, result)) = nav.take_subtitle() {
+                        playback.subtitle_loaded(track, result);
+                    }
+                    if let Some((track, path)) = playback.take_subtitle_fetch() {
+                        nav.fetch_subtitle(track, path);
+                    }
+                }
+
                 // Subtitles: redrawn only when the text changes. While
                 // editing, sample text shows their size and place.
                 let caption = if caption_edit {

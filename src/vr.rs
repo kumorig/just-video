@@ -181,10 +181,7 @@ mod tests {
             (Equirect180, SideBySide)
         );
         assert_eq!(by_name("clip_MKX200.mp4"), (Fisheye180, Mono));
-        assert_eq!(
-            by_name("scene_FISHEYE190_LR.mp4"),
-            (Fisheye180, SideBySide)
-        );
+        assert_eq!(by_name("scene_FISHEYE190_LR.mp4"), (Fisheye180, SideBySide));
         assert_eq!(by_name("walk_360.mp4"), (Equirect360, Mono));
         assert_eq!(by_name("odd_180_RL.mp4"), (Equirect180, SideBySide));
         assert_eq!(by_name("movie.2024.2160p.mkv"), (Flat, Mono));

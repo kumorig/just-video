@@ -292,13 +292,15 @@ fn windows_1252(b: u8) -> char {
     }
 }
 
+/// The video's name without its extension.
+pub fn stem(video: &str) -> &str {
+    video.rsplit_once('.').map_or(video, |(s, _)| s)
+}
+
 /// Whether `candidate` is a subtitle file for the video `video`: the same
 /// name with `.srt`, optionally with a language in between (`movie.en.srt`).
 pub fn is_sidecar(video: &str, candidate: &str) -> bool {
-    let stem = video
-        .rsplit_once('.')
-        .map_or(video, |(s, _)| s)
-        .to_lowercase();
+    let stem = stem(video).to_lowercase();
     let candidate = candidate.to_lowercase();
     let Some(name) = candidate.strip_suffix(".srt") else {
         return false;
@@ -307,6 +309,122 @@ pub fn is_sidecar(video: &str, candidate: &str) -> bool {
         || name
             .strip_prefix(&stem)
             .is_some_and(|rest| rest.starts_with('.') && rest.len() <= 12)
+}
+
+/// A folder of subtitle files beside the videos (`Subs`, `Subtitles`);
+/// season packs keep one subfolder per episode in it.
+pub fn is_subs_folder(name: &str) -> bool {
+    name.eq_ignore_ascii_case("subs") || name.eq_ignore_ascii_case("subtitles")
+}
+
+pub fn is_srt(name: &str) -> bool {
+    name.to_lowercase().ends_with(".srt")
+}
+
+/// How a subtitle file is listed: its language ("Norwegian" for `29_nor.srt`
+/// or `movie.no.srt`, "English" for `2_English.srt`), "Subtitles" for a
+/// bare `movie.srt`, or whatever else the name says.
+pub fn sidecar_label(video: &str, file: &str) -> String {
+    let name = match file.rsplit_once('.') {
+        Some((n, ext)) if ext.eq_ignore_ascii_case("srt") => n,
+        _ => file,
+    };
+    let name = match name.split_once('_') {
+        Some((n, rest)) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => rest,
+        _ => name,
+    };
+    let stem = stem(video);
+    if name.eq_ignore_ascii_case(stem) {
+        return "Subtitles".to_string();
+    }
+    let token = match name.get(..stem.len()) {
+        Some(head) if head.eq_ignore_ascii_case(stem) => {
+            name[stem.len()..].strip_prefix('.').unwrap_or(name)
+        }
+        _ => name,
+    };
+    language_name(token)
+}
+
+/// Sort key: numbered files (`2_English.srt`) in their number's order first,
+/// then the rest, shortest name first (`movie.srt` before `movie.en.srt`).
+pub fn sidecar_order(file: &str) -> (bool, u32, usize, String) {
+    let number = file
+        .split_once('_')
+        .and_then(|(n, _)| n.parse::<u32>().ok());
+    (
+        number.is_none(),
+        number.unwrap_or(0),
+        file.len(),
+        file.to_lowercase(),
+    )
+}
+
+/// Repeated labels get a count: "English", "English (2)".
+pub fn distinct_labels(labels: Vec<String>) -> Vec<String> {
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    labels
+        .into_iter()
+        .map(|label| {
+            let n = seen.entry(label.clone()).or_insert(0);
+            *n += 1;
+            if *n == 1 {
+                label
+            } else {
+                format!("{label} ({n})")
+            }
+        })
+        .collect()
+}
+
+/// "English", "Svenska"… for common ISO 639-2 codes; the code otherwise.
+pub fn language_name(code: &str) -> String {
+    let name = match code.to_ascii_lowercase().as_str() {
+        "eng" | "en" => "English",
+        "swe" | "sv" => "Swedish",
+        "nor" | "nob" | "no" => "Norwegian",
+        "dan" | "da" => "Danish",
+        "fin" | "fi" => "Finnish",
+        "ger" | "deu" | "de" => "German",
+        "fre" | "fra" | "fr" => "French",
+        "spa" | "es" => "Spanish",
+        "ita" | "it" => "Italian",
+        "por" | "pt" => "Portuguese",
+        "dut" | "nld" | "nl" => "Dutch",
+        "pol" | "pl" => "Polish",
+        "rus" | "ru" => "Russian",
+        "jpn" | "ja" => "Japanese",
+        "kor" | "ko" => "Korean",
+        "chi" | "zho" | "zh" => "Chinese",
+        "ara" | "ar" => "Arabic",
+        "est" | "et" => "Estonian",
+        "lav" | "lv" => "Latvian",
+        "lit" | "lt" => "Lithuanian",
+        "ukr" | "uk" => "Ukrainian",
+        "hin" | "hi" => "Hindi",
+        "tam" | "ta" => "Tamil",
+        "tel" | "te" => "Telugu",
+        "cze" | "ces" | "cs" => "Czech",
+        "slo" | "slk" | "sk" => "Slovak",
+        "slv" | "sl" => "Slovenian",
+        "hun" | "hu" => "Hungarian",
+        "rum" | "ron" | "ro" => "Romanian",
+        "bul" | "bg" => "Bulgarian",
+        "hrv" | "hr" => "Croatian",
+        "srp" | "sr" => "Serbian",
+        "gre" | "ell" | "el" => "Greek",
+        "tur" | "tr" => "Turkish",
+        "heb" | "he" => "Hebrew",
+        "tha" | "th" => "Thai",
+        "vie" | "vi" => "Vietnamese",
+        "ind" | "id" => "Indonesian",
+        "may" | "msa" | "ms" => "Malay",
+        "ice" | "isl" | "is" => "Icelandic",
+        "cat" | "ca" => "Catalan",
+        "per" | "fas" | "fa" => "Persian",
+        _ => return code.to_string(),
+    };
+    name.to_string()
 }
 
 #[cfg(test)]
@@ -385,6 +503,67 @@ mod tests {
         assert!(is_sidecar("movie.mkv", "MOVIE.en.SRT"));
         assert!(!is_sidecar("Show S01E02.mp4", "Show S01E03.srt"));
         assert!(!is_sidecar("movie.mkv", "movie.mkv"));
+    }
+
+    #[test]
+    fn labels_sidecars_by_language() {
+        let v = "Show.S01E01.1080p.WEBRip.x265-RARBG[eztv.re].mp4";
+        assert_eq!(sidecar_label(v, "29_nor.srt"), "Norwegian");
+        assert_eq!(sidecar_label(v, "2_English.srt"), "English");
+        assert_eq!(sidecar_label(v, "34_slo.SRT"), "Slovak");
+        assert_eq!(sidecar_label(v, "4_Arabic.srt"), "Arabic");
+        assert_eq!(
+            sidecar_label(v, "Show.S01E01.1080p.WEBRip.x265-RARBG[eztv.re].en.srt"),
+            "English"
+        );
+        assert_eq!(
+            sidecar_label(v, "show.s01e01.1080p.webrip.x265-rarbg[eztv.re].srt"),
+            "Subtitles"
+        );
+        assert_eq!(sidecar_label("movie.mkv", "movie.forced.srt"), "forced");
+    }
+
+    #[test]
+    fn numbered_sidecars_keep_release_order() {
+        let mut names = vec![
+            "9_Danish.srt",
+            "34_slo.srt",
+            "2_English.srt",
+            "Show.srt",
+            "Show.en.srt",
+        ];
+        names.sort_by_key(|n| sidecar_order(n));
+        assert_eq!(
+            names,
+            [
+                "2_English.srt",
+                "9_Danish.srt",
+                "34_slo.srt",
+                "Show.srt",
+                "Show.en.srt"
+            ]
+        );
+    }
+
+    #[test]
+    fn repeated_labels_are_numbered() {
+        let labels = ["English", "English", "Danish", "English"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(
+            distinct_labels(labels),
+            ["English", "English (2)", "Danish", "English (3)"]
+        );
+    }
+
+    #[test]
+    fn subs_folder_names() {
+        assert!(is_subs_folder("Subs"));
+        assert!(is_subs_folder("subs"));
+        assert!(is_subs_folder("Subtitles"));
+        assert!(!is_subs_folder("Subsonic"));
+        assert!(is_srt("2_English.SRT"));
+        assert!(!is_srt("notes.txt"));
     }
 
     #[test]

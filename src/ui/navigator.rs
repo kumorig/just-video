@@ -175,6 +175,11 @@ pub struct Navigator {
     dirty: bool,
     /// Exit was chosen on the top page; the app reads it with [`Navigator::take_exit`].
     exit_requested: bool,
+    /// Where the playing video is, for fetching its subtitle files.
+    playing_source: Option<(Server, String)>,
+    /// The subtitle fetch awaited (request id, track) and its answer.
+    subtitle_request: Option<(u64, usize)>,
+    subtitle_result: Option<(usize, Result<Vec<crate::subtitles::Cue>, String>)>,
 }
 
 impl Navigator {
@@ -203,6 +208,9 @@ impl Navigator {
             generation: 0,
             dirty: true,
             exit_requested: false,
+            playing_source: None,
+            subtitle_request: None,
+            subtitle_result: None,
         };
         nav.show_servers();
         nav
@@ -667,7 +675,13 @@ impl Navigator {
                                 [a.detail, a.hint].into_iter().flatten().collect(),
                             );
                         }
-                        Ok(opened) => return Some(opened),
+                        Ok(opened) => {
+                            self.playing_source =
+                                Some((opened.server.clone(), opened.share.clone()));
+                            self.subtitle_request = None;
+                            self.subtitle_result = None;
+                            return Some(opened);
+                        }
                         Err(e) => self.dialog("Can't open this video", vec![e]),
                     }
                 }
@@ -713,6 +727,12 @@ impl Navigator {
                         }
                     }
                 }
+                Response::Subtitle { id, result }
+                    if self.subtitle_request.is_some_and(|(r, _)| r == id) =>
+                {
+                    let (_, track) = self.subtitle_request.take().expect("request");
+                    self.subtitle_result = Some((track, result));
+                }
                 // A video that finished opening after we moved on: its reader and
                 // decoder may take a while to close, so never on the frame loop.
                 Response::Opened {
@@ -722,6 +742,35 @@ impl Navigator {
             }
         }
         None
+    }
+
+    /// Handles worker results while a video plays (subtitle files arriving).
+    pub fn poll_while_playing(&mut self) {
+        // Nothing is being opened meanwhile, so no video comes back here.
+        if let Some(opened) = self.poll() {
+            crate::xr::app::drop_in_background(opened);
+        }
+    }
+
+    /// Fetches the file of the playing video's external subtitle `track`;
+    /// the answer comes back through [`Navigator::take_subtitle`].
+    pub fn fetch_subtitle(&mut self, track: usize, path: Path) {
+        let Some((server, share)) = self.playing_source.clone() else {
+            self.subtitle_result = Some((track, Err("No connection.".into())));
+            return;
+        };
+        let id = self.id();
+        self.subtitle_request = Some((id, track));
+        self.library.send(Request::Subtitle {
+            id,
+            server,
+            share,
+            path,
+        });
+    }
+
+    pub fn take_subtitle(&mut self) -> Option<(usize, Result<Vec<crate::subtitles::Cue>, String>)> {
+        self.subtitle_result.take()
     }
 
     fn changes_done(&mut self) {

@@ -109,6 +109,13 @@ pub enum Request {
         selection: MoveSelection,
         destination: Path,
     },
+    /// Fetches a subtitle file found when the video opened.
+    Subtitle {
+        id: u64,
+        server: Server,
+        share: String,
+        path: Path,
+    },
     /// Checks the login (and that shares can be listed), then saves the server.
     AddServer {
         id: u64,
@@ -124,8 +131,11 @@ pub struct Opened {
     pub name: String,
     /// Identifies the file for its saved layout and resume point.
     pub key: String,
-    /// Subtitle files next to the video (`movie.srt`, `movie.en.srt`).
+    /// Subtitle files found for the video, fetched when chosen.
     pub external_subtitles: Vec<ExternalSubtitles>,
+    /// Where the video is, for fetching its subtitle files.
+    pub server: Server,
+    pub share: String,
     /// Saved picture corrections for this file.
     pub image: config::ImageAdjust,
     /// Where this file was left last time (seconds), to continue from.
@@ -137,55 +147,142 @@ pub struct Opened {
 }
 
 pub struct ExternalSubtitles {
-    /// File name, e.g. `movie.en.srt`.
+    /// File name, e.g. `movie.en.srt` or `2_English.srt`.
     pub name: String,
-    pub cues: Vec<crate::subtitles::Cue>,
+    /// How it is listed: its language where the name says it.
+    pub label: String,
+    /// The file's path in the share.
+    pub path: Path,
 }
 
-/// Loads the .srt files next to `path`. Missing or unreadable ones are
-/// skipped: subtitles must never stop a video from playing.
-fn load_sidecars(session: &SmbSession, share: &str, path: &Path) -> Vec<ExternalSubtitles> {
-    use std::io::Read;
+/// Finds the .srt files for the video at `path`: next to it (`movie.srt`,
+/// `movie.en.srt`), in a `Subs` folder there, and in that folder's
+/// subfolder named after the video (season packs). Nothing is read yet:
+/// a pack holds dozens of languages, and opening must stay quick. A
+/// folder that can't be listed is skipped: subtitles must never stop a
+/// video from playing.
+fn find_sidecars(session: &SmbSession, share: &str, path: &Path) -> Vec<ExternalSubtitles> {
     let Some((video, folder)) = path.split_last() else {
         return Vec::new();
     };
-    let entries = match session.list_in(share, &smb_path(&folder.to_vec())) {
-        Ok(entries) => entries,
+    let list = |parts: Vec<String>| match session.list_in(share, &smb_path(&parts)) {
+        Ok(entries) => Some(entries),
         Err(e) => {
-            eprintln!("Subtitles: can't list the folder: {e:#}");
-            return Vec::new();
+            eprintln!("Subtitles: can't list {}: {e:#}", parts.join("/"));
+            None
         }
     };
-    let mut names: Vec<String> = entries
-        .into_iter()
-        .filter(|e| !e.is_dir && e.size <= 8 << 20 && crate::subtitles::is_sidecar(video, &e.name))
-        .map(|e| e.name)
+    let Some(here) = list(folder.to_vec()) else {
+        return Vec::new();
+    };
+    let subs = here
+        .iter()
+        .find(|e| e.is_dir && crate::subtitles::is_subs_folder(&e.name))
+        .map(|e| e.name.clone())
+        .and_then(|dir| {
+            let mut parts = folder.to_vec();
+            parts.push(dir.clone());
+            list(parts).map(|entries| (dir, entries))
+        });
+    let stem = crate::subtitles::stem(video);
+    let own = subs.as_ref().and_then(|(dir, entries)| {
+        let sub = entries
+            .iter()
+            .find(|e| e.is_dir && e.name.eq_ignore_ascii_case(stem))?
+            .name
+            .clone();
+        let mut parts = folder.to_vec();
+        parts.push(dir.clone());
+        parts.push(sub.clone());
+        list(parts).map(|entries| (sub, entries))
+    });
+    choose_sidecars(
+        video,
+        &here,
+        subs.as_ref().map(|(d, e)| (d.as_str(), e.as_slice())),
+        own.as_ref().map(|(d, e)| (d.as_str(), e.as_slice())),
+    )
+    .into_iter()
+    .map(|(label, relative)| {
+        let name = relative.last().cloned().unwrap_or_default();
+        let mut path = folder.to_vec();
+        path.extend(relative);
+        ExternalSubtitles { name, label, path }
+    })
+    .collect()
+}
+
+/// The subtitle files for `video` among the listings of its folder, of the
+/// `Subs` folder there and of that folder's subfolder named after the
+/// video: (label, path relative to the video's folder), in listing order.
+pub(crate) fn choose_sidecars(
+    video: &str,
+    here: &[Entry],
+    subs: Option<(&str, &[Entry])>,
+    own: Option<(&str, &[Entry])>,
+) -> Vec<(String, Vec<String>)> {
+    use crate::subtitles::{distinct_labels, is_sidecar, is_srt, sidecar_label, sidecar_order};
+    let small = |e: &&Entry| !e.is_dir && e.size <= 8 << 20;
+    let mut files: Vec<(Vec<String>, String)> = here
+        .iter()
+        .filter(small)
+        .filter(|e| is_sidecar(video, &e.name))
+        .map(|e| (Vec::new(), e.name.clone()))
         .collect();
-    // `movie.srt` first, then language variants.
-    names.sort_by_key(|n| (n.len(), n.clone()));
+    if let Some((dir, entries)) = subs {
+        files.extend(
+            entries
+                .iter()
+                .filter(small)
+                .filter(|e| is_sidecar(video, &e.name))
+                .map(|e| (vec![dir.to_string()], e.name.clone())),
+        );
+        if let Some((sub, entries)) = own {
+            files.extend(
+                entries
+                    .iter()
+                    .filter(small)
+                    .filter(|e| is_srt(&e.name))
+                    .map(|e| (vec![dir.to_string(), sub.to_string()], e.name.clone())),
+            );
+        }
+    }
+    files.sort_by_cached_key(|(_, name)| sidecar_order(name));
+    let labels = distinct_labels(
+        files
+            .iter()
+            .map(|(_, name)| sidecar_label(video, name))
+            .collect(),
+    );
+    files
+        .into_iter()
+        .zip(labels)
+        .map(|((mut parts, name), label)| {
+            parts.push(name);
+            (label, parts)
+        })
+        .collect()
+}
+
+/// Reads and parses one subtitle file.
+fn read_subtitles(
+    session: &SmbSession,
+    share: &str,
+    path: &Path,
+) -> anyhow::Result<Vec<crate::subtitles::Cue>> {
+    use std::io::Read;
     let small = ReadAhead {
         block_size: 256 * 1024,
         blocks_ahead: 4,
         reserve_bytes: 0,
     };
-    names
-        .into_iter()
-        .filter_map(|name| {
-            let mut file = folder.to_vec();
-            file.push(name.clone());
-            let mut bytes = Vec::new();
-            let read = session
-                .open_in(share, &smb_path(&file), small)
-                .and_then(|mut r| Ok(r.read_to_end(&mut bytes)?));
-            if let Err(e) = read {
-                eprintln!("Subtitles: can't read {name}: {e:#}");
-                return None;
-            }
-            let cues = crate::subtitles::parse_srt(&crate::subtitles::decode_text(&bytes));
-            eprintln!("Subtitles: {name}: {} cues", cues.len());
-            (!cues.is_empty()).then_some(ExternalSubtitles { name, cues })
-        })
-        .collect()
+    let mut bytes = Vec::new();
+    session
+        .open_in(share, &smb_path(path), small)?
+        .read_to_end(&mut bytes)?;
+    let cues = crate::subtitles::parse_srt(&crate::subtitles::decode_text(&bytes));
+    anyhow::ensure!(!cues.is_empty(), "No subtitles in this file.");
+    Ok(cues)
 }
 
 pub enum Response {
@@ -218,6 +315,10 @@ pub enum Response {
     ServerAdded {
         id: u64,
         result: Result<Server, String>,
+    },
+    Subtitle {
+        id: u64,
+        result: Result<Vec<crate::subtitles::Cue>, String>,
     },
 }
 
@@ -367,6 +468,7 @@ fn handle(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
         Request::Delete { server, .. } => (server.clone(), "delete"),
         Request::Move { selection, .. } => (selection.server.clone(), "move"),
         Request::AddServer { server, .. } => (server.clone(), "add server"),
+        Request::Subtitle { server, .. } => (server.clone(), "subtitle"),
     };
     let response = run(request, sessions, hw);
     let failure = match &response {
@@ -374,7 +476,8 @@ fn handle(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
         | Response::List { result: Err(e), .. }
         | Response::Opened { result: Err(e), .. }
         | Response::Changed { result: Err(e), .. }
-        | Response::ServerAdded { result: Err(e), .. } => Some(e.clone()),
+        | Response::ServerAdded { result: Err(e), .. }
+        | Response::Subtitle { result: Err(e), .. } => Some(e.clone()),
         // A bad file is not a connection problem; a stalled server is.
         Response::Probe { result: Err(e), .. }
             if e.contains("stopped sending") || e.contains("did not answer") =>
@@ -470,7 +573,7 @@ fn run(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
             // is affected, and it closes when the video does.
             let key = file_key(&server, &share, &path);
             let result = connect(&server, None).and_then(|s| {
-                let external_subtitles = load_sidecars(&s, &share, &path);
+                let external_subtitles = find_sidecars(&s, &share, &path);
                 let read_ahead = ReadAhead {
                     reserve_bytes: config::reserve_bytes(),
                     ..ReadAhead::default()
@@ -505,6 +608,8 @@ fn run(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
                     name,
                     key,
                     external_subtitles,
+                    server: server.clone(),
+                    share: share.clone(),
                     image,
                     resume,
                     buffer,
@@ -513,6 +618,17 @@ fn run(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
             });
             Response::Opened { id, result }
         }
+        Request::Subtitle {
+            id,
+            server,
+            share,
+            path,
+        } => Response::Subtitle {
+            id,
+            result: with_session(sessions, &server, Purpose::Browse, |s| {
+                read_subtitles(s, &share, &path).map_err(err)
+            }),
+        },
         Request::Rename {
             id,
             server,
@@ -720,6 +836,67 @@ mod tests {
                 vec!["old".into(), "b".into()],
             ],
         }
+    }
+
+    fn entry(name: &str, is_dir: bool) -> Entry {
+        Entry {
+            name: name.into(),
+            is_dir,
+            size: if is_dir { 0 } else { 90_000 },
+        }
+    }
+
+    #[test]
+    fn season_pack_subtitles_are_found_and_labelled() {
+        let video = "Show.S01E01.1080p.WEBRip.x265-RARBG[eztv.re].mp4";
+        let stem = "Show.S01E01.1080p.WEBRip.x265-RARBG[eztv.re]";
+        let here = [
+            entry("Show.S01E01.1080p.WEBRip.x265-RARBG[eztv.re].mp4", false),
+            entry("Show.S01E02.1080p.WEBRip.x265-RARBG[eztv.re].mp4", false),
+            entry("Subs", true),
+        ];
+        let subs = [
+            entry(stem, true),
+            entry("Show.S01E02.1080p.WEBRip.x265-RARBG[eztv.re]", true),
+        ];
+        let own = [
+            entry("43_Chinese.srt", false),
+            entry("4_Arabic.srt", false),
+            entry("9_Danish.srt", false),
+            entry("3_English.srt", false),
+            entry("2_English.srt", false),
+            entry("29_nor.srt", false),
+            entry("34_slo.srt", false),
+            entry("35_Slovenian.srt", false),
+            entry("readme.txt", false),
+        ];
+        let chosen = choose_sidecars(video, &here, Some(("Subs", &subs)), Some((stem, &own)));
+        let labels: Vec<&str> = chosen.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "English",
+                "English (2)",
+                "Arabic",
+                "Danish",
+                "Norwegian",
+                "Slovak",
+                "Slovenian",
+                "Chinese"
+            ]
+        );
+        assert_eq!(chosen[0].1, ["Subs", stem, "2_English.srt"]);
+        // A file beside the video still counts, and comes after the numbered ones.
+        let here = [
+            entry("movie.mkv", false),
+            entry("movie.en.srt", false),
+            entry("movie.srt", false),
+            entry("other.srt", false),
+        ];
+        let chosen = choose_sidecars("movie.mkv", &here, None, None);
+        let labels: Vec<&str> = chosen.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(labels, ["Subtitles", "English"]);
+        assert_eq!(chosen[1].1, ["movie.en.srt"]);
     }
 
     #[test]
