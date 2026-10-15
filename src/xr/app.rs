@@ -132,6 +132,11 @@ impl Panel {
 const BROWSER_DISTANCE: f32 = 2.2;
 const BROWSER_SIZE: [f32; 2] = [2.347, 1.467];
 
+/// The curvature preview: a 16:9 screen this far ahead, this much wider
+/// than the browser looks, so its bent edges show around the panel.
+const CURVE_PREVIEW_DISTANCE: f32 = 3.0;
+const CURVE_PREVIEW_SCALE: f32 = 1.4;
+
 /// Where the browser starts: a little below eye level.
 fn browser_placement(pivot: [f32; 3]) -> Placement {
     Placement {
@@ -139,6 +144,7 @@ fn browser_placement(pivot: [f32; 3]) -> Placement {
         pitch: (-0.147f32).atan2(BROWSER_DISTANCE),
         distance: BROWSER_DISTANCE,
         curved: false,
+        curve: 1.0,
         zoom: 1.0,
         offset: 0.0,
         pivot,
@@ -146,9 +152,10 @@ fn browser_placement(pivot: [f32; 3]) -> Placement {
 }
 
 /// The browser panel where it has been dragged, facing its pivot and
-/// keeping its apparent size at any distance.
-fn browser_panel(place: &Placement) -> Panel {
-    let s = place.distance / BROWSER_DISTANCE;
+/// keeping its apparent size at any distance; `width` is the chosen
+/// multiple of its usual size.
+fn browser_panel(place: &Placement, width: f32) -> Panel {
+    let s = place.distance / BROWSER_DISTANCE * width;
     Panel {
         center: place.center(),
         yaw: place.yaw,
@@ -217,6 +224,7 @@ fn vr_bar_placement(head: &xr::Posef) -> Placement {
         pitch: VR_BAR_PITCH,
         distance: CONTROLS_DISTANCE / VR_BAR_PITCH.cos(),
         curved: false,
+        curve: 1.0,
         zoom: 1.0,
         offset: 0.0,
         pivot: [head.position.x, head.position.y, head.position.z],
@@ -244,7 +252,8 @@ fn screen_controls_panel(placement: &Placement, screen: [f32; 2]) -> Panel {
     let d = placement.distance;
     // A curved screen's arc is wider than the straight line across it.
     let across = if placement.curved {
-        2.0 * d * (screen[0] / (2.0 * d)).min(std::f32::consts::PI).sin()
+        let r = placement.curve_radius();
+        2.0 * r * (screen[0] / (2.0 * r)).min(std::f32::consts::PI).sin()
     } else {
         screen[0]
     };
@@ -512,12 +521,14 @@ const CLICK_NS: i64 = 400_000_000;
 /// Subtitles on a curved screen: bent along it, just in front (a cylinder
 /// section around the screen's axis, as high as the flat panel would be).
 fn caption_cylinder(placement: &Placement, panel: &Panel) -> (xr::Posef, Shape) {
-    let radius = placement.distance - 0.02;
-    let [_, up, _] = panel.basis();
-    // The axis passes through the pivot; the section sits at the panel's height.
+    let radius = placement.curve_radius() - 0.02;
+    let [_, up, normal] = panel.basis();
+    // The axis passes through the pivot (behind it for a gentle curve); the
+    // section sits at the panel's height.
     let y = dot([0, 1, 2].map(|i| panel.center[i] - placement.pivot[i]), up);
+    let back = placement.curve_radius() - placement.distance;
     let axis = Panel {
-        center: [0, 1, 2].map(|i| placement.pivot[i] + up[i] * y),
+        center: [0, 1, 2].map(|i| placement.pivot[i] + up[i] * y + normal[i] * back),
         ..*panel
     };
     (
@@ -628,7 +639,6 @@ fn screen_outline(placement: &Placement, screen: [f32; 2], t: f32) -> Vec<Line> 
         pixels: [1, 1],
     };
     let [right, up, normal] = base.basis();
-    let r = placement.distance;
     if !placement.curved {
         let panel = Panel {
             center: placement.center(),
@@ -636,10 +646,13 @@ fn screen_outline(placement: &Placement, screen: [f32; 2], t: f32) -> Vec<Line> 
         };
         return panel_outline(&panel, t);
     }
-    // A point on the curved screen `angle` to the right, `y` up, facing the viewer.
+    // The cylinder's axis: through the pivot, or behind it for a gentle curve.
+    let r = placement.curve_radius();
+    let axis = add(placement.pivot, scale(normal, r - placement.distance));
+    // A point on the curved screen `angle` to the right, `y` up, facing the axis.
     let at = |angle: f32, y: f32| -> xr::Posef {
         let p = add(
-            placement.pivot,
+            axis,
             add(
                 add(scale(right, r * angle.sin()), scale(up, y)),
                 scale(normal, -r * angle.cos()),
@@ -705,7 +718,9 @@ fn video_hit(
     let (w, h) = (screen[0], screen[1]);
     let p = match projection {
         Projection::Flat if placement.curved => {
-            let radius = placement.distance;
+            // Relative to the cylinder's axis, behind the pivot for a gentle curve.
+            let radius = placement.curve_radius();
+            let o = [o[0], o[1], o[2] - (radius - placement.distance)];
             let a = d[0] * d[0] + d[2] * d[2];
             let b = 2.0 * (o[0] * d[0] + o[2] * d[2]);
             let c = o[0] * o[0] + o[2] * o[2] - radius * radius;
@@ -716,7 +731,11 @@ fn video_hit(
             let t = (-b + disc.sqrt()) / (2.0 * a);
             let p = add(o, scale(d, t));
             let arc = p[0].atan2(-p[2]) * radius;
-            (p[2] < 0.0 && arc.abs() <= w / 2.0 && p[1].abs() <= h / 2.0).then_some(p)?
+            (p[2] < 0.0 && arc.abs() <= w / 2.0 && p[1].abs() <= h / 2.0).then_some([
+                p[0],
+                p[1],
+                p[2] + (radius - placement.distance),
+            ])?
         }
         Projection::Flat => {
             if d[2] > -1e-4 {
@@ -866,6 +885,10 @@ pub fn run(
     let mut resume_saved_at = Instant::now();
     let mut screenshot = options.play.screenshot.clone();
     let mut placement = Placement::new(&options.view);
+    placement.curve = crate::config::curvature();
+    // The browser panel's width (a multiple of its usual size), as shown:
+    // the saved choice, or the one pointed at in its dialog.
+    let mut browser_width = crate::config::browser_width();
     // The VR180/360 control bar, once opened; dragged by its handle.
     let mut bar_place: Option<Placement> = None;
     let mut bar_press: Option<Press> = None;
@@ -1059,6 +1082,7 @@ pub fn run(
                     // don't carry over.
                     placement = Placement {
                         curved: placement.curved,
+                        curve: placement.curve,
                         pivot: head_position(&views),
                         ..Placement::new(&options.view)
                     };
@@ -1068,7 +1092,7 @@ pub fn run(
                         .end(state.predicted_display_time, ctx.blend_mode, &[])?;
                     continue;
                 }
-                let browser_at = browser_panel(&browser_place);
+                let browser_at = browser_panel(&browser_place, browser_width);
                 let handle_at = handle_panel(&browser_at, false);
                 let point = ray.and_then(|r| browser_at.hit(r));
                 let on_handle = ray.and_then(|r| handle_at.hit(r));
@@ -1134,6 +1158,35 @@ pub fn run(
                 let hit = point.map_or(browser::Hit::Nothing, |(x, y)| {
                     browser::hit(nav.view(), &mut fonts, x, y)
                 });
+                // The settings dialogs preview the choice pointed at: the
+                // browser's width on the panel itself, the screen curvature
+                // as an outline bent around the panel. The next video
+                // opens with the saved curvature.
+                placement.curve = nav.curvature();
+                browser_width = nav.browser_width();
+                outlines.clear();
+                match nav.preview(hit) {
+                    Some(crate::ui::navigator::Preview::BrowserWidth(w)) => browser_width = w,
+                    Some(crate::ui::navigator::Preview::Curvature(c)) => {
+                        let sample = Placement {
+                            distance: CURVE_PREVIEW_DISTANCE,
+                            curved: true,
+                            curve: c,
+                            zoom: 1.0,
+                            offset: 0.0,
+                            ..browser_place
+                        };
+                        let w = CURVE_PREVIEW_SCALE * BROWSER_SIZE[0] * CURVE_PREVIEW_DISTANCE
+                            / BROWSER_DISTANCE;
+                        let screen = [w, w * 9.0 / 16.0];
+                        outlines.extend(
+                            screen_outline(&sample, screen, 0.004 * CURVE_PREVIEW_DISTANCE)
+                                .into_iter()
+                                .map(|l| (false, l)),
+                        );
+                    }
+                    None => {}
+                }
                 if buttons.select[active_hand]
                     && browser_press.is_none()
                     && press.is_none()
@@ -1670,6 +1723,7 @@ pub fn run(
                     // Ahead of the head, wherever it is now; the VR bar too.
                     placement = Placement {
                         curved: placement.curved,
+                        curve: placement.curve,
                         pivot: head_position(&views),
                         ..Placement::new(&options.view)
                     };
@@ -1876,8 +1930,12 @@ pub fn run(
         };
         match &mode {
             Mode::Browser => {
-                let browser_at = browser_panel(&browser_place);
+                let browser_at = browser_panel(&browser_place, browser_width);
                 if let Some(target) = browser_target.as_ref().filter(|t| t.ready) {
+                    // The curvature preview's outline, behind the panel.
+                    for (_, (pose, size)) in &outlines {
+                        overlays.push(Overlay::quad(&screen_line, *pose, *size, true));
+                    }
                     overlays.push(Overlay::quad(
                         target,
                         browser_at.pose(),
@@ -2116,6 +2174,7 @@ mod tests {
             pitch: 0.0,
             distance: 3.0,
             curved: true,
+            curve: 1.0,
             zoom: 1.0,
             offset: 0.0,
             pivot: [0.0; 3],
@@ -2130,6 +2189,43 @@ mod tests {
             let towards = [-p[0] / horizontal, 0.0, -p[2] / horizontal];
             assert!(dot(n, towards) > 0.999, "{n:?} vs {towards:?}");
         }
+        // A gentler curve: a 6 m cylinder whose axis is 3 m behind the
+        // viewer, the screen's centre still 3 m ahead.
+        let gentle = Placement {
+            curve: 0.5,
+            ..placement
+        };
+        let r = gentle.rotation();
+        let forward = [-r[2][0], -r[2][1], -r[2][2]];
+        let axis = scale(forward, -3.0);
+        let lines = screen_outline(&gentle, [4.0, 2.25], 0.01);
+        let (mut nearest, mut farthest) = (f32::MAX, 0.0f32);
+        for (pose, _) in &lines {
+            let p = [pose.position.x, pose.position.y, pose.position.z];
+            let off = [p[0] - axis[0], 0.0, p[2] - axis[2]];
+            assert!(
+                (dot(off, off).sqrt() - 6.0).abs() < 1e-3,
+                "on the arc: {p:?}"
+            );
+            nearest = nearest.min(dot(p, forward));
+            farthest = farthest.max(dot(p, forward));
+        }
+        let hit = video_hit(
+            &Ray {
+                origin: [0.0; 3],
+                direction: forward,
+            },
+            &gentle,
+            Projection::Flat,
+            [4.0, 2.25],
+        )
+        .expect("ahead");
+        assert!((dot(hit, forward) - 3.0).abs() < 1e-3, "{hit:?}");
+        // The edges bend towards the viewer; the centre is the farthest point.
+        assert!(
+            farthest <= 3.0 + 1e-3 && nearest < 2.9,
+            "{nearest}..{farthest}"
+        );
     }
 
     #[test]
@@ -2145,6 +2241,7 @@ mod tests {
                 pitch,
                 distance: 3.0,
                 curved,
+                curve: 1.0,
                 zoom,
                 offset: 0.0,
                 pivot: [0.0; 3],
@@ -2240,7 +2337,8 @@ mod tests {
                 } else if let Some(p) = video_hit(&ray, placement, Projection::Flat, screen) {
                     let local = [0, 1, 2].map(|i| (0..3).map(|k| r[i][k] * p[k]).sum::<f32>());
                     let u = if placement.curved {
-                        local[0].atan2(-local[2]) * placement.distance
+                        let r = placement.curve_radius();
+                        local[0].atan2(-(local[2] - (r - placement.distance))) * r
                     } else {
                         local[0]
                     };
@@ -2318,21 +2416,32 @@ mod tests {
         let caption =
             captions::render(&crate::subtitles::Caption::text(SAMPLE_CAPTION), &mut fonts);
         let options = ViewOptions::default();
-        for (name, yaw, pitch, curved, zoom, turns, look) in [
-            ("flat", 0.0, 0.0, false, 1.0, 0, (0.0, -0.2)),
-            ("flat-zoomed", 0.0, 0.0, false, 2.0, 0, (0.0, -0.3)),
-            ("flat-small", 0.0, 0.0, false, 0.5, 0, (0.0, -0.1)),
-            ("curved", 0.0, 0.0, true, 1.0, 0, (0.0, -0.2)),
-            ("curved-wide", 0.0, 0.0, true, 2.0, 0, (0.0, -0.3)),
-            ("raised", 0.3, 0.5, false, 1.0, 0, (0.3, 0.3)),
-            ("rotated", 0.0, 0.0, false, 1.0, 1, (0.0, -0.2)),
-            ("rotated-smallest", 0.0, 0.0, false, 0.25, 1, (0.0, -0.1)),
+        for (name, yaw, pitch, curved, curve, zoom, turns, look) in [
+            ("flat", 0.0, 0.0, false, 1.0, 1.0, 0, (0.0, -0.2)),
+            ("flat-zoomed", 0.0, 0.0, false, 1.0, 2.0, 0, (0.0, -0.3)),
+            ("flat-small", 0.0, 0.0, false, 1.0, 0.5, 0, (0.0, -0.1)),
+            ("curved", 0.0, 0.0, true, 1.0, 1.0, 0, (0.0, -0.2)),
+            ("curved-wide", 0.0, 0.0, true, 1.0, 2.0, 0, (0.0, -0.3)),
+            ("curved-gentle", 0.0, 0.0, true, 0.25, 2.0, 0, (0.0, -0.3)),
+            ("raised", 0.3, 0.5, false, 1.0, 1.0, 0, (0.3, 0.3)),
+            ("rotated", 0.0, 0.0, false, 1.0, 1.0, 1, (0.0, -0.2)),
+            (
+                "rotated-smallest",
+                0.0,
+                0.0,
+                false,
+                1.0,
+                0.25,
+                1,
+                (0.0, -0.1),
+            ),
         ] {
             let placement = Placement {
                 yaw,
                 pitch,
                 distance: options.screen_distance,
                 curved,
+                curve,
                 zoom,
                 offset: 0.0,
                 pivot: [0.0; 3],
@@ -2388,6 +2497,7 @@ mod tests {
             pitch: 0.1,
             distance: 3.0,
             curved: true,
+            curve: 1.0,
             zoom: 1.0,
             offset: 0.0,
             pivot: [0.0, -0.5, 0.2],
@@ -2423,6 +2533,23 @@ mod tests {
             dot(off, up).abs() > dot(off, off).sqrt() * 0.999,
             "along up"
         );
+        // A gentler curve: the axis moves behind the pivot, along the normal.
+        let gentle = Placement {
+            curve: 0.5,
+            ..placement
+        };
+        let panel = caption_panel(&gentle, Projection::Flat, screen, Default::default());
+        let (pose, shape) = caption_cylinder(&gentle, &panel);
+        let Shape::Cylinder { radius, .. } = shape else {
+            panic!("{shape:?}")
+        };
+        assert!((radius - 5.98).abs() < 1e-4);
+        let [_, up, normal] = panel.basis();
+        let p = [pose.position.x, pose.position.y, pose.position.z];
+        let off = [0, 1, 2].map(|i| p[i] - gentle.pivot[i]);
+        assert!((dot(off, normal) - 3.0).abs() < 1e-3, "3 m behind: {off:?}");
+        let sideways = dot(off, off) - dot(off, up).powi(2) - dot(off, normal).powi(2);
+        assert!(sideways.abs() < 1e-3);
     }
 
     #[test]
@@ -2465,7 +2592,7 @@ mod tests {
         let mut place = browser_placement([0.0, 1.6, 0.0]);
         place.yaw = 0.5;
         place.distance = 3.3;
-        let panel = browser_panel(&place);
+        let panel = browser_panel(&place, 1.0);
         // Apparent size is kept: 1.5x the distance, 1.5x the size.
         assert!((panel.size[0] - BROWSER_SIZE[0] * 1.5).abs() < 1e-3);
         let handle = handle_panel(&panel, false);

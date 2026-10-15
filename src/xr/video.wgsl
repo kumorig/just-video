@@ -13,7 +13,8 @@ struct Eye {
     // xyz: eye position in the reference space; w: eye index (0 left, 1 right).
     origin: vec4<f32>,
     // x: projection (0 flat, 1 equirect 180, 2 equirect 360, 3 fisheye, 4 curved screen),
-    // y: stereo (0 mono, 1 side-by-side, 2 top-bottom), z: unused, w: fisheye FOV (rad).
+    // y: stereo (0 mono, 1 side-by-side, 2 top-bottom), z: curved screen radius (m),
+    // w: fisheye FOV (rad).
     mode: vec4<f32>,
     // Flat screen: x width, y height, z distance, w center height (metres).
     // Spherical video: w is the viewpoint's offset along -Z inside the
@@ -74,15 +75,18 @@ fn project(origin: vec3<f32>, d: vec3<f32>) -> vec3<f32> {
         return vec3<f32>(uv, select(-1.0, rect_inside(uv), d.z < -1e-4));
     }
     if kind == 4u {
-        // Curved screen: a cylinder of radius `screen.z` around the viewer,
-        // `screen.x` metres of arc wide. Rays start inside it: take the far hit.
-        let r = eye.screen.z;
+        // Curved screen: a cylinder of radius `mode.z`, `screen.x` metres of
+        // arc wide, its centre `screen.z` ahead; a gentle curve has a wide
+        // cylinder whose axis lies behind the viewer. Rays start inside
+        // it: take the far hit.
+        let r = eye.mode.z;
+        let o = origin - vec3<f32>(0.0, 0.0, r - eye.screen.z);
         let a = max(d.x * d.x + d.z * d.z, 1e-6);
-        let b = 2.0 * (origin.x * d.x + origin.z * d.z);
-        let c = origin.x * origin.x + origin.z * origin.z - r * r;
+        let b = 2.0 * (o.x * d.x + o.z * d.z);
+        let c = o.x * o.x + o.z * o.z - r * r;
         let disc = max(b * b - 4.0 * a * c, 0.0);
         let t = (-b + sqrt(disc)) / (2.0 * a);
-        let p = origin + t * d;
+        let p = o + t * d;
         let arc = atan2(p.x, -p.z) * r;
         let uv = vec2<f32>(arc / eye.screen.x + 0.5, 0.5 - (p.y - eye.screen.w) / eye.screen.y);
         return vec3<f32>(uv, select(-1.0, rect_inside(uv), p.z < 0.0));

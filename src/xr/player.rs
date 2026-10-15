@@ -48,6 +48,10 @@ pub struct Placement {
     /// Flat/curved screen distance in metres.
     pub distance: f32,
     pub curved: bool,
+    /// How much a curved screen bends: 1 wraps it around the viewer (the
+    /// cylinder's axis through the pivot), less is gentler (a wider
+    /// cylinder, its axis behind the viewer); see `curve_radius`.
+    pub curve: f32,
     /// Size multiplier: screen width for flat/curved, magnification for VR180/360.
     pub zoom: f32,
     /// VR180/360: the viewpoint moved along the placement's -Z towards the
@@ -75,10 +79,17 @@ impl Placement {
             pitch: 0.0,
             distance: options.screen_distance,
             curved: false,
+            curve: 1.0,
             zoom: 1.0,
             offset: 0.0,
             pivot: [0.0; 3],
         }
+    }
+
+    /// Radius of the curved screen's cylinder; its centre stays `distance`
+    /// away, so the axis is `curve_radius() - distance` behind the pivot.
+    pub fn curve_radius(&self) -> f32 {
+        self.distance / self.curve.clamp(0.05, 1.0)
     }
 
     /// Where the flat screen's centre is.
@@ -147,6 +158,7 @@ mod tests {
             pitch: 0.2,
             distance: 3.0,
             curved: false,
+            curve: 1.0,
             zoom: 1.0,
             offset: 0.0,
             pivot: [0.0; 3],
@@ -214,6 +226,7 @@ mod tests {
             pitch: 0.0,
             distance: 3.0,
             curved: false,
+            curve: 1.0,
             zoom: 1.0,
             offset: 0.0,
             pivot: [0.0; 3],
@@ -1268,7 +1281,11 @@ pub fn eye_params(
                 Stereo::SideBySide => 1.0,
                 Stereo::TopBottom => 2.0,
             },
-            0.0,
+            if curved {
+                placement.curve_radius()
+            } else {
+                0.0
+            },
             options.fisheye_fov.to_radians(),
         ],
         screen: [

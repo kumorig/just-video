@@ -54,8 +54,14 @@ enum Location {
 enum Item {
     Server(Server),
     AddServer,
+    /// The settings section: click to show or hide the rows below.
+    Settings,
     /// How much to buffer ahead while paused; opens a dialog of presets.
     BufferSize,
+    /// How much a curved video screen bends; a dialog of presets.
+    Curvature,
+    /// The browser panel's width; a dialog of presets.
+    BrowserWidth,
     Share(String),
     Dir(String),
     Video {
@@ -73,11 +79,18 @@ enum Item {
     },
 }
 
+/// The rows under Settings, in order.
+const SETTINGS: [Item; 3] = [Item::BufferSize, Item::Curvature, Item::BrowserWidth];
+
 impl Item {
     fn name(&self) -> &str {
         match self {
             Item::Server(s) => &s.name,
-            Item::AddServer | Item::BufferSize => "",
+            Item::AddServer
+            | Item::Settings
+            | Item::BufferSize
+            | Item::Curvature
+            | Item::BrowserWidth => "",
             Item::Share(n)
             | Item::Dir(n)
             | Item::Video { name: n, .. }
@@ -134,7 +147,18 @@ enum Purpose {
     Delete(Vec<usize>),
     /// Choosing a buffer size; the buttons are [`config::RESERVE_PRESETS`].
     BufferSize,
+    /// Choosing from [`config::CURVATURE_PRESETS`] / [`config::BROWSER_WIDTH_PRESETS`].
+    Curvature,
+    BrowserWidth,
     Info,
+}
+
+/// What the open settings dialog shows, to be previewed as the pointer
+/// moves over its choices.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Preview {
+    Curvature(f32),
+    BrowserWidth(f32),
 }
 
 pub struct Navigator {
@@ -177,6 +201,11 @@ pub struct Navigator {
     exit_requested: bool,
     /// Text copied in a form, kept for pasting into the next.
     clipboard: String,
+    /// The settings section on the top page is open.
+    settings_open: bool,
+    /// Settings read once and kept up to date here.
+    curvature: f32,
+    browser_width: f32,
     /// Where the playing video is, for fetching its subtitle files.
     playing_source: Option<(Server, String)>,
     /// The subtitle fetch awaited (request id, track) and its answer.
@@ -211,6 +240,9 @@ impl Navigator {
             dirty: true,
             exit_requested: false,
             clipboard: String::new(),
+            settings_open: false,
+            curvature: config::curvature(),
+            browser_width: config::browser_width(),
             playing_source: None,
             subtitle_request: None,
             subtitle_result: None,
@@ -365,9 +397,58 @@ impl Navigator {
         });
         self.items = servers.into_iter().map(Item::Server).collect();
         self.items.push(Item::AddServer);
-        self.items.push(Item::BufferSize);
+        self.items.push(Item::Settings);
+        if self.settings_open {
+            self.items.extend(SETTINGS);
+        }
         self.restore_scroll();
         self.rebuild_rows();
+    }
+
+    /// Opens or closes the settings section on the top page.
+    fn toggle_settings(&mut self) {
+        self.settings_open = !self.settings_open;
+        if let Some(at) = self.items.iter().position(|i| matches!(i, Item::Settings)) {
+            self.items.truncate(at + 1);
+            if self.settings_open {
+                self.items.extend(SETTINGS);
+            }
+        }
+        self.rebuild_rows();
+        self.dirty = true;
+    }
+
+    /// How much a curved video screen bends (see [`config::curvature`]).
+    pub fn curvature(&self) -> f32 {
+        self.curvature
+    }
+
+    /// The browser panel's width, as a multiple of its usual width.
+    pub fn browser_width(&self) -> f32 {
+        self.browser_width
+    }
+
+    /// What a settings dialog previews, given what the pointer is on: the
+    /// choice pointed at, otherwise the saved one.
+    pub fn preview(&self, hover: Hit) -> Option<Preview> {
+        self.view.dialog.as_ref()?;
+        let pointed = match hover {
+            Hit::DialogButton(k) => Some(k),
+            _ => None,
+        };
+        match &self.purpose {
+            Some(Purpose::Curvature) => Some(Preview::Curvature(
+                pointed
+                    .and_then(|k| config::CURVATURE_PRESETS.get(k))
+                    .map_or(self.curvature, |p| p.1),
+            )),
+            Some(Purpose::BrowserWidth) => Some(Preview::BrowserWidth(
+                pointed
+                    .and_then(|k| config::BROWSER_WIDTH_PRESETS.get(k).copied())
+                    .unwrap_or(self.browser_width),
+            )),
+            _ => None,
+        }
     }
 
     fn navigate(&mut self, location: Location) {
@@ -418,6 +499,8 @@ impl Navigator {
     fn rebuild_rows(&mut self) {
         let editing = self.editing();
         let selecting = self.selecting.as_ref();
+        let (settings_open, curvature, browser_width) =
+            (self.settings_open, self.curvature, self.browser_width);
         self.view.rows = self
             .items
             .iter()
@@ -437,14 +520,38 @@ impl Navigator {
                         detail: "A Windows PC, NAS or Samba server on your network".into(),
                         ..Row::new(Icon::Add, "Add server")
                     },
+                    Item::Settings => Row {
+                        detail: "Buffer ahead, screen curvature, browser width".into(),
+                        ..Row::new(Icon::Chevron(settings_open), "Settings")
+                    },
                     Item::BufferSize => Row {
                         detail: "Fetched while paused, to play on without the network".into(),
+                        inset: true,
                         ..Row::new(
                             Icon::Buffer,
                             format!(
                                 "Buffer ahead: {}",
                                 crate::ui::controls::format_size(config::reserve_bytes())
                             ),
+                        )
+                    },
+                    Item::Curvature => Row {
+                        detail: "How much a curved video screen bends around you".into(),
+                        inset: true,
+                        ..Row::new(
+                            Icon::Curve,
+                            format!(
+                                "Screen curvature: {}",
+                                config::CURVATURE_PRESETS[config::curvature_preset(curvature)].0
+                            ),
+                        )
+                    },
+                    Item::BrowserWidth => Row {
+                        detail: "How wide this window is".into(),
+                        inset: true,
+                        ..Row::new(
+                            Icon::Width,
+                            format!("Browser width: {}", config::percent(browser_width)),
                         )
                     },
                     Item::Share(name) => Row::new(Icon::Share, name),
@@ -1159,6 +1266,42 @@ impl Navigator {
                 self.purpose = Some(Purpose::BufferSize);
                 self.dirty = true;
             }
+            (Item::Settings, _) => self.toggle_settings(),
+            (Item::Curvature, _) => {
+                self.view.dialog = Some(Dialog {
+                    title: "Screen curvature".into(),
+                    body: vec![
+                        "How much a curved video screen bends around you. The outline shows the choice you point at."
+                            .into(),
+                    ],
+                    buttons: config::CURVATURE_PRESETS
+                        .iter()
+                        .map(|(name, _)| name.to_string())
+                        .collect(),
+                    danger: false,
+                    choice: Some(config::curvature_preset(self.curvature)),
+                });
+                self.purpose = Some(Purpose::Curvature);
+                self.dirty = true;
+            }
+            (Item::BrowserWidth, _) => {
+                self.view.dialog = Some(Dialog {
+                    title: "Browser width".into(),
+                    body: vec![
+                        "How wide this window is. It follows the choice you point at.".into(),
+                    ],
+                    buttons: config::BROWSER_WIDTH_PRESETS
+                        .iter()
+                        .map(|&w| config::percent(w))
+                        .collect(),
+                    danger: false,
+                    choice: config::BROWSER_WIDTH_PRESETS
+                        .iter()
+                        .position(|&w| w == self.browser_width),
+                });
+                self.purpose = Some(Purpose::BrowserWidth);
+                self.dirty = true;
+            }
             (Item::Share(name), Location::Shares { server }) => self.navigate(Location::Folder {
                 server,
                 share: name.clone(),
@@ -1317,14 +1460,37 @@ impl Navigator {
         self.view.dialog = None;
         self.dirty = true;
         let purpose = self.purpose.take();
-        if let Some(Purpose::BufferSize) = purpose {
-            if let Some(&bytes) = config::RESERVE_PRESETS.get(button)
-                && let Err(e) = config::save_reserve_bytes(bytes)
-            {
-                eprintln!("Can't save the buffer size: {e:#}");
+        match &purpose {
+            Some(Purpose::BufferSize) => {
+                if let Some(&bytes) = config::RESERVE_PRESETS.get(button)
+                    && let Err(e) = config::save_reserve_bytes(bytes)
+                {
+                    eprintln!("Can't save the buffer size: {e:#}");
+                }
+                self.rebuild_rows();
+                return;
             }
-            self.rebuild_rows();
-            return;
+            Some(Purpose::Curvature) => {
+                if let Some(&(_, curvature)) = config::CURVATURE_PRESETS.get(button) {
+                    self.curvature = curvature;
+                    if let Err(e) = config::save_curvature(curvature) {
+                        eprintln!("Can't save the curvature: {e:#}");
+                    }
+                }
+                self.rebuild_rows();
+                return;
+            }
+            Some(Purpose::BrowserWidth) => {
+                if let Some(&width) = config::BROWSER_WIDTH_PRESETS.get(button) {
+                    self.browser_width = width;
+                    if let Err(e) = config::save_browser_width(width) {
+                        eprintln!("Can't save the browser width: {e:#}");
+                    }
+                }
+                self.rebuild_rows();
+                return;
+            }
+            _ => {}
         }
         if !confirmed {
             return;
@@ -1800,10 +1966,48 @@ mod tests {
     }
 
     #[test]
+    fn settings_row_expands_into_inset_children() {
+        let mut nav = Navigator::new(Library::start(None));
+        let last = nav.view().rows.len() - 1;
+        nav.click(Hit::Row(last));
+        let icons: Vec<Icon> = nav.view().rows.iter().map(|r| r.icon.clone()).collect();
+        assert_eq!(
+            &icons[last..],
+            [Icon::Chevron(true), Icon::Buffer, Icon::Curve, Icon::Width]
+        );
+        assert!(!nav.view().rows[last].inset);
+        assert!(nav.view().rows[last + 1..].iter().all(|r| r.inset));
+        // The curvature dialog previews the choice pointed at, else the saved one.
+        nav.click(Hit::Row(last + 2));
+        assert_eq!(
+            nav.view().dialog.as_ref().map(|d| d.title.as_str()),
+            Some("Screen curvature")
+        );
+        assert_eq!(
+            nav.preview(Hit::DialogButton(0)),
+            Some(Preview::Curvature(0.25))
+        );
+        assert_eq!(
+            nav.preview(Hit::Nothing),
+            Some(Preview::Curvature(nav.curvature()))
+        );
+        nav.back();
+        assert_eq!(nav.preview(Hit::Nothing), None);
+        nav.click(Hit::Row(last + 3));
+        assert_eq!(
+            nav.preview(Hit::DialogButton(0)),
+            Some(Preview::BrowserWidth(0.5))
+        );
+        nav.back();
+        nav.click(Hit::Row(last));
+        assert_eq!(nav.view().rows.len(), last + 1, "closed again");
+    }
+
+    #[test]
     fn server_list_offers_adding_one_and_exiting() {
         let mut nav = Navigator::new(Library::start(None));
         let icons: Vec<Icon> = nav.view().rows.iter().map(|r| r.icon.clone()).collect();
-        assert_eq!(&icons[icons.len() - 2..], [Icon::Add, Icon::Buffer]);
+        assert_eq!(&icons[icons.len() - 2..], [Icon::Add, Icon::Chevron(false)]);
         assert_eq!(nav.view().crumbs, vec!["Just Video".to_string()]);
         assert_eq!(nav.view().tools.len(), 1, "the exit button, top right");
         assert!(!nav.take_exit());

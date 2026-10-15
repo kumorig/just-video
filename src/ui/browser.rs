@@ -54,6 +54,12 @@ pub enum Icon {
     Add,
     /// Buffering ahead: an arrow into a tray, as on the player's button.
     Buffer,
+    /// A section that opens (true) and closes.
+    Chevron(bool),
+    /// A curved screen, seen from above.
+    Curve,
+    /// Width: a double-headed arrow.
+    Width,
     /// Close the app.
     Exit,
 }
@@ -104,6 +110,8 @@ pub struct Row {
     pub outlined: bool,
     /// How much of a video was watched (a line along the row's foot).
     pub progress: Option<f32>,
+    /// Indented: part of the section above it.
+    pub inset: bool,
 }
 
 impl Row {
@@ -118,6 +126,7 @@ impl Row {
             dimmed: false,
             outlined: false,
             progress: None,
+            inset: false,
         }
     }
 }
@@ -382,9 +391,18 @@ fn crumb_limit(view: &View, fonts: &mut Fonts) -> f32 {
     ((crumb_right(view, fonts) - PAD) / 3.0).max(160.0)
 }
 
+/// How far an inset row is indented.
+const INSET: f32 = 64.0;
+
 fn row_rect(view: &View, i: usize) -> Rect {
     let y = HEADER + (i as f32 - view.scroll) * ROW;
-    (PAD, y + 4.0, WIDTH as f32 - 2.0 * PAD - SCROLL_W, ROW - 8.0)
+    let inset = if view.rows[i].inset { INSET } else { 0.0 };
+    (
+        PAD + inset,
+        y + 4.0,
+        WIDTH as f32 - 2.0 * PAD - SCROLL_W - inset,
+        ROW - 8.0,
+    )
 }
 
 /// The `k`th action button of row `i`.
@@ -514,6 +532,56 @@ fn draw_icon(canvas: &mut Canvas, icon: &Icon, cx: f32, cy: f32) {
             canvas.rect(cx + 13.0, cy + 6.0, 5.0, 12.0, 2.0, ACCENT);
             canvas.rect(cx - 18.0, cy + 14.0, 36.0, 5.0, 2.0, ACCENT);
         }
+        Icon::Chevron(open) => {
+            // A triangle from strips: pointing right (closed) or down (open).
+            for i in 0..24 {
+                let t = i as f32;
+                let half = 11.0 * (1.0 - t / 24.0);
+                if *open {
+                    canvas.rect(cx - half, cy - 6.0 + t, half * 2.0, 1.5, 0.0, SUBTLE);
+                } else {
+                    canvas.rect(cx - 6.0 + t, cy - half, 1.5, half * 2.0, 0.0, SUBTLE);
+                }
+            }
+        }
+        Icon::Curve => {
+            // A screen bent around the viewer (the dot), seen from above.
+            let steps = 32;
+            for i in 0..=steps {
+                let a = (i as f32 / steps as f32 - 0.5) * 1.6;
+                canvas.rect(
+                    cx + 22.0 * a.sin() - 2.5,
+                    cy - 2.0 - 22.0 * a.cos() + 14.0,
+                    5.0,
+                    5.0,
+                    2.0,
+                    ACCENT,
+                );
+            }
+            canvas.circle(cx, cy + 14.0, 5.0, SUBTLE);
+        }
+        Icon::Width => {
+            canvas.rect(cx - 20.0, cy - 2.5, 40.0, 5.0, 2.0, ACCENT);
+            for i in 0..12 {
+                let t = i as f32;
+                canvas.rect(
+                    cx - 20.0 + t,
+                    cy - 12.0 + t,
+                    1.5,
+                    24.0 - 2.0 * t,
+                    0.0,
+                    ACCENT,
+                );
+                canvas.rect(
+                    cx + 19.0 - t,
+                    cy - 12.0 + t,
+                    1.5,
+                    24.0 - 2.0 * t,
+                    0.0,
+                    ACCENT,
+                );
+            }
+        }
         Icon::Exit => {
             // A power symbol: a ring open at the top with a bar through the gap.
             // (Drawn on the header's tool button, so the gap takes its fill.)
@@ -605,7 +673,7 @@ pub fn render(
                 canvas.rect(rx - 3.0, ry - 3.0, rw + 6.0, rh + 6.0, 17.0, ACCENT);
             }
             canvas.rect(rx, ry, rw, rh, 14.0, if hovered { HOVER } else { ROW_BG });
-            let (icon_x, icon_y) = (PAD + 48.0, ry - 4.0 + ROW / 2.0);
+            let (icon_x, icon_y) = (rx + 48.0, ry - 4.0 + ROW / 2.0);
             match row.checked {
                 Some(checked) => draw_checkbox(&mut canvas, icon_x, icon_y, checked),
                 None => draw_icon(&mut canvas, &row.icon, icon_x, icon_y),
@@ -650,12 +718,12 @@ pub fn render(
             } else {
                 fonts.measure(&row.right, 28.0) + 24.0
             };
-            let text_w = right_edge - right_w - (PAD + 96.0);
+            let text_w = right_edge - right_w - (rx + 96.0);
             if row.detail.is_empty() {
                 fonts.draw(
                     &mut canvas,
                     &row.label,
-                    PAD + 96.0,
+                    rx + 96.0,
                     ry + 52.0,
                     36.0,
                     label_color,
@@ -665,7 +733,7 @@ pub fn render(
                 fonts.draw(
                     &mut canvas,
                     &row.label,
-                    PAD + 96.0,
+                    rx + 96.0,
                     ry + 38.0,
                     34.0,
                     label_color,
@@ -674,7 +742,7 @@ pub fn render(
                 fonts.draw(
                     &mut canvas,
                     &row.detail,
-                    PAD + 96.0,
+                    rx + 96.0,
                     ry + 70.0,
                     24.0,
                     detail_color,
@@ -694,7 +762,7 @@ pub fn render(
             }
             // Where a video was left: a line along the row's foot.
             if let Some(progress) = row.progress {
-                let (px, pw) = (PAD + 96.0, right_edge - (PAD + 96.0));
+                let (px, pw) = (rx + 96.0, right_edge - (rx + 96.0));
                 canvas.rect(px, ry + rh - 5.0, pw, 3.0, 1.5, [0x3a, 0x42, 0x50]);
                 canvas.rect(
                     px,

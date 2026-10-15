@@ -901,8 +901,23 @@ fn main() -> anyhow::Result<()> {
                         ..Row::new(Icon::Add, "Add server")
                     },
                     Row {
+                        detail: "Buffer ahead, screen curvature, browser width".into(),
+                        ..Row::new(Icon::Chevron(true), "Settings")
+                    },
+                    Row {
                         detail: "Fetched while paused, to play on without the network".into(),
+                        inset: true,
                         ..Row::new(Icon::Buffer, "Buffer ahead: 1 GB")
+                    },
+                    Row {
+                        detail: "How much a curved video screen bends around you".into(),
+                        inset: true,
+                        ..Row::new(Icon::Curve, "Screen curvature: Medium")
+                    },
+                    Row {
+                        detail: "How wide this window is".into(),
+                        inset: true,
+                        ..Row::new(Icon::Width, "Browser width: 100%")
                     },
                 ],
                 tools: vec![Tool::icon(Icon::Exit)],
@@ -988,6 +1003,24 @@ fn main() -> anyhow::Result<()> {
             just_video::ui::save_png(
                 &render(&presets, &mut fonts, Some((1000.0, 700.0)), true),
                 &dir.join("dialog-buffer.png"),
+            )?;
+            let mut curvature = servers.clone();
+            curvature.dialog = Some(Dialog {
+                title: "Screen curvature".into(),
+                body: vec![
+                    "How much a curved video screen bends around you. The outline shows the choice you point at."
+                        .into(),
+                ],
+                buttons: just_video::config::CURVATURE_PRESETS
+                    .iter()
+                    .map(|(name, _)| name.to_string())
+                    .collect(),
+                danger: false,
+                choice: Some(3),
+            });
+            just_video::ui::save_png(
+                &render(&curvature, &mut fonts, Some((600.0, 700.0)), true),
+                &dir.join("dialog-curvature.png"),
             )?;
             use just_video::ui::controls;
             let state = controls::State {

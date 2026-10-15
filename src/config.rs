@@ -292,6 +292,64 @@ struct Settings {
     /// Whether the control bar shows the buffer-ahead button.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     buffer_button: Option<bool>,
+    /// How much a curved screen bends: 1 wraps around the viewer, less is gentler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    curvature: Option<f32>,
+    /// The browser panel's width, as a multiple of its usual width.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    browser_width: Option<f32>,
+}
+
+/// Choices for how much a curved screen bends: name and the fraction of
+/// the full curve (a cylinder around the viewer).
+pub const CURVATURE_PRESETS: [(&str, f32); 4] = [
+    ("Slight", 0.25),
+    ("Medium", 0.5),
+    ("Strong", 0.75),
+    ("Full", 1.0),
+];
+
+pub fn curvature() -> f32 {
+    read_json::<Settings>("settings.json")
+        .ok()
+        .and_then(|s| s.curvature)
+        .map_or(1.0, |c| c.clamp(0.05, 1.0))
+}
+
+pub fn save_curvature(curvature: f32) -> anyhow::Result<()> {
+    let mut settings: Settings = read_json("settings.json")?;
+    settings.curvature = Some(curvature);
+    write_json("settings.json", &settings, false)
+}
+
+/// The preset nearest to `curvature` (index into [`CURVATURE_PRESETS`]).
+pub fn curvature_preset(curvature: f32) -> usize {
+    CURVATURE_PRESETS
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| (a.1 - curvature).abs().total_cmp(&(b.1 - curvature).abs()))
+        .map_or(0, |(i, _)| i)
+}
+
+/// Choices for the browser panel's width (multiples of the usual width).
+pub const BROWSER_WIDTH_PRESETS: [f32; 4] = [0.5, 0.75, 1.0, 1.25];
+
+pub fn browser_width() -> f32 {
+    read_json::<Settings>("settings.json")
+        .ok()
+        .and_then(|s| s.browser_width)
+        .map_or(1.0, |w| w.clamp(0.5, 1.25))
+}
+
+pub fn save_browser_width(width: f32) -> anyhow::Result<()> {
+    let mut settings: Settings = read_json("settings.json")?;
+    settings.browser_width = Some(width);
+    write_json("settings.json", &settings, false)
+}
+
+/// "75%".
+pub fn percent(fraction: f32) -> String {
+    format!("{}%", (fraction * 100.0).round())
 }
 
 pub fn buffer_button() -> bool {
