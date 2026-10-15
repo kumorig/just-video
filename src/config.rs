@@ -19,7 +19,27 @@ pub struct Server {
     pub url: String,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Per-test config directory, so tests never touch the real one (and
+    /// don't race each other through `XDG_CONFIG_HOME`).
+    static TEST_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Points this test thread's config at a fresh temporary directory.
+#[cfg(test)]
+pub(crate) fn temp_config(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("jv-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    TEST_DIR.with(|d| *d.borrow_mut() = Some(dir.clone()));
+    dir
+}
+
 pub fn dir() -> anyhow::Result<PathBuf> {
+    #[cfg(test)]
+    if let Some(dir) = TEST_DIR.with(|d| d.borrow().clone()) {
+        return Ok(dir);
+    }
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
@@ -474,9 +494,8 @@ mod tests {
 
     #[test]
     fn round_trip_with_private_credentials() {
-        let dir = std::env::temp_dir().join(format!("jv-config-{}", std::process::id()));
-        // SAFETY: single-threaded within this test; other tests don't read XDG_CONFIG_HOME.
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+        // Not through XDG_CONFIG_HOME: tests on other threads read it.
+        let dir = temp_config("config");
         let server = Server {
             name: "PC".into(),
             url: "smb://alice@192.168.1.10".into(),
@@ -484,7 +503,7 @@ mod tests {
         save_server(server.clone(), "secret").unwrap();
         assert_eq!(servers().unwrap(), vec![server.clone()]);
         assert_eq!(password(&server.url).unwrap().as_deref(), Some("secret"));
-        let mode = std::fs::metadata(dir.join("just-video/credentials.json"))
+        let mode = std::fs::metadata(dir.join("credentials.json"))
             .unwrap()
             .permissions()
             .mode();
