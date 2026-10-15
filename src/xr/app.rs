@@ -460,7 +460,6 @@ fn save_layout(
     let saved = crate::config::LayoutOverride {
         projection: layout.projection,
         stereo: layout.stereo,
-        swap_eyes: layout.swap_eyes,
         image: *image,
     };
     if let Err(e) = crate::config::save_layout_override(key, Some(saved)) {
@@ -870,8 +869,6 @@ pub fn run(
     // The VR180/360 control bar, once opened; dragged by its handle.
     let mut bar_place: Option<Placement> = None;
     let mut bar_press: Option<Press> = None;
-    // Flat screens: what shows around the picture (see `eye_params`).
-    let mut see_through = crate::config::see_through();
     // Whether the bar offers buffering ahead.
     let mut buffer_button = crate::config::buffer_button();
     let mut browser_place = browser_placement([0.0; 3]);
@@ -1286,11 +1283,9 @@ pub fn run(
                     has_previous: navigator.as_ref().is_some_and(|n| n.has_adjacent(-1)),
                     has_next: navigator.as_ref().is_some_and(|n| n.has_adjacent(1)),
                     curved: curved_applies.then_some(placement.curved),
-                    see_through,
                     buffer_button,
                     format: (playback.layout.projection, playback.layout.stereo),
                     favourites: favourites.clone(),
-                    swap_eyes: playback.layout.swap_eyes,
                     subtitle_tracks: playback.subtitle_labels(),
                     subtitle: playback.subtitle_index(),
                     audio_tracks: playback.audio_labels().to_vec(),
@@ -1527,6 +1522,9 @@ pub fn run(
                             set_format(playback, next);
                         }
                     }
+                    Some(controls::Hit::Image) if dialog == Some(controls::Dialog::Image) => {
+                        dialog = None;
+                    }
                     Some(controls::Hit::Image) => dialog = Some(controls::Dialog::Image),
                     Some(controls::Hit::AudioTrack(track)) => playback.set_audio_track(track),
                     Some(controls::Hit::SubtitleTrack(track)) => playback.set_subtitle(track),
@@ -1563,16 +1561,6 @@ pub fn run(
                         if let Err(e) = crate::config::save_buffer_button(buffer_button) {
                             eprintln!("Can't save the buffer button setting: {e:#}");
                         }
-                    }
-                    Some(controls::Hit::SeeThrough) => {
-                        see_through = !see_through;
-                        if let Err(e) = crate::config::save_see_through(see_through) {
-                            eprintln!("Can't save the surround setting: {e:#}");
-                        }
-                    }
-                    Some(controls::Hit::SwapEyes) => {
-                        playback.layout.swap_eyes = !playback.layout.swap_eyes;
-                        save_layout(playing_key.as_ref(), &playback.layout, &playback.image);
                     }
                     Some(controls::Hit::Brightness(d)) => {
                         playback.image.brightness = (playback.image.brightness
@@ -1828,7 +1816,6 @@ pub fn run(
                         &options.view,
                         &placement,
                         playback.image.rotation,
-                        see_through,
                     );
                     renderer.draw_eye(eye, index, &params, show);
                 }
@@ -1856,7 +1843,7 @@ pub fn run(
         let mut overlays: Vec<Overlay> = Vec::new();
         // Whether this frame's eye images have a transparent surround.
         let see_through_now = match &mode {
-            Mode::Playing(p) => see_through && p.layout.projection == Projection::Flat,
+            Mode::Playing(p) => p.layout.projection == Projection::Flat,
             Mode::Browser => false,
         };
         match &mode {
@@ -2287,11 +2274,9 @@ mod tests {
             has_previous: true,
             has_next: true,
             curved: Some(false),
-            see_through: true,
             buffer_button: true,
             format: controls::FORMATS[0],
             favourites: vec![controls::FORMATS[0]],
-            swap_eyes: false,
             subtitle_tracks: vec!["English".into()],
             subtitle: Some(0),
             audio_tracks: vec!["English 5.1".into()],

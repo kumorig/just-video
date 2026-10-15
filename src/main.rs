@@ -59,9 +59,6 @@ enum Command {
         /// Override the detected stereo packing.
         #[arg(long, value_enum)]
         stereo: Option<StereoArg>,
-        /// Swap left and right eye images.
-        #[arg(long)]
-        swap_eyes: bool,
         /// Fisheye lens field of view in degrees.
         #[arg(long, default_value_t = 180.0)]
         fisheye_fov: f32,
@@ -491,7 +488,6 @@ fn main() -> anyhow::Result<()> {
             hw,
             projection,
             stereo,
-            swap_eyes,
             fisheye_fov,
             screen_width,
             screen_distance,
@@ -527,17 +523,7 @@ fn main() -> anyhow::Result<()> {
                     StereoArg::Tb => vr::Stereo::TopBottom,
                 };
             }
-            layout.swap_eyes ^= swap_eyes;
-            eprintln!(
-                "Layout: {:?} / {:?}{}",
-                layout.projection,
-                layout.stereo,
-                if layout.swap_eyes {
-                    " (eyes swapped)"
-                } else {
-                    ""
-                }
-            );
+            eprintln!("Layout: {:?} / {:?}", layout.projection, layout.stereo);
             let decoder = media.into_decoder(hw_backend(hw), true, "")?;
             if let Some(note) = &decoder.stats().note {
                 eprintln!("Decoder: {} ({note})", decoder.stats().decoder);
@@ -998,11 +984,9 @@ fn main() -> anyhow::Result<()> {
                 has_previous: true,
                 has_next: false,
                 curved: Some(true),
-                see_through: true,
                 buffer_button: true,
                 format: controls::FORMATS[3],
                 favourites: vec![controls::FORMATS[0], controls::FORMATS[3]],
-                swap_eyes: false,
                 subtitle_tracks: [
                     "English",
                     "English (Forced)",

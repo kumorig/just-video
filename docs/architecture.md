@@ -65,7 +65,7 @@ whole directories into unbounded UI state. Network reads remain read-only.
 Projection and stereo packing are independent settings:
 
 - Projection: flat screen, equirectangular VR180, equirectangular VR360.
-- Packing: mono, side-by-side, top/bottom; left/right eye swap.
+- Packing: mono, side-by-side, top/bottom.
 - Flat view: distance, size, height, yaw/pitch; optional curvature later.
 - Immersive view: rotation offset and recenter; no artificial translation of
   the captured viewpoint. Fisheye VR180 needs explicit lens calibration support
@@ -79,7 +79,7 @@ runtime reference-space changes and tracking loss explicitly.
 
 OpenXR actions cover select, back, play/pause, seek, volume, recenter and view
 adjustments. Bind after enumerating the actual Frame interaction profile. Show
-compact in-headset controls for projection, packing, swap eyes and reset view.
+compact in-headset controls for projection, packing and reset view.
 Keep controller changes reversible and clamp screen distance/scale to valid values.
 
 ## Packaging

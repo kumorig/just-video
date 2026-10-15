@@ -1205,7 +1205,6 @@ pub fn screen_size(
 }
 
 /// Shader parameters for one eye.
-#[allow(clippy::too_many_arguments)]
 pub fn eye_params(
     view: &xr::View,
     eye: usize,
@@ -1214,7 +1213,6 @@ pub fn eye_params(
     options: &ViewOptions,
     placement: &Placement,
     quarter_turns: u8,
-    see_through: bool,
 ) -> EyeParams {
     let (w, h) = (tex.0 as f32, tex.1 as f32);
     let screen = screen_size(tex, layout.stereo, options, placement.zoom, quarter_turns);
@@ -1252,7 +1250,7 @@ pub fn eye_params(
                 Stereo::SideBySide => 1.0,
                 Stereo::TopBottom => 2.0,
             },
-            if layout.swap_eyes { 1.0 } else { 0.0 },
+            0.0,
             options.fisheye_fov.to_radians(),
         ],
         screen: [
@@ -1262,13 +1260,10 @@ pub fn eye_params(
             if spherical { placement.offset } else { 0.0 },
         ],
         tex: [w, h, options.debug_view as f32, placement.zoom],
-        // Only a screen has a surround; spherical video fills the view.
+        // Only a screen has a surround, left transparent for the runtime to
+        // fill (passthrough, or its environment); spherical video fills the view.
         surround: [
-            if see_through && layout.projection == Projection::Flat {
-                1.0
-            } else {
-                0.0
-            },
+            if layout.projection == Projection::Flat { 1.0 } else { 0.0 },
             0.0,
             0.0,
             0.0,

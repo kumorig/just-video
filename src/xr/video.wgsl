@@ -13,7 +13,7 @@ struct Eye {
     // xyz: eye position in the reference space; w: eye index (0 left, 1 right).
     origin: vec4<f32>,
     // x: projection (0 flat, 1 equirect 180, 2 equirect 360, 3 fisheye, 4 curved screen),
-    // y: stereo (0 mono, 1 side-by-side, 2 top-bottom), z: swap eyes, w: fisheye FOV (rad).
+    // y: stereo (0 mono, 1 side-by-side, 2 top-bottom), z: unused, w: fisheye FOV (rad).
     mode: vec4<f32>,
     // Flat screen: x width, y height, z distance, w center height (metres).
     // Spherical video: w is the viewpoint's offset along -Z inside the
@@ -186,10 +186,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     // Select this eye's part of the frame; stay half a chroma texel inside it
     // so the other eye's image never bleeds in.
-    var index = eye.origin.w;
-    if eye.mode.z > 0.5 {
-        index = 1.0 - index;
-    }
+    let index = eye.origin.w;
     // Rotated video: turn the eye's image within its part of the frame.
     var st = clamp(hit.xy, vec2<f32>(0.0), vec2<f32>(1.0));
     let turns = u32(color.adjust.w + 0.5) % 4u;

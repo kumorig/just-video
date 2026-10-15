@@ -37,8 +37,6 @@ pub enum Evidence {
 pub struct Layout {
     pub projection: Projection,
     pub stereo: Stereo,
-    /// Right eye stored first (e.g. `_RL`, or stereo3d "inverted").
-    pub swap_eyes: bool,
     pub projection_from: Evidence,
     pub stereo_from: Evidence,
 }
@@ -81,7 +79,7 @@ fn projection_from_name(tokens: &[String]) -> Option<Projection> {
     None
 }
 
-fn stereo_from_name(tokens: &[String]) -> Option<(Stereo, bool)> {
+fn stereo_from_name(tokens: &[String]) -> Option<Stereo> {
     for t in tokens {
         let t = t.as_str();
         let t = t
@@ -89,13 +87,11 @@ fn stereo_from_name(tokens: &[String]) -> Option<(Stereo, bool)> {
             .or_else(|| t.strip_prefix("360"))
             .unwrap_or(t);
         match t {
-            "lr" | "sbs" | "3dh" | "hsbs" | "fsbs" => return Some((Stereo::SideBySide, false)),
-            "rl" => return Some((Stereo::SideBySide, true)),
-            "tb" | "ou" | "3dv" | "htab" | "tab" | "overunder" => {
-                return Some((Stereo::TopBottom, false));
+            "lr" | "rl" | "sbs" | "3dh" | "hsbs" | "fsbs" => return Some(Stereo::SideBySide),
+            "tb" | "bt" | "ou" | "3dv" | "htab" | "tab" | "overunder" => {
+                return Some(Stereo::TopBottom);
             }
-            "bt" => return Some((Stereo::TopBottom, true)),
-            "mono" | "2d" => return Some((Stereo::Mono, false)),
+            "mono" | "2d" => return Some(Stereo::Mono),
             _ => {}
         }
     }
@@ -120,14 +116,14 @@ fn projection_from_metadata(video: &VideoInfo) -> Option<Projection> {
     }
 }
 
-fn stereo_from_metadata(video: &VideoInfo) -> Option<(Stereo, bool)> {
+fn stereo_from_metadata(video: &VideoInfo) -> Option<Stereo> {
     let stereo = match video.stereo_mode.as_deref()? {
         "2D" => Stereo::Mono,
         "side by side" => Stereo::SideBySide,
         "top and bottom" => Stereo::TopBottom,
         _ => return None,
     };
-    Some((stereo, video.stereo_inverted))
+    Some(stereo)
 }
 
 pub fn detect(name: &str, video: Option<&VideoInfo>) -> Layout {
@@ -137,11 +133,11 @@ pub fn detect(name: &str, video: Option<&VideoInfo>) -> Layout {
         .map(|p| (p, Evidence::Metadata))
         .or_else(|| projection_from_name(&tokens).map(|p| (p, Evidence::Filename)))
         .unwrap_or((Projection::Flat, Evidence::Default));
-    let ((stereo, swap_eyes), stereo_from) = video
+    let (stereo, stereo_from) = video
         .and_then(stereo_from_metadata)
         .map(|s| (s, Evidence::Metadata))
         .or_else(|| stereo_from_name(&tokens).map(|s| (s, Evidence::Filename)))
-        .unwrap_or(((Stereo::Mono, false), Evidence::Default));
+        .unwrap_or((Stereo::Mono, Evidence::Default));
     // Untagged 2:1 frames of 5.7K and wider are almost always VR180 side-by-side
     // (two square eyes). Smaller 2:1 frames are often mono 360, so leave them flat.
     if projection_from == Evidence::Default
@@ -153,7 +149,6 @@ pub fn detect(name: &str, video: Option<&VideoInfo>) -> Layout {
         return Layout {
             projection: Projection::Equirect180,
             stereo: Stereo::SideBySide,
-            swap_eyes: false,
             projection_from: Evidence::Aspect,
             stereo_from: Evidence::Aspect,
         };
@@ -161,7 +156,6 @@ pub fn detect(name: &str, video: Option<&VideoInfo>) -> Layout {
     Layout {
         projection,
         stereo,
-        swap_eyes,
         projection_from,
         stereo_from,
     }
@@ -171,31 +165,31 @@ pub fn detect(name: &str, video: Option<&VideoInfo>) -> Layout {
 mod tests {
     use super::*;
 
-    fn by_name(name: &str) -> (Projection, Stereo, bool) {
+    fn by_name(name: &str) -> (Projection, Stereo) {
         let l = detect(name, None);
-        (l.projection, l.stereo, l.swap_eyes)
+        (l.projection, l.stereo)
     }
 
     #[test]
     fn filename_conventions() {
         use Projection::*;
         use Stereo::*;
-        assert_eq!(by_name("Trip_180_LR.mp4"), (Equirect180, SideBySide, false));
-        assert_eq!(by_name("dive-360_TB.mkv"), (Equirect360, TopBottom, false));
+        assert_eq!(by_name("Trip_180_LR.mp4"), (Equirect180, SideBySide));
+        assert_eq!(by_name("dive-360_TB.mkv"), (Equirect360, TopBottom));
         assert_eq!(
             by_name("Concert 180x180_3dh.mp4"),
-            (Equirect180, SideBySide, false)
+            (Equirect180, SideBySide)
         );
-        assert_eq!(by_name("clip_MKX200.mp4"), (Fisheye180, Mono, false));
+        assert_eq!(by_name("clip_MKX200.mp4"), (Fisheye180, Mono));
         assert_eq!(
             by_name("scene_FISHEYE190_LR.mp4"),
-            (Fisheye180, SideBySide, false)
+            (Fisheye180, SideBySide)
         );
-        assert_eq!(by_name("walk_360.mp4"), (Equirect360, Mono, false));
-        assert_eq!(by_name("odd_180_RL.mp4"), (Equirect180, SideBySide, true));
-        assert_eq!(by_name("movie.2024.2160p.mkv"), (Flat, Mono, false));
-        assert_eq!(by_name("film_sbs.mkv"), (Flat, SideBySide, false));
-        assert_eq!(by_name("dir/360/flat_video.mp4"), (Flat, Mono, false));
+        assert_eq!(by_name("walk_360.mp4"), (Equirect360, Mono));
+        assert_eq!(by_name("odd_180_RL.mp4"), (Equirect180, SideBySide));
+        assert_eq!(by_name("movie.2024.2160p.mkv"), (Flat, Mono));
+        assert_eq!(by_name("film_sbs.mkv"), (Flat, SideBySide));
+        assert_eq!(by_name("dir/360/flat_video.mp4"), (Flat, Mono));
     }
 
     fn video(projection: Option<&str>, degrees: Option<f64>, stereo: Option<&str>) -> VideoInfo {

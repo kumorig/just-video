@@ -16,8 +16,9 @@
 //! holds the size and position buttons while the screen and subtitle area
 //! are outlined, with sample text). The screen button: a
 //! click steps through the favourite formats, a long press opens the screen
-//! dialog (every format, stars, curved screen, swap eyes). The image button
-//! opens the image dialog (brightness, contrast, saturation, rotation).
+//! dialog (every format, stars, curved screen, buffer button). The image
+//! button opens the image dialog (brightness, contrast, saturation,
+//! rotation); a second click closes it.
 //! Volume is left to the headset's buttons; the thumbstick click resets the
 //! screen.
 
@@ -107,7 +108,7 @@ pub enum Hit {
     Captions,
     /// Click: next favourite format; long press: the screen dialog.
     Screen,
-    /// Opens the image dialog.
+    /// Opens the image dialog (or closes it).
     Image,
     // In the dialogs:
     AudioTrack(usize),
@@ -128,11 +129,8 @@ pub enum Hit {
     /// A format (index into [`FORMATS`]); long press stars it.
     Pick(usize),
     Curved,
-    /// Flat screens: surroundings visible around the picture, or black.
-    SeeThrough,
     /// Show or hide the buffer-ahead button on the bar.
     BufferButton,
-    SwapEyes,
     Brightness(i8),
     Contrast(i8),
     Saturation(i8),
@@ -183,13 +181,10 @@ pub struct State {
     pub has_next: bool,
     /// None when the curve toggle does not apply (VR180/360).
     pub curved: Option<bool>,
-    /// Flat screens: the surroundings show around the picture.
-    pub see_through: bool,
     /// The buffer-ahead button is shown (`reserve` is None when hidden).
     pub buffer_button: bool,
     pub format: Format,
     pub favourites: Vec<Format>,
-    pub swap_eyes: bool,
     /// Names of the subtitle tracks (empty: none), and the one shown.
     pub subtitle_tracks: Vec<String>,
     pub subtitle: Option<usize>,
@@ -366,17 +361,7 @@ fn dialog_buttons(state: &State) -> Vec<(Hit, Rect, bool)> {
                 (24.0, 420.0, 568.0, 72.0),
                 state.curved.is_some(),
             ));
-            out.push((
-                Hit::SwapEyes,
-                (608.0, 420.0, 568.0, 72.0),
-                state.format.1 != Stereo::Mono,
-            ));
-            out.push((
-                Hit::SeeThrough,
-                (24.0, 508.0, 568.0, 72.0),
-                state.curved.is_some(),
-            ));
-            out.push((Hit::BufferButton, (608.0, 508.0, 568.0, 72.0), true));
+            out.push((Hit::BufferButton, (608.0, 420.0, 568.0, 72.0), true));
         }
         Some(Dialog::Image) => {
             for (i, (minus, plus)) in [
@@ -878,15 +863,6 @@ pub fn render_dialog(
                 .to_string(),
                 state.curved == Some(true),
             ),
-            Hit::SeeThrough => (
-                (if state.see_through {
-                    "Around the screen: see-through"
-                } else {
-                    "Around the screen: black"
-                })
-                .to_string(),
-                state.see_through,
-            ),
             Hit::BufferButton => (
                 (if state.buffer_button {
                     "Buffer button: shown"
@@ -896,7 +872,6 @@ pub fn render_dialog(
                 .to_string(),
                 state.buffer_button,
             ),
-            Hit::SwapEyes => ("Swap eyes".to_string(), state.swap_eyes),
             Hit::Brightness(d) | Hit::Contrast(d) | Hit::Saturation(d) => {
                 ((if d < 0 { "−" } else { "+" }).to_string(), false)
             }
@@ -950,11 +925,9 @@ mod tests {
             has_previous: true,
             has_next: false,
             curved: Some(false),
-            see_through: true,
             buffer_button: true,
             format: FORMATS[0],
             favourites: vec![FORMATS[0], FORMATS[3]],
-            swap_eyes: false,
             subtitle_tracks: Vec::new(),
             subtitle: None,
             audio_tracks: vec!["Korean 5.1".into()],

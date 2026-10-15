@@ -701,7 +701,6 @@ impl LayoutOverride {
     pub fn apply(&self, layout: &mut Layout) {
         layout.projection = self.projection;
         layout.stereo = self.stereo;
-        layout.swap_eyes = self.swap_eyes;
     }
 }
 
