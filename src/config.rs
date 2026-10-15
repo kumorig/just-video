@@ -322,6 +322,78 @@ struct Settings {
     /// on the keyframe before it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     seek_exact: Option<bool>,
+    /// Player preferences (jump lengths, volume step, continuing videos).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    player: Option<Preferences>,
+}
+
+/// Player choices made on the Settings page.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Preferences {
+    /// D-pad left/right (and a sideways stick flick), seconds.
+    pub short_jump: u32,
+    /// The same with the grip held, seconds.
+    pub long_jump: u32,
+    /// D-pad up/down step of the headset's volume, percent.
+    pub volume_step: u32,
+    /// Continue videos where they were left.
+    pub resume: bool,
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            short_jump: 5,
+            long_jump: 60,
+            volume_step: 10,
+            resume: true,
+        }
+    }
+}
+
+/// Choices for the jump lengths and the volume step.
+pub const SHORT_JUMP_PRESETS: [u32; 4] = [5, 10, 15, 30];
+pub const LONG_JUMP_PRESETS: [u32; 5] = [30, 60, 120, 300, 600];
+pub const VOLUME_STEP_PRESETS: [u32; 3] = [5, 10, 20];
+
+impl Preferences {
+    /// Seconds a D-pad press jumps (`direction` -1 or +1); the grip makes it long.
+    pub fn jump(&self, direction: i32, long: bool) -> f64 {
+        let seconds = if long {
+            self.long_jump
+        } else {
+            self.short_jump
+        };
+        seconds.max(1) as f64 * direction.signum() as f64
+    }
+}
+
+/// "5 s", "1 min", "1 min 30 s".
+pub fn format_jump(seconds: u32) -> String {
+    match (seconds / 60, seconds % 60) {
+        (0, s) => format!("{s} s"),
+        (m, 0) => format!("{m} min"),
+        (m, s) => format!("{m} min {s} s"),
+    }
+}
+
+pub fn preferences() -> Preferences {
+    read_json::<Settings>("settings.json")
+        .ok()
+        .and_then(|s| s.player)
+        .unwrap_or_default()
+}
+
+/// Changes the saved preferences: read, `change`, write, so other settings
+/// are kept. Returns the result.
+pub fn update_preferences(change: impl FnOnce(&mut Preferences)) -> anyhow::Result<Preferences> {
+    let mut settings: Settings = read_json("settings.json")?;
+    let mut prefs = settings.player.unwrap_or_default();
+    change(&mut prefs);
+    settings.player = Some(prefs);
+    write_json("settings.json", &settings, false)?;
+    Ok(prefs)
 }
 
 /// Where a jump lands: name and whether it is exact (see [`seek_exact`]).
@@ -504,6 +576,43 @@ mod tests {
         assert_eq!(entries["server/other/old/movie.mp4"], 4);
         assert!(!entries.contains_key("server/share/old"));
         assert!(!remap_file_keys(&mut entries, "missing", "new"));
+    }
+
+    #[test]
+    fn old_settings_files_still_parse() {
+        let s: Settings =
+            serde_json::from_str(r#"{"captions":{"scale":1.2,"raise":0.1}}"#).unwrap();
+        assert_eq!(s.player, None);
+        // A partial object (fields added later) fills in defaults; fields no
+        // longer used are ignored.
+        let s: Settings =
+            serde_json::from_str(r#"{"player":{"volume":70,"volume_step":5}}"#).unwrap();
+        let p = s.player.unwrap();
+        assert_eq!((p.volume_step, p.short_jump), (5, 5));
+        assert!(p.resume);
+    }
+
+    #[test]
+    fn preferences_round_trip_keeping_other_settings() {
+        let dir = temp_config("prefs");
+        assert_eq!(preferences(), Preferences::default());
+        save_curvature(0.5).unwrap();
+        update_preferences(|p| p.long_jump = 600).unwrap();
+        update_preferences(|p| p.volume_step = 20).unwrap();
+        let p = preferences();
+        assert_eq!((p.long_jump, p.volume_step), (600, 20));
+        assert_eq!(curvature(), 0.5);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn jump_lengths() {
+        let p = Preferences::default();
+        assert_eq!(p.jump(-1, false), -5.0);
+        assert_eq!(p.jump(1, true), 60.0);
+        assert_eq!(format_jump(5), "5 s");
+        assert_eq!(format_jump(60), "1 min");
+        assert_eq!(format_jump(90), "1 min 30 s");
     }
 
     #[test]

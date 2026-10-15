@@ -894,6 +894,11 @@ pub fn run(
     let mut bar_press: Option<Press> = None;
     // Whether the bar offers buffering ahead.
     let mut buffer_button = crate::config::buffer_button();
+    // Jump lengths, volume step and continuing: as on the Settings page.
+    let mut prefs = navigator
+        .as_ref()
+        .map_or_else(crate::config::preferences, |nav| nav.preferences());
+    let system_volume = crate::system_volume::SystemVolume::new();
     let mut browser_place = browser_placement([0.0; 3]);
     let mut controls_panel_at: Option<Panel> = None;
     let mut controls_drawn: Option<(controls::State, controls::Hit, Option<controls::Pressing>)> =
@@ -978,6 +983,9 @@ pub fn run(
                 active_hand = hand;
             }
         }
+        if let Some(nav) = &navigator {
+            prefs = nav.preferences();
+        }
         let ray = buttons.rays[active_hand]
             .as_ref()
             .or(buttons.rays[1 - active_hand].as_ref());
@@ -1061,7 +1069,10 @@ pub fn run(
                         "Playing {} as {:?} / {:?}",
                         opened.name, opened.layout.projection, opened.layout.stereo
                     );
-                    let start = opened.resume.map_or(0.0, |t| (t - RESUME_REWIND).max(0.0));
+                    let start = opened
+                        .resume
+                        .filter(|_| prefs.resume)
+                        .map_or(0.0, |t| (t - RESUME_REWIND).max(0.0));
                     let mut playback = Playback::start(
                         opened.decoder,
                         opened.layout,
@@ -1718,10 +1729,14 @@ pub fn run(
                 }
                 let dragging = press.as_ref().is_some_and(|p| p.dragging);
                 // Thumbstick click: back to the default size and place.
-                // D-pad left/right (or a sideways stick flick): 5 seconds back/forward.
+                // D-pad left/right (or a sideways stick flick): a jump, long
+                // with the grip held. D-pad up/down: the headset's volume.
                 if buttons.seek != 0 {
-                    playback.seek(playback.position() + 5.0 * buttons.seek as f64);
+                    playback.seek(playback.position() + prefs.jump(buttons.seek, buttons.grip));
                     controls_drawn = None;
+                }
+                if buttons.volume != 0 {
+                    system_volume.step(buttons.volume * prefs.volume_step as i32);
                 }
                 if buttons.reset {
                     // Ahead of the head, wherever it is now; the VR bar too.

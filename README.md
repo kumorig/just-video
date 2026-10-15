@@ -47,5 +47,5 @@ under **This headset**: Videos, Downloads, the home folder, SD card and USB driv
 - **Trigger** or **A**: select. **B**: back, or stop the video.
 - **Thumbstick**: scroll; hold the **grip** to scroll faster. **Click** it to reset the view.
 - **Grip**: drag the browser or control bar, nearer or farther.
-- **D-pad left/right** (or a sideways stick flick): jump 5 seconds.
+- **D-pad left/right** (or a sideways stick flick): jump 5 seconds, a minute with the grip held. **D-pad up/down**: headset volume. Lengths are in Settings.
 - **Hold** a file or server to rename, move or delete it.

@@ -1,7 +1,9 @@
 //! Controller input: an aim ray per hand (smoothed), select (trigger or A),
-//! back (B), scroll (thumbstick; grip held = faster), seek (left D-pad or a
-//! sideways stick flick). Bindings are suggested for the Steam
-//! Frame controller, Index controllers and the generic simple profile.
+//! back (B), scroll (thumbstick; grip held = faster), jump (left D-pad
+//! left/right, repeating while held, or a sideways stick flick), volume
+//! (left D-pad up/down). Bindings are suggested for the Steam Frame
+//! controller, Index controllers and the generic simple profile; which one
+//! the runtime picked is logged.
 //!
 //! The stick's up/down and sideways jobs are kept apart: when it leaves the
 //! centre its direction is decided once (within 30° of vertical, or not),
@@ -28,9 +30,11 @@ pub struct InputState {
     pub reset: bool,
     /// Grip (lower trigger) held on either hand: a modifier, e.g. fast scroll.
     pub grip: bool,
-    /// Seek pressed this frame: -1 back, +1 forward (D-pad left/right, or a
-    /// sideways thumbstick flick where the D-pad isn't available).
+    /// Jump this frame: -1 back, +1 forward (D-pad left/right, repeating
+    /// while held, or a sideways thumbstick flick).
     pub seek: i32,
+    /// Volume step this frame: -1 down, +1 up (D-pad down/up, repeating).
+    pub volume: i32,
     /// Thumbstick vertical deflection per hand (left, right): -1..1, up
     /// positive, 0 in the dead zone or while the stick is pushed sideways.
     pub stick: [f32; 2],
@@ -46,6 +50,44 @@ const STICK_RECENTRE: f32 = 0.3;
 const FLICK: f32 = 0.8;
 /// tan(30°): within this ratio of the axis counts as along it.
 const SECTOR: f32 = 0.577_350_3;
+
+/// Hold-to-repeat for a button: fires on press, then after [`REPEAT_DELAY`]
+/// every [`REPEAT_EVERY`] while still held.
+#[derive(Clone, Copy, Default)]
+struct Repeat {
+    /// Display time (ns) of the next repeat while held.
+    next: Option<i64>,
+}
+
+const REPEAT_DELAY: i64 = 500_000_000;
+const REPEAT_EVERY: i64 = 250_000_000;
+
+impl Repeat {
+    fn update(&mut self, held: bool, now: i64) -> bool {
+        match self.next {
+            _ if !held => {
+                self.next = None;
+                false
+            }
+            None => {
+                self.next = Some(now + REPEAT_DELAY);
+                true
+            }
+            Some(at) if now >= at => {
+                self.next = Some(now + REPEAT_EVERY);
+                true
+            }
+            Some(_) => false,
+        }
+    }
+
+    /// A direction held now fires again only after it is let go.
+    fn wait_for_release(&mut self) {
+        if self.next.is_some() {
+            self.next = Some(i64::MAX);
+        }
+    }
+}
 
 /// What a hand's stick is doing, decided when it leaves the centre.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -108,8 +150,14 @@ pub struct Input {
     grip: xr::Action<bool>,
     seek_back: xr::Action<bool>,
     seek_forward: xr::Action<bool>,
+    volume_up: xr::Action<bool>,
+    volume_down: xr::Action<bool>,
     scroll: xr::Action<xr::Vector2f>,
     hands: [xr::Path; 2],
+    /// D-pad left, right, up, down: press-and-hold repeat.
+    repeats: [Repeat; 4],
+    /// Interaction profile last logged per hand (None: not yet).
+    profiles: [Option<xr::Path>; 2],
     spaces: [xr::Space; 2],
     /// Per hand: what the stick is doing.
     sticks: [Stick; 2],
@@ -197,9 +245,12 @@ impl Input {
         let back = set.create_action::<bool>("back", "Back", &hands)?;
         let reset = set.create_action::<bool>("reset", "Reset view", &hands)?;
         let grip = set.create_action::<bool>("grip", "Modifier", &hands)?;
-        let seek_back = set.create_action::<bool>("seek_back", "Back 5 seconds", &hands)?;
-        let seek_forward =
-            set.create_action::<bool>("seek_forward", "Forward 5 seconds", &hands)?;
+        // Names are kept (SteamVR stores rebindings by them); the jump
+        // length is a setting, so the labels don't give one.
+        let seek_back = set.create_action::<bool>("seek_back", "Jump back", &hands)?;
+        let seek_forward = set.create_action::<bool>("seek_forward", "Jump forward", &hands)?;
+        let volume_up = set.create_action::<bool>("volume_up", "Volume up", &hands)?;
+        let volume_down = set.create_action::<bool>("volume_down", "Volume down", &hands)?;
         let scroll = set.create_action::<xr::Vector2f>("scroll", "Scroll", &hands)?;
 
         let binding = |action: &str, path: xr::Path| match action {
@@ -210,6 +261,8 @@ impl Input {
             "grip" => xr::Binding::new(&grip, path),
             "seek_back" => xr::Binding::new(&seek_back, path),
             "seek_forward" => xr::Binding::new(&seek_forward, path),
+            "volume_up" => xr::Binding::new(&volume_up, path),
+            "volume_down" => xr::Binding::new(&volume_down, path),
             _ => xr::Binding::new(&scroll, path),
         };
         // Suggests every binding the runtime accepts for `profile` (each is
@@ -268,6 +321,8 @@ impl Input {
             ("grip", "grip/click"),
             ("seek_back", "left:dpad_left/click"),
             ("seek_forward", "left:dpad_right/click"),
+            ("volume_up", "left:dpad_up/click"),
+            ("volume_down", "left:dpad_down/click"),
         ];
         for profile in [
             "/interaction_profiles/valve/frame_controller",
@@ -324,8 +379,12 @@ impl Input {
             grip,
             seek_back,
             seek_forward,
+            volume_up,
+            volume_down,
             scroll,
             hands,
+            repeats: Default::default(),
+            profiles: [None; 2],
             spaces,
             sticks: [Stick::Centred; 2],
             // Direction: unit vector (rad/s-ish speeds); origin: metres.
@@ -340,7 +399,17 @@ impl Input {
         time: xr::Time,
     ) -> anyhow::Result<InputState> {
         ctx.session.sync_actions(&[(&self.set).into()])?;
+        // Until both hands have a profile (later changes arrive as events).
+        if self
+            .profiles
+            .iter()
+            .any(|p| p.is_none_or(|p| p == xr::Path::NULL))
+        {
+            self.log_profiles(ctx);
+        }
         let mut state = InputState::default();
+        let now = time.as_nanos();
+        let mut dpad = [false; 4];
         let pressed = |action: &xr::Action<bool>, hand: xr::Path| -> anyhow::Result<bool> {
             let s = action.state(&ctx.session, hand)?;
             Ok(s.is_active && s.current_state && s.changed_since_last_sync)
@@ -353,11 +422,15 @@ impl Input {
             state.reset |= pressed(&self.reset, hand)?;
             let grip = self.grip.state(&ctx.session, hand)?;
             state.grip |= grip.is_active && grip.current_state;
-            if pressed(&self.seek_back, hand)? {
-                state.seek = -1;
-            }
-            if pressed(&self.seek_forward, hand)? {
-                state.seek = 1;
+            let dpad_actions = [
+                &self.seek_back,
+                &self.seek_forward,
+                &self.volume_up,
+                &self.volume_down,
+            ];
+            for (held, action) in dpad.iter_mut().zip(dpad_actions) {
+                let s = action.state(&ctx.session, hand)?;
+                *held |= s.is_active && s.current_state;
             }
             let stick = self.scroll.state(&ctx.session, hand)?;
             if stick.is_active {
@@ -393,13 +466,83 @@ impl Input {
                 }
             }
         }
+        let fired: Vec<bool> = (self.repeats.iter_mut().zip(dpad))
+            .map(|(r, held)| r.update(held, now))
+            .collect();
+        if fired[0] {
+            state.seek = -1;
+        }
+        if fired[1] {
+            state.seek = 1;
+        }
+        state.volume = fired[2] as i32 - fired[3] as i32;
         Ok(state)
+    }
+
+    /// D-pad directions held now do nothing until let go (e.g. a jump held
+    /// while a video opens doesn't repeat into it).
+    pub fn wait_for_dpad_release(&mut self) {
+        for r in &mut self.repeats {
+            r.wait_for_release();
+        }
+    }
+
+    /// Logs the interaction profile the runtime chose for each hand (at
+    /// first, then whenever it changes): it decides which buttons work.
+    pub fn log_profiles(&mut self, ctx: &XrContext) {
+        for (i, hand) in ["left", "right"].into_iter().enumerate() {
+            // NULL: none chosen yet (no controller seen).
+            let profile = match ctx.session.current_interaction_profile(self.hands[i]) {
+                Ok(p) => p,
+                Err(e) => {
+                    if self.profiles[i].is_none() {
+                        eprintln!("Input: {hand} hand profile unknown: {e}");
+                        self.profiles[i] = Some(xr::Path::NULL);
+                    }
+                    continue;
+                }
+            };
+            if self.profiles[i] == Some(profile) {
+                continue;
+            }
+            let name = if profile == xr::Path::NULL {
+                "no profile yet".into()
+            } else {
+                ctx.xr
+                    .path_to_string(profile)
+                    .unwrap_or_else(|e| format!("? ({e})"))
+            };
+            eprintln!("Input: {hand} hand uses {name}");
+            self.profiles[i] = Some(profile);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn held_buttons_repeat_after_a_delay() {
+        let ms = 1_000_000;
+        let mut r = Repeat::default();
+        let fired: Vec<i64> = (0..100)
+            .map(|i| i * 11 * ms)
+            .filter(|&t| r.update(t < 1000 * ms, t))
+            .collect();
+        // Press, then from 0.5 s every ~0.25 s until released at 1 s.
+        assert_eq!(fired.len(), 3, "{fired:?}");
+        assert_eq!(fired[0], 0);
+        assert!((500 * ms..520 * ms).contains(&fired[1]));
+        assert!((750 * ms..780 * ms).contains(&fired[2]));
+        assert!(!r.update(false, 1100 * ms));
+        assert!(r.update(true, 1200 * ms), "a new press fires at once");
+        // Told to wait for release: nothing until let go and pressed again.
+        r.wait_for_release();
+        assert!(!r.update(true, 5000 * ms));
+        assert!(!r.update(false, 5100 * ms));
+        assert!(r.update(true, 5200 * ms));
+    }
 
     #[test]
     fn one_euro_smooths_jitter_but_follows_motion() {
