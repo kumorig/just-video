@@ -1,3 +1,7 @@
+## 2026-10-16
+I've pulled in a few PR's with little to no testing. But many are behind feature-toggles (on the settings page).
+Just a warning that things might be a bit messy until consistency/bugs has been ironed out.
+
 ```
 AI Disclaimer: Text below is AI generated, sorry I'm lazy.
 Most of the code is as well.
