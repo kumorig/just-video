@@ -69,6 +69,8 @@ pub enum Icon {
     Jump,
     /// Settings: a gear.
     Settings,
+    /// A D-pad: a cross.
+    Dpad,
     /// Loudness: a speaker with sound waves.
     Volume,
     /// Continuing a video: a play triangle after a bar.
@@ -244,6 +246,11 @@ pub fn progress_rect(from: f32, to: f32) -> (f32, f32, f32, f32) {
     (PAD + full * from, HEADER - 8.0, full * (to - from), 3.0)
 }
 
+/// Canvas y where the list starts (below the header).
+pub fn list_top() -> f32 {
+    HEADER
+}
+
 pub fn visible_rows() -> f32 {
     (HEIGHT as f32 - HEADER - BOTTOM) / ROW
 }
@@ -258,7 +265,7 @@ impl View {
     }
 }
 
-type Rect = (f32, f32, f32, f32);
+pub type Rect = (f32, f32, f32, f32);
 
 fn inside((x, y, w, h): Rect, px: f32, py: f32) -> bool {
     px >= x && px <= x + w && py >= y && py <= y + h
@@ -443,6 +450,54 @@ fn action_rect(view: &View, i: usize, k: usize) -> Rect {
     )
 }
 
+/// What the D-pad moves between besides the list's rows, with their
+/// rectangles: a form's fields and keys, a dialog's buttons (left to right),
+/// or the header's breadcrumbs and tools (left to right).
+pub fn fixed_targets(view: &View, fonts: &mut Fonts) -> Vec<(Hit, Rect)> {
+    if let Some(f) = &view.form {
+        return form::targets(f, WIDTH as f32)
+            .into_iter()
+            .map(|(h, r)| (Hit::Form(h), r))
+            .collect();
+    }
+    if let Some(dialog) = &view.dialog {
+        return dialog_buttons(dialog.buttons.len())
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| (Hit::DialogButton(i), r))
+            .collect();
+    }
+    // The last crumb is where we are: not a link (and none while a heading
+    // stands in for them).
+    let last = view.crumbs.len().saturating_sub(1);
+    let crumbs: Vec<(Hit, Rect)> = if view.heading.is_some() {
+        Vec::new()
+    } else {
+        crumb_layout(view, fonts)
+            .elements(view)
+            .into_iter()
+            .filter(|&(_, _, i)| i < last)
+            .map(|(_, (a, b), i)| (Hit::Crumb(i), (a - 8.0, 36.0, b - a + 16.0, 62.0)))
+            .collect()
+    };
+    let tools = (0..view.tools.len()).map(|k| (Hit::Tool(k), tool_rect(view, k)));
+    crumbs.into_iter().chain(tools).collect()
+}
+
+/// Row `i`'s targets, left to right: the row itself, then its buttons.
+pub fn row_targets(view: &View, i: usize) -> Vec<(Hit, Rect)> {
+    let Some(row) = view.rows.get(i) else {
+        return Vec::new();
+    };
+    let (x, y, _, h) = row_rect(view, i);
+    // The row: its label, left of any buttons.
+    let mut out = vec![(Hit::Row(i), (x, y, 400.0, h))];
+    for (k, action) in row.actions.iter().enumerate() {
+        out.push((Hit::RowAction(i, *action), action_rect(view, i, k)));
+    }
+    out
+}
+
 /// What the pointer at canvas pixel (x, y) would activate.
 pub fn hit(view: &View, fonts: &mut Fonts, x: f32, y: f32) -> Hit {
     if let Some(f) = &view.form {
@@ -592,6 +647,11 @@ fn draw_icon(canvas: &mut Canvas, icon: &Icon, cx: f32, cy: f32, bg: Rgb) {
                 );
             }
             canvas.circle(cx, cy + 14.0, 5.0, SUBTLE);
+        }
+        Icon::Dpad => {
+            canvas.rect(cx - 9.0, cy - 24.0, 18.0, 48.0, 4.0, ACCENT);
+            canvas.rect(cx - 24.0, cy - 9.0, 48.0, 18.0, 4.0, ACCENT);
+            canvas.circle(cx, cy, 4.0, bg);
         }
         Icon::Settings => {
             // Eight teeth around a wheel with a hole in the row's colour.
