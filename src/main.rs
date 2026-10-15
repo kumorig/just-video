@@ -985,29 +985,8 @@ fn main() -> anyhow::Result<()> {
                         ..Row::new(Icon::Add, "Add server")
                     },
                     Row {
-                        detail: "Buffer ahead, screen curvature, browser width, jumps".into(),
-                        ..Row::new(Icon::Chevron(true), "Settings")
-                    },
-                    Row {
-                        detail: "Fetched while paused, to play on without the network".into(),
-                        inset: true,
-                        ..Row::new(Icon::Buffer, "Buffer ahead: 1 GB")
-                    },
-                    Row {
-                        detail: "How much a curved video screen bends around you".into(),
-                        inset: true,
-                        ..Row::new(Icon::Curve, "Screen curvature: Medium")
-                    },
-                    Row {
-                        detail: "How wide this window is".into(),
-                        inset: true,
-                        ..Row::new(Icon::Width, "Browser width: 100%")
-                    },
-                    Row {
-                        detail: "Where a jump lands: the keyframe before the target at once, or exactly on it"
-                            .into(),
-                        inset: true,
-                        ..Row::new(Icon::Jump, "Jumps land on: Keyframe")
+                        detail: "Jumps, buffering, screen and browser".into(),
+                        ..Row::new(Icon::Settings, "Settings")
                     },
                 ],
                 tools: vec![Tool::icon(Icon::Exit)],
@@ -1085,6 +1064,36 @@ fn main() -> anyhow::Result<()> {
             just_video::ui::save_png(
                 &render(&servers, &mut fonts, None, false),
                 &dir.join("servers.png"),
+            )?;
+            let settings = View {
+                crumbs: crumbs(&["Just Video", "Settings"]),
+                rows: vec![
+                    Row {
+                        detail: "Fetched while paused, to play on without the network".into(),
+                        right: "1 GB".into(),
+                        ..Row::new(Icon::Buffer, "Buffer ahead")
+                    },
+                    Row {
+                        detail: "How much a curved video screen bends around you".into(),
+                        right: "Medium".into(),
+                        ..Row::new(Icon::Curve, "Screen curvature")
+                    },
+                    Row {
+                        detail: "How wide this window is".into(),
+                        right: "100%".into(),
+                        ..Row::new(Icon::Width, "Browser width")
+                    },
+                    Row {
+                        detail: "The keyframe before the target at once, or exactly on it".into(),
+                        right: "Keyframe".into(),
+                        ..Row::new(Icon::Jump, "Jumps land on")
+                    },
+                ],
+                ..Default::default()
+            };
+            just_video::ui::save_png(
+                &render(&settings, &mut fonts, Some((700.0, 310.0)), true),
+                &dir.join("settings.png"),
             )?;
             let mut dialog = folder.clone();
             dialog.dialog = Some(Dialog {

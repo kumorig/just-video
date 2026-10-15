@@ -28,6 +28,8 @@ pub fn is_video(name: &str) -> bool {
 fn trail(location: &Location) -> Vec<String> {
     match location {
         Location::Servers => Vec::new(),
+        // The Settings row's name (never a server URL): marks the way back in.
+        Location::Settings => vec!["Settings".into()],
         Location::Shares { server } => vec![server.url.clone()],
         Location::Folder {
             server,
@@ -43,6 +45,8 @@ fn trail(location: &Location) -> Vec<String> {
 #[derive(Clone, Debug, PartialEq)]
 enum Location {
     Servers,
+    /// The Settings page, off the server list.
+    Settings,
     Shares {
         server: Server,
     },
@@ -56,7 +60,7 @@ enum Location {
 enum Item {
     Server(Server),
     AddServer,
-    /// The settings section: click to show or hide the rows below.
+    /// Opens the Settings page.
     Settings,
     /// How much to buffer ahead while paused; opens a dialog of presets.
     BufferSize,
@@ -64,7 +68,8 @@ enum Item {
     Curvature,
     /// The browser panel's width; a dialog of presets.
     BrowserWidth,
-    /// Where a jump lands: the keyframe before the target, or exactly on it.
+    /// Where a jump lands: the keyframe before the target, or exactly on
+    /// it. Two-way: a click switches.
     SeekLanding,
     Share(String),
     Dir(String),
@@ -85,7 +90,7 @@ enum Item {
     },
 }
 
-/// The rows under Settings, in order.
+/// The rows of the Settings page, in order.
 const SETTINGS: [Item; 4] = [
     Item::BufferSize,
     Item::Curvature,
@@ -98,11 +103,11 @@ impl Item {
         match self {
             Item::Server(s) => &s.name,
             Item::AddServer
-            | Item::Settings
             | Item::BufferSize
             | Item::Curvature
             | Item::BrowserWidth
             | Item::SeekLanding => "",
+            Item::Settings => "Settings",
             Item::Share(n)
             | Item::Dir(n)
             | Item::Video { name: n, .. }
@@ -162,8 +167,6 @@ enum Purpose {
     /// Choosing from [`config::CURVATURE_PRESETS`] / [`config::BROWSER_WIDTH_PRESETS`].
     Curvature,
     BrowserWidth,
-    /// Choosing from [`config::SEEK_LANDING_PRESETS`].
-    SeekLanding,
     Info,
 }
 
@@ -215,8 +218,6 @@ pub struct Navigator {
     exit_requested: bool,
     /// Text copied in a form, kept for pasting into the next.
     clipboard: String,
-    /// The settings section on the top page is open.
-    settings_open: bool,
     /// Settings read once and kept up to date here.
     curvature: f32,
     browser_width: f32,
@@ -255,7 +256,6 @@ impl Navigator {
             dirty: true,
             exit_requested: false,
             clipboard: String::new(),
-            settings_open: false,
             curvature: config::curvature(),
             browser_width: config::browser_width(),
             seek_exact: config::seek_exact(),
@@ -319,6 +319,7 @@ impl Navigator {
         let mut crumbs = vec!["Just Video".to_string()];
         match &self.location {
             Location::Servers => {}
+            Location::Settings => crumbs.push("Settings".into()),
             Location::Shares { server } => crumbs.push(server.name.clone()),
             Location::Folder {
                 server,
@@ -417,22 +418,21 @@ impl Navigator {
             .collect();
         self.items.push(Item::AddServer);
         self.items.push(Item::Settings);
-        if self.settings_open {
-            self.items.extend(SETTINGS);
-        }
         self.restore_scroll();
         self.rebuild_rows();
     }
 
-    /// Opens or closes the settings section on the top page.
-    fn toggle_settings(&mut self) {
-        self.settings_open = !self.settings_open;
-        if let Some(at) = self.items.iter().position(|i| matches!(i, Item::Settings)) {
-            self.items.truncate(at + 1);
-            if self.settings_open {
-                self.items.extend(SETTINGS);
-            }
-        }
+    /// The Settings page: one row per setting, its value on the right.
+    fn show_settings(&mut self) {
+        self.leave(&Location::Settings);
+        self.location = Location::Settings;
+        self.folder_loaded = false;
+        self.pending = None;
+        self.cancel_listing();
+        self.probes = (0, 0);
+        self.reset_view();
+        self.items = SETTINGS.into_iter().collect();
+        self.restore_scroll();
         self.rebuild_rows();
         self.dirty = true;
     }
@@ -489,6 +489,7 @@ impl Navigator {
         self.pending = Some(id);
         match location {
             Location::Servers => self.show_servers(),
+            Location::Settings => self.show_settings(),
             Location::Shares { server } => {
                 self.set_status("Connecting…");
                 self.library.send(Request::Shares { id, server });
@@ -523,12 +524,8 @@ impl Navigator {
     fn rebuild_rows(&mut self) {
         let editing = self.editing();
         let selecting = self.selecting.as_ref();
-        let (settings_open, curvature, browser_width, seek_exact) = (
-            self.settings_open,
-            self.curvature,
-            self.browser_width,
-            self.seek_exact,
-        );
+        let (curvature, browser_width, seek_exact) =
+            (self.curvature, self.browser_width, self.seek_exact);
         self.view.rows = self
             .items
             .iter()
@@ -555,50 +552,30 @@ impl Navigator {
                         ..Row::new(Icon::Add, "Add server")
                     },
                     Item::Settings => Row {
-                        detail: "Buffer ahead, screen curvature, browser width, jumps".into(),
-                        ..Row::new(Icon::Chevron(settings_open), "Settings")
+                        detail: "Jumps, buffering, screen and browser".into(),
+                        ..Row::new(Icon::Settings, "Settings")
                     },
                     Item::BufferSize => Row {
                         detail: "Fetched while paused, to play on without the network".into(),
-                        inset: true,
-                        ..Row::new(
-                            Icon::Buffer,
-                            format!(
-                                "Buffer ahead: {}",
-                                crate::ui::controls::format_size(config::reserve_bytes())
-                            ),
-                        )
+                        right: crate::ui::controls::format_size(config::reserve_bytes()),
+                        ..Row::new(Icon::Buffer, "Buffer ahead")
                     },
                     Item::Curvature => Row {
                         detail: "How much a curved video screen bends around you".into(),
-                        inset: true,
-                        ..Row::new(
-                            Icon::Curve,
-                            format!(
-                                "Screen curvature: {}",
-                                config::CURVATURE_PRESETS[config::curvature_preset(curvature)].0
-                            ),
-                        )
+                        right: config::CURVATURE_PRESETS[config::curvature_preset(curvature)]
+                            .0
+                            .into(),
+                        ..Row::new(Icon::Curve, "Screen curvature")
                     },
                     Item::BrowserWidth => Row {
                         detail: "How wide this window is".into(),
-                        inset: true,
-                        ..Row::new(
-                            Icon::Width,
-                            format!("Browser width: {}", config::percent(browser_width)),
-                        )
+                        right: config::percent(browser_width),
+                        ..Row::new(Icon::Width, "Browser width")
                     },
                     Item::SeekLanding => Row {
-                        detail: "Where a jump lands: the keyframe before the target at once, or exactly on it"
-                            .into(),
-                        inset: true,
-                        ..Row::new(
-                            Icon::Jump,
-                            format!(
-                                "Jumps land on: {}",
-                                config::SEEK_LANDING_PRESETS[seek_exact as usize].0
-                            ),
-                        )
+                        detail: "The keyframe before the target at once, or exactly on it".into(),
+                        right: config::SEEK_LANDING_PRESETS[seek_exact as usize].0.into(),
+                        ..Row::new(Icon::Jump, "Jumps land on")
                     },
                     Item::Share(name) => Row::new(Icon::Share, name),
                     Item::Dir(name) => Row::new(Icon::Folder, name),
@@ -1350,22 +1327,13 @@ impl Navigator {
                 self.purpose = Some(Purpose::BufferSize);
                 self.dirty = true;
             }
-            (Item::Settings, _) => self.toggle_settings(),
+            (Item::Settings, _) => self.navigate(Location::Settings),
             (Item::SeekLanding, _) => {
-                self.view.dialog = Some(Dialog {
-                    title: "Where jumps land".into(),
-                    body: vec![
-                        "Keyframe: the picture before the target shows at once, up to a few seconds early. Exact: decodes on to the target first."
-                            .into(),
-                    ],
-                    buttons: config::SEEK_LANDING_PRESETS
-                        .iter()
-                        .map(|(name, _)| name.to_string())
-                        .collect(),
-                    danger: false,
-                    choice: Some(self.seek_exact as usize),
-                });
-                self.purpose = Some(Purpose::SeekLanding);
+                self.seek_exact = !self.seek_exact;
+                if let Err(e) = config::save_seek_exact(self.seek_exact) {
+                    eprintln!("Can't save where jumps land: {e:#}");
+                }
+                self.rebuild_rows();
                 self.dirty = true;
             }
             (Item::Curvature, _) => {
@@ -1580,16 +1548,6 @@ impl Navigator {
                     self.curvature = curvature;
                     if let Err(e) = config::save_curvature(curvature) {
                         eprintln!("Can't save the curvature: {e:#}");
-                    }
-                }
-                self.rebuild_rows();
-                return;
-            }
-            Some(Purpose::SeekLanding) => {
-                if let Some(&(_, exact)) = config::SEEK_LANDING_PRESETS.get(button) {
-                    self.seek_exact = exact;
-                    if let Err(e) = config::save_seek_exact(exact) {
-                        eprintln!("Can't save where jumps land: {e:#}");
                     }
                 }
                 self.rebuild_rows();
@@ -1831,7 +1789,7 @@ impl Navigator {
         }
         match self.location.clone() {
             Location::Servers => return false,
-            Location::Shares { .. } => self.show_servers(),
+            Location::Settings | Location::Shares { .. } => self.show_servers(),
             Location::Folder {
                 server,
                 share,
@@ -2095,27 +2053,19 @@ mod tests {
     }
 
     #[test]
-    fn settings_row_expands_into_inset_children() {
+    fn settings_page_shows_values_and_previews_choices() {
         // The jump choice below is saved: not into the user's settings.
         let dir = config::temp_config("nav-settings");
         let mut nav = Navigator::new(Library::start(None));
         let last = nav.view().rows.len() - 1;
         nav.click(Hit::Row(last));
+        assert_eq!(nav.view().crumbs, ["Just Video", "Settings"]);
+        assert!(nav.view().tools.is_empty(), "no exit button here");
         let icons: Vec<Icon> = nav.view().rows.iter().map(|r| r.icon.clone()).collect();
-        assert_eq!(
-            &icons[last..],
-            [
-                Icon::Chevron(true),
-                Icon::Buffer,
-                Icon::Curve,
-                Icon::Width,
-                Icon::Jump
-            ]
-        );
-        assert!(!nav.view().rows[last].inset);
-        assert!(nav.view().rows[last + 1..].iter().all(|r| r.inset));
+        assert_eq!(icons, [Icon::Buffer, Icon::Curve, Icon::Width, Icon::Jump]);
+        assert_eq!(nav.view().rows[1].right, "Full");
         // The curvature dialog previews the choice pointed at, else the saved one.
-        nav.click(Hit::Row(last + 2));
+        nav.click(Hit::Row(1));
         assert_eq!(
             nav.view().dialog.as_ref().map(|d| d.title.as_str()),
             Some("Screen curvature")
@@ -2130,26 +2080,23 @@ mod tests {
         );
         nav.back();
         assert_eq!(nav.preview(Hit::Nothing), None);
-        nav.click(Hit::Row(last + 3));
+        nav.click(Hit::Row(2));
         assert_eq!(
             nav.preview(Hit::DialogButton(0)),
             Some(Preview::BrowserWidth(0.5))
         );
         nav.back();
-        // Where jumps land: a two-way choice, saved and shown in the row.
-        nav.click(Hit::Row(last + 4));
-        assert_eq!(
-            nav.view().dialog.as_ref().map(|d| d.title.as_str()),
-            Some("Where jumps land")
-        );
-        nav.click(Hit::DialogButton(1));
+        // Where jumps land: two-way, so a click switches, saved and shown.
+        nav.click(Hit::Row(3));
         assert!(nav.seek_exact());
-        assert_eq!(nav.view().rows[last + 4].label, "Jumps land on: Exact");
-        nav.click(Hit::Row(last + 4));
-        nav.click(Hit::DialogButton(0));
+        assert_eq!(nav.view().rows[3].right, "Exact");
+        assert!(config::seek_exact(), "saved");
+        nav.click(Hit::Row(3));
         assert!(!nav.seek_exact());
-        nav.click(Hit::Row(last));
-        assert_eq!(nav.view().rows.len(), last + 1, "closed again");
+        // B goes back to the server list, which marks the way in.
+        assert!(nav.back());
+        assert_eq!(nav.view().crumbs, ["Just Video"]);
+        assert!(nav.view().rows[last].outlined, "the way back in");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2157,7 +2104,7 @@ mod tests {
     fn server_list_offers_adding_one_and_exiting() {
         let mut nav = Navigator::new(Library::start(None));
         let icons: Vec<Icon> = nav.view().rows.iter().map(|r| r.icon.clone()).collect();
-        assert_eq!(&icons[icons.len() - 2..], [Icon::Add, Icon::Chevron(false)]);
+        assert_eq!(&icons[icons.len() - 2..], [Icon::Add, Icon::Settings]);
         assert_eq!(nav.view().crumbs, vec!["Just Video".to_string()]);
         assert_eq!(nav.view().tools.len(), 1, "the exit button, top right");
         assert!(!nav.take_exit());

@@ -67,6 +67,8 @@ pub enum Icon {
     Width,
     /// A jump in the video: an arrow to a bar.
     Jump,
+    /// Settings: a gear.
+    Settings,
     /// Close the app.
     Exit,
 }
@@ -586,6 +588,16 @@ fn draw_icon(canvas: &mut Canvas, icon: &Icon, cx: f32, cy: f32, bg: Rgb) {
                 );
             }
             canvas.circle(cx, cy + 14.0, 5.0, SUBTLE);
+        }
+        Icon::Settings => {
+            // Eight teeth around a wheel with a hole in the row's colour.
+            for k in 0..8 {
+                let a = k as f32 * std::f32::consts::FRAC_PI_4;
+                let (x, y) = (cx + 16.0 * a.cos(), cy + 16.0 * a.sin());
+                canvas.rect(x - 5.0, y - 5.0, 10.0, 10.0, 2.0, SUBTLE);
+            }
+            canvas.circle(cx, cy, 15.0, SUBTLE);
+            canvas.circle(cx, cy, 6.0, bg);
         }
         Icon::Jump => {
             // An arrow to a bar: the shaft, its head of shortening strokes, the bar.
