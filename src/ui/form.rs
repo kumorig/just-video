@@ -10,6 +10,7 @@ const FIELD_FOCUS: Rgb = [0x26, 0x2f, 0x40];
 const KEY: Rgb = [0x2a, 0x2f, 0x38];
 const KEY_HOVER: Rgb = [0x3a, 0x42, 0x50];
 const ACCENT: Rgb = [0x4f, 0x8c, 0xff];
+const SELECTION: Rgb = [0x2f, 0x4f, 0x80];
 const ERROR: Rgb = [0xff, 0x6b, 0x60];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -35,6 +36,8 @@ pub struct Form {
     pub focused: usize,
     /// Caret in the focused field, in characters from its start.
     pub cursor: usize,
+    /// The other end of the selection, when text is selected.
+    pub anchor: Option<usize>,
     pub layer: Layer,
     pub error: Option<String>,
     pub busy: Option<String>,
@@ -51,6 +54,9 @@ pub enum Key {
     Left,
     Right,
     Space,
+    /// The selection (or the whole field) to the owner's clipboard, and back.
+    Copy,
+    Paste,
     Cancel,
     Submit,
 }
@@ -71,6 +77,7 @@ impl Form {
             fields,
             focused: 0,
             cursor,
+            anchor: None,
             layer: Layer::Lower,
             error: None,
             busy: None,
@@ -85,42 +92,102 @@ impl Form {
     /// Focuses field `i` with the caret at `cursor` (None: at the end).
     pub fn focus(&mut self, i: usize, cursor: Option<usize>) {
         self.focused = i;
+        self.anchor = None;
         let len = self.fields[i].value.chars().count();
         self.cursor = cursor.unwrap_or(len).min(len);
     }
 
-    /// Applies a key; returns Cancel/Submit for the owner to act on.
-    pub fn press(&mut self, key: Key) -> Option<Key> {
-        self.error = None;
-        let field = &mut self.fields[self.focused];
-        let len = field.value.chars().count();
-        self.cursor = self.cursor.min(len);
-        // Byte offset of the caret.
-        let at = |value: &str, chars: usize| {
-            value
-                .char_indices()
-                .nth(chars)
-                .map_or(value.len(), |(i, _)| i)
+    /// The selected characters of the focused field, start to end.
+    pub fn selection(&self) -> Option<(usize, usize)> {
+        let anchor = self.anchor?;
+        (anchor != self.cursor).then(|| (anchor.min(self.cursor), anchor.max(self.cursor)))
+    }
+
+    /// Selects characters `anchor` to `cursor` of field `i` (either order).
+    pub fn select_range(&mut self, i: usize, anchor: usize, cursor: usize) {
+        self.focus(i, Some(cursor));
+        let len = self.fields[i].value.chars().count();
+        self.anchor = Some(anchor.min(len));
+    }
+
+    pub fn select_all(&mut self) {
+        self.anchor = Some(0);
+        self.cursor = self.fields[self.focused].value.chars().count();
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.anchor = None;
+    }
+
+    /// Removes the selection; false when there was none.
+    fn delete_selection(&mut self) -> bool {
+        let Some((a, b)) = self.selection() else {
+            return false;
         };
+        let field = &mut self.fields[self.focused];
+        let (from, to) = (byte_at(&field.value, a), byte_at(&field.value, b));
+        field.value.replace_range(from..to, "");
+        self.cursor = a;
+        self.anchor = None;
+        true
+    }
+
+    /// Applies a key; returns Cancel/Submit for the owner to act on. The
+    /// clipboard is the owner's, so it outlives the form.
+    pub fn press(&mut self, key: Key, clipboard: &mut String) -> Option<Key> {
+        self.error = None;
+        let len = self.fields[self.focused].value.chars().count();
+        self.cursor = self.cursor.min(len);
         match key {
-            Key::Char(_) | Key::Space => {
-                let c = match key {
-                    Key::Char(c) => c,
-                    _ => ' ',
+            Key::Char(_) | Key::Space | Key::Paste => {
+                let text = match key {
+                    Key::Char(c) => c.to_string(),
+                    Key::Space => " ".to_string(),
+                    _ => clipboard.clone(),
                 };
-                field.value.insert(at(&field.value, self.cursor), c);
-                self.cursor += 1;
-                if key != Key::Space && self.layer == Layer::Upper {
+                if text.is_empty() {
+                    return None;
+                }
+                self.delete_selection();
+                let field = &mut self.fields[self.focused];
+                field
+                    .value
+                    .insert_str(byte_at(&field.value, self.cursor), &text);
+                self.cursor += text.chars().count();
+                if matches!(key, Key::Char(_)) && self.layer == Layer::Upper {
                     self.layer = Layer::Lower; // one-shot shift
                 }
             }
-            Key::Backspace if self.cursor > 0 => {
-                self.cursor -= 1;
-                field.value.remove(at(&field.value, self.cursor));
+            Key::Backspace => {
+                if !self.delete_selection() && self.cursor > 0 {
+                    self.cursor -= 1;
+                    let field = &mut self.fields[self.focused];
+                    field.value.remove(byte_at(&field.value, self.cursor));
+                }
             }
-            Key::Backspace => {}
-            Key::Left => self.cursor = self.cursor.saturating_sub(1),
-            Key::Right => self.cursor = (self.cursor + 1).min(len),
+            Key::Left => match self.selection() {
+                Some((start, _)) => {
+                    self.cursor = start;
+                    self.anchor = None;
+                }
+                None => self.cursor = self.cursor.saturating_sub(1),
+            },
+            Key::Right => match self.selection() {
+                Some((_, end)) => {
+                    self.cursor = end;
+                    self.anchor = None;
+                }
+                None => self.cursor = (self.cursor + 1).min(len),
+            },
+            Key::Copy => {
+                let field = &self.fields[self.focused];
+                if !field.secret {
+                    *clipboard = match self.selection() {
+                        Some((a, b)) => field.value.chars().skip(a).take(b - a).collect(),
+                        None => field.value.clone(),
+                    };
+                }
+            }
             Key::Shift => {
                 self.layer = if self.layer == Layer::Upper {
                     Layer::Lower
@@ -139,6 +206,14 @@ impl Form {
         }
         None
     }
+}
+
+/// Byte offset of character `chars` in `value`.
+fn byte_at(value: &str, chars: usize) -> usize {
+    value
+        .char_indices()
+        .nth(chars)
+        .map_or(value.len(), |(i, _)| i)
 }
 
 // Layout inside the 1600×1000 browser panel.
@@ -185,8 +260,8 @@ fn keys(form: &Form, panel_width: f32) -> Vec<(Key, Rect)> {
         let (left, right) = match r {
             0 => (None, Some(Key::Backspace)),
             1 => (Some(Key::Left), Some(Key::Right)),
-            2 => (Some(Key::Shift), None),
-            3 => (Some(Key::Symbols), None),
+            2 => (Some(Key::Shift), Some(Key::Copy)),
+            3 => (Some(Key::Symbols), Some(Key::Paste)),
             _ => (None, None),
         };
         if let Some(k) = left {
@@ -292,7 +367,9 @@ fn key_label(key: Key, form: &Form) -> String {
                 "#+=".into()
             }
         }
-        Key::Backspace => "Delete".into(),
+        Key::Backspace => "Backspace".into(),
+        Key::Copy => "Copy".into(),
+        Key::Paste => "Paste".into(),
         // Drawn as triangles.
         Key::Left | Key::Right => String::new(),
         Key::Space => "space".into(),
@@ -338,6 +415,17 @@ pub fn render(canvas: &mut Canvas, fonts: &mut Fonts, form: &Form, hover: Hit) {
             );
         }
         let start = first_shown(form, i, fonts);
+        if focused && let Some((a, b)) = form.selection() {
+            // The selected stretch, within what is shown.
+            let mut x_of = |k: usize| {
+                let before: String = chars[start..k.max(start)].iter().collect();
+                (fx + 20.0 + fonts.measure(&before, TEXT_SIZE)).min(fx + fw - 20.0)
+            };
+            let (x0, x1) = (x_of(a), x_of(b));
+            if x1 > x0 {
+                canvas.rect(x0, fy + 14.0, x1 - x0, fh - 28.0, 4.0, SELECTION);
+            }
+        }
         let text: String = chars[start..].iter().collect();
         fonts.draw(
             canvas,
@@ -437,37 +525,107 @@ mod tests {
     #[test]
     fn typing_shift_and_backspace() {
         let mut f = form();
-        f.press(Key::Shift);
-        f.press(Key::Char('N'));
-        f.press(Key::Char('a'));
-        f.press(Key::Char('s'));
-        f.press(Key::Backspace);
+        let mut clip = String::new();
+        f.press(Key::Shift, &mut clip);
+        f.press(Key::Char('N'), &mut clip);
+        f.press(Key::Char('a'), &mut clip);
+        f.press(Key::Char('s'), &mut clip);
+        f.press(Key::Backspace, &mut clip);
         assert_eq!(f.value(0), "Na");
         assert_eq!(f.layer, Layer::Lower, "shift is one-shot");
-        assert_eq!(f.press(Key::Submit), Some(Key::Submit));
+        assert_eq!(f.press(Key::Submit, &mut clip), Some(Key::Submit));
     }
 
     #[test]
     fn editing_in_the_middle() {
         let mut f = form();
+        let mut clip = String::new();
         f.fields[0].value = "clip.mp4".into();
         f.focus(0, Some(4));
-        f.press(Key::Char('2'));
+        f.press(Key::Char('2'), &mut clip);
         assert_eq!(f.value(0), "clip2.mp4");
-        f.press(Key::Left);
-        f.press(Key::Backspace);
+        f.press(Key::Left, &mut clip);
+        f.press(Key::Backspace, &mut clip);
         assert_eq!(f.value(0), "cli2.mp4");
         assert_eq!(f.cursor, 3);
-        f.press(Key::Right);
-        f.press(Key::Right);
-        f.press(Key::Space);
+        f.press(Key::Right, &mut clip);
+        f.press(Key::Right, &mut clip);
+        f.press(Key::Space, &mut clip);
         assert_eq!(f.value(0), "cli2. mp4");
         f.focus(0, Some(99));
         assert_eq!(f.cursor, 9, "clamped to the end");
         f.fields[0].value = "åäö".into();
         f.focus(0, Some(1));
-        f.press(Key::Backspace);
+        f.press(Key::Backspace, &mut clip);
         assert_eq!(f.value(0), "äö", "characters, not bytes");
+    }
+
+    #[test]
+    fn selection_is_replaced_or_deleted() {
+        let mut f = form();
+        let mut clip = String::new();
+        f.fields[0].value = "clip.mp4".into();
+        f.select_range(0, 4, 0);
+        assert_eq!(f.selection(), Some((0, 4)), "either order");
+        f.press(Key::Char('x'), &mut clip);
+        assert_eq!(f.value(0), "x.mp4");
+        assert_eq!((f.cursor, f.selection()), (1, None));
+        f.fields[0].value = "clip.mp4".into();
+        f.select_range(0, 2, 6);
+        f.press(Key::Backspace, &mut clip);
+        assert_eq!(f.value(0), "clp4");
+        assert_eq!(f.cursor, 2);
+        f.select_range(0, 1, 3);
+        f.press(Key::Left, &mut clip);
+        assert_eq!(
+            (f.cursor, f.selection()),
+            (1, None),
+            "collapses to the start"
+        );
+        f.select_range(0, 1, 3);
+        f.press(Key::Right, &mut clip);
+        assert_eq!((f.cursor, f.selection()), (3, None), "collapses to the end");
+        f.select_all();
+        assert_eq!(f.selection(), Some((0, 4)));
+        f.focus(0, Some(1));
+        assert_eq!(f.selection(), None, "clicking clears it");
+    }
+
+    #[test]
+    fn copy_and_paste_round_trip() {
+        let mut f = form();
+        let mut clip = String::new();
+        f.fields[0].value = "clip.mp4".into();
+        f.select_range(0, 0, 4);
+        f.press(Key::Copy, &mut clip);
+        assert_eq!(clip, "clip");
+        assert_eq!(f.selection(), Some((0, 4)), "copying keeps the selection");
+        f.focus(0, None);
+        f.press(Key::Paste, &mut clip);
+        assert_eq!(f.value(0), "clip.mp4clip");
+        assert_eq!(f.cursor, 12);
+        f.focus(0, None);
+        f.press(Key::Copy, &mut clip);
+        assert_eq!(clip, "clip.mp4clip", "nothing selected: the whole field");
+        f.fields[1].value = "secret".into();
+        f.focus(1, None);
+        f.press(Key::Copy, &mut clip);
+        assert_eq!(clip, "clip.mp4clip", "passwords are never copied");
+        f.select_range(0, 4, 12);
+        f.press(Key::Paste, &mut clip);
+        assert_eq!(
+            f.value(0),
+            "clipclip.mp4clip",
+            "pasting replaces the selection"
+        );
+        clip.clear();
+        f.select_range(0, 0, 4);
+        f.press(Key::Paste, &mut clip);
+        assert_eq!(
+            f.selection(),
+            Some((0, 4)),
+            "an empty clipboard does nothing"
+        );
     }
 
     #[test]
@@ -481,6 +639,13 @@ mod tests {
                 "{key:?}"
             );
             assert!(y + h <= 1000.0, "{key:?} below the panel");
+            if matches!(key, Key::Copy | Key::Paste) {
+                assert_eq!(
+                    x,
+                    X0 + 1600.0 - 2.0 * X0 - 180.0,
+                    "{key:?} at the right edge"
+                );
+            }
         }
     }
 }

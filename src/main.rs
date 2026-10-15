@@ -936,7 +936,7 @@ fn main() -> anyhow::Result<()> {
                 &dir.join("browsing-move.png"),
             )?;
             let mut adding = servers.clone();
-            adding.form = Some(Form::new(
+            let mut form = Form::new(
                 "Add server",
                 ["Address", "User", "Password", "Name"]
                     .iter()
@@ -949,7 +949,10 @@ fn main() -> anyhow::Result<()> {
                     })
                     .collect(),
                 "Connect",
-            ));
+            );
+            // Part of the address selected by dragging across it.
+            form.select_range(0, 4, 11);
+            adding.form = Some(form);
             just_video::ui::save_png(
                 &render(&adding, &mut fonts, Some((700.0, 700.0)), true),
                 &dir.join("form.png"),

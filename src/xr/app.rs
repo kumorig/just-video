@@ -9,7 +9,7 @@ use super::player::{
 use super::renderer::{QuadTarget, Renderer};
 use crate::ui::canvas::Fonts;
 use crate::ui::navigator::Navigator;
-use crate::ui::{browser, captions, controls};
+use crate::ui::{browser, captions, controls, form};
 use crate::vr::Projection;
 use anyhow::Context;
 use openxr as xr;
@@ -1156,6 +1156,17 @@ pub fn run(
                                 matches!(p.hit, browser::Hit::Row(_) | browser::Hit::RowAction(..));
                             if p.hit == browser::Hit::ScrollBar {
                                 nav.set_scroll(browser::scroll_at(nav.view(), y));
+                            } else if let (
+                                browser::Hit::Form(form::Hit::Field(i, from)),
+                                browser::Hit::Form(form::Hit::Field(j, to)),
+                            ) = (p.hit, hit)
+                                && i == j
+                                && (p.dragging || from != to)
+                                && !p.long_pressed
+                            {
+                                // Dragging across a field selects its text.
+                                p.dragging = true;
+                                nav.drag_select(i, from, to);
                             } else if on_list
                                 && !p.long_pressed
                                 && (p.dragging || (y - p.start_y).abs() > LIST_DRAG_PX)
@@ -1167,13 +1178,19 @@ pub fn run(
                                 );
                             }
                         }
-                        if let browser::Hit::Row(i) = p.hit
-                            && !p.dragging
-                            && !p.long_pressed
-                            && now - p.since > LONG_PRESS_NS
-                        {
-                            p.long_pressed = true;
-                            nav.long_press(i);
+                        if !p.dragging && !p.long_pressed && now - p.since > LONG_PRESS_NS {
+                            match p.hit {
+                                browser::Hit::Row(i) => {
+                                    p.long_pressed = true;
+                                    nav.long_press(i);
+                                }
+                                // Holding on a field selects all of its text.
+                                browser::Hit::Form(form::Hit::Field(i, _)) => {
+                                    p.long_pressed = true;
+                                    nav.select_all_field(i);
+                                }
+                                _ => {}
+                            }
                         }
                     } else {
                         if !p.dragging && !p.long_pressed {

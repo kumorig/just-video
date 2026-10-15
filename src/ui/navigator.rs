@@ -175,6 +175,8 @@ pub struct Navigator {
     dirty: bool,
     /// Exit was chosen on the top page; the app reads it with [`Navigator::take_exit`].
     exit_requested: bool,
+    /// Text copied in a form, kept for pasting into the next.
+    clipboard: String,
     /// Where the playing video is, for fetching its subtitle files.
     playing_source: Option<(Server, String)>,
     /// The subtitle fetch awaited (request id, track) and its answer.
@@ -208,6 +210,7 @@ impl Navigator {
             generation: 0,
             dirty: true,
             exit_requested: false,
+            clipboard: String::new(),
             playing_source: None,
             subtitle_request: None,
             subtitle_result: None,
@@ -1377,7 +1380,7 @@ impl Navigator {
         self.dirty = true;
         match hit {
             form::Hit::Field(i, cursor) => f.focus(i, Some(cursor)),
-            form::Hit::Key(key) => match f.press(key) {
+            form::Hit::Key(key) => match f.press(key, &mut self.clipboard) {
                 Some(Key::Cancel) => {
                     self.view.form = None;
                     self.purpose = None;
@@ -1385,7 +1388,28 @@ impl Navigator {
                 Some(Key::Submit) => self.submit_form(),
                 _ => {}
             },
-            form::Hit::Nothing => {}
+            form::Hit::Nothing => f.clear_selection(),
+        }
+    }
+
+    /// Dragging across field `i`: selects from character `from` to `to`.
+    pub fn drag_select(&mut self, i: usize, from: usize, to: usize) {
+        if let Some(f) = &mut self.view.form
+            && i < f.fields.len()
+        {
+            f.select_range(i, from, to);
+            self.dirty = true;
+        }
+    }
+
+    /// Holding on field `i` selects all of its text.
+    pub fn select_all_field(&mut self, i: usize) {
+        if let Some(f) = &mut self.view.form
+            && i < f.fields.len()
+        {
+            f.focus(i, None);
+            f.select_all();
+            self.dirty = true;
         }
     }
 
