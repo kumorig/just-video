@@ -226,6 +226,9 @@ struct JVDecoder {
     AVFrame *transfer;  // scratch for hwaccel -> CPU transfers
     FormatChoice choice;
     int flushing;
+    // `packet` holds a video packet the decoder refused for now (EAGAIN): it
+    // is sent again once a picture has been taken out.
+    int packet_held;
     // While catching up to a seek target: video packets before this time
     // (stream time base) skip non-reference frames, which nothing else needs.
     int64_t skip_until;
@@ -754,11 +757,30 @@ static int64_t take_earliest(JVDecoder *d) {
     return ts;
 }
 
+// How long one call to jv_decoder_next may wait in the hardware decoder for a
+// picture (it returns an error then, and the player stops with a message
+// instead of hanging). Needs FFmpeg patch 0002, which bounds each wait.
+#define HARDWARE_STALL_US 3000000
+
 int jv_decoder_next(JVDecoder *d, JVFrame *out) {
     AVFrame *frame = av_frame_alloc();
     if (!frame) return AVERROR(ENOMEM);
+    // Time spent waiting in the hardware decoder for a picture (reading and
+    // other work don't count): it blocks only when the driver is slow, or has
+    // stopped (every buffer it can decode into held elsewhere, a lost session).
+    int64_t waited = 0;
     for (;;) {
+        int64_t began = av_gettime_relative();
         int ret = avcodec_receive_frame(d->ctx, frame);
+        if (ret == AVERROR(EAGAIN) && d->choice.hardware_wrapper) {
+            waited += av_gettime_relative() - began;
+            if (waited > HARDWARE_STALL_US) {
+                av_log(NULL, AV_LOG_ERROR, "Hardware decoder returned no picture for %lld ms\n",
+                       (long long)(waited / 1000));
+                av_frame_free(&frame);
+                return AVERROR(ETIMEDOUT);
+            }
+        }
         if (ret == 0 && d->choice.hardware_wrapper) {
             if (d->stale > 0) {  // queued before the last seek
                 d->stale--;
@@ -781,13 +803,17 @@ int jv_decoder_next(JVDecoder *d, JVFrame *out) {
             return ret;
         }
         if (ret != AVERROR(EAGAIN)) { av_frame_free(&frame); return ret; }  // EOF or error
-        ret = av_read_frame(d->media->format, d->packet);
-        if (ret == AVERROR_EOF && !d->flushing) {
-            d->flushing = 1;
-            avcodec_send_packet(d->ctx, NULL);
-            continue;
+        if (d->packet_held) {
+            d->packet_held = 0;  // sent again below
+        } else {
+            ret = av_read_frame(d->media->format, d->packet);
+            if (ret == AVERROR_EOF && !d->flushing) {
+                d->flushing = 1;
+                avcodec_send_packet(d->ctx, NULL);
+                continue;
+            }
+            if (ret < 0) { av_frame_free(&frame); return ret; }
         }
-        if (ret < 0) { av_frame_free(&frame); return ret; }
         if (d->audio && d->packet->stream_index == d->media->audio_stream) {
             decode_audio_packet(d, d->packet);
             av_packet_unref(d->packet);
@@ -807,6 +833,7 @@ int jv_decoder_next(JVDecoder *d, JVFrame *out) {
             if (!skip) d->skip_until = AV_NOPTS_VALUE;
         }
         ret = avcodec_send_packet(d->ctx, d->packet);
+        if (ret == AVERROR(EAGAIN)) { d->packet_held = 1; continue; }  // take a picture first
         if (ret >= 0 && d->choice.hardware_wrapper) remember_packet(d, d->packet);
         av_packet_unref(d->packet);
         // A damaged packet costs a glitch, not the whole playback.
@@ -830,6 +857,10 @@ int jv_decoder_seek(JVDecoder *d, double seconds) {
     int ret = av_seek_frame(d->media->format, d->media->video_stream, video_ts(d, seconds),
                             AVSEEK_FLAG_BACKWARD);
     if (ret < 0) return ret;
+    if (d->packet_held) {
+        av_packet_unref(d->packet);
+        d->packet_held = 0;
+    }
     avcodec_flush_buffers(d->ctx);
     d->ctx->skip_frame = AVDISCARD_DEFAULT;
     d->skip_until = AV_NOPTS_VALUE;
