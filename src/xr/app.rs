@@ -2,6 +2,7 @@
 //! with a control bar, and controller input (point, click, drag).
 
 use super::context::{VIEW_TYPE, XrContext};
+use super::frame_timing::{FrameTiming, Phase};
 use super::input::{Input, InputState, Ray};
 use super::player::{
     Placement, PlayOptions, PlayStats, Playback, ViewOptions, eye_params, screen_size,
@@ -931,6 +932,19 @@ pub fn run(
     // Previous (-1) or next (+1) video requested from the control bar.
     let mut switch_video: Option<isize> = None;
 
+    // Testing over SSH with nobody wearing the headset: the runtime never asks
+    // for frames then, so draw them anyway (it just doesn't show them).
+    let render_unseen = std::env::var_os("JUST_VIDEO_RENDER_UNSEEN").is_some();
+    let mut timing = FrameTiming::default();
+    // Time since `mark` in ms; moves `mark` to now.
+    let lap = |mark: &mut Instant| {
+        let now = Instant::now();
+        let ms = (now - *mark).as_secs_f64() * 1e3;
+        *mark = now;
+        ms
+    };
+    let mut period = 0i64;
+
     'main: loop {
         heartbeat.store(loop_started.elapsed().as_millis() as i64, Ordering::Relaxed);
         set_phase(0);
@@ -969,14 +983,18 @@ pub fn run(
         }
 
         set_phase(1);
+        let mut mark = Instant::now();
         let state = ctx.frame_waiter.wait()?;
         ctx.frame_stream.begin()?;
+        timing.add(Phase::Wait, lap(&mut mark));
         stats.xr_frames += 1;
-        if !state.should_render {
+        if !state.should_render && !render_unseen {
             ctx.frame_stream
                 .end(state.predicted_display_time, ctx.blend_mode, &[])?;
+            timing.restart();
             continue;
         }
+        period = state.predicted_display_period.as_nanos();
         stats.rendered_xr_frames += 1;
         let now = state.predicted_display_time.as_nanos();
         let dt = state.predicted_display_period.as_nanos() as f32 / 1e9;
@@ -1034,6 +1052,8 @@ pub fn run(
             let mut saved: Option<ResumeSaved> = None;
             if let Mode::Playing(playback) = std::mem::replace(&mut mode, Mode::Browser) {
                 input.wait_for_dpad_release();
+                timing.report(period);
+                timing.restart();
                 saved = save_resume(playing_key.as_ref(), &playback);
                 stats.displayed_frames += playback.stats.displayed_frames;
                 stats.uploaded_frames += playback.stats.uploaded_frames;
@@ -1072,6 +1092,9 @@ pub fn run(
         // in the browser): SteamVR only treats an app showing one as running,
         // and otherwise leaves its own menu in front ("start in background").
         let eyes_rendered;
+        // Whether a picture was uploaded, and pictures skipped so far, on
+        // frames that drew the video.
+        let mut uploaded = None;
         match &mut mode {
             Mode::Browser => {
                 set_phase(4);
@@ -2020,6 +2043,7 @@ pub fn run(
                 }
                 set_phase(6);
                 let upload = playback.advance(now);
+                timing.add(Phase::Advance, lap(&mut mark));
                 // A hairline sweeping along the bar's top edge while the next
                 // picture is awaited (after opening or seeking).
                 progress_at = controls_panel_at
@@ -2043,6 +2067,8 @@ pub fn run(
                     });
                 renderer.begin_frame(if upload { playback.current() } else { None })?;
                 if upload {
+                    timing.add(Phase::Copy, renderer.copy_ms);
+                    mark += Duration::from_secs_f64(renderer.copy_ms / 1e3);
                     playback.stats.uploaded_frames += 1;
                 }
                 let show = playback.current().is_some();
@@ -2075,7 +2101,13 @@ pub fn run(
                 if capture.is_some() {
                     renderer.record_readback(0, indices[0])?;
                 }
+                timing.add(Phase::Record, lap(&mut mark));
                 renderer.end_frame()?;
+                timing.add(Phase::Gpu, lap(&mut mark));
+                let gpu = renderer.gpu_ms();
+                timing.add(Phase::GpuUpload, gpu[0]);
+                timing.add(Phase::GpuEyes, gpu[1] + gpu[2]);
+                uploaded = Some((upload, playback.stats.skipped_frames));
                 if let Some((path, _)) = capture {
                     renderer.take_screenshot(0, &path)?;
                     stats.screenshot = Some(path.display().to_string());
@@ -2269,7 +2301,17 @@ pub fn run(
         }
         ctx.frame_stream
             .end(state.predicted_display_time, ctx.blend_mode, &layers)?;
+        if let Some((uploaded, skipped)) = uploaded {
+            timing.add(Phase::End, lap(&mut mark));
+            timing.frame(
+                state.predicted_display_time.as_nanos(),
+                period,
+                uploaded,
+                skipped,
+            );
+        }
     }
+    timing.report(period);
     options.quit.store(true, Ordering::Relaxed);
     if let Mode::Playing(playback) = mode {
         // Written here, not in the background: the app is about to exit.
