@@ -318,6 +318,29 @@ struct Settings {
     /// The browser panel's width, as a multiple of its usual width.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     browser_width: Option<f32>,
+    /// Jumps land exactly on their target (decoding up to it) rather than
+    /// on the keyframe before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seek_exact: Option<bool>,
+}
+
+/// Where a jump lands: name and whether it is exact (see [`seek_exact`]).
+pub const SEEK_LANDING_PRESETS: [(&str, bool); 2] = [("Keyframe", false), ("Exact", true)];
+
+/// Whether jumps decode on to their exact target. Off, a jump shows the
+/// keyframe before the target at once, which can be seconds early with
+/// long keyframe intervals but is as quick as a seek gets.
+pub fn seek_exact() -> bool {
+    read_json::<Settings>("settings.json")
+        .ok()
+        .and_then(|s| s.seek_exact)
+        .unwrap_or(false)
+}
+
+pub fn save_seek_exact(exact: bool) -> anyhow::Result<()> {
+    let mut settings: Settings = read_json("settings.json")?;
+    settings.seek_exact = Some(exact);
+    write_json("settings.json", &settings, false)
 }
 
 /// Choices for how much a curved screen bends: name and the fraction of

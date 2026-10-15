@@ -65,6 +65,8 @@ pub enum Icon {
     Curve,
     /// Width: a double-headed arrow.
     Width,
+    /// A jump in the video: an arrow to a bar.
+    Jump,
     /// Close the app.
     Exit,
 }
@@ -584,6 +586,22 @@ fn draw_icon(canvas: &mut Canvas, icon: &Icon, cx: f32, cy: f32, bg: Rgb) {
                 );
             }
             canvas.circle(cx, cy + 14.0, 5.0, SUBTLE);
+        }
+        Icon::Jump => {
+            // An arrow to a bar: the shaft, its head of shortening strokes, the bar.
+            canvas.rect(cx - 22.0, cy - 2.5, 28.0, 5.0, 2.0, ACCENT);
+            for i in 0..10 {
+                let t = i as f32;
+                canvas.rect(
+                    cx - 4.0 + t,
+                    cy - 11.0 + t,
+                    1.5,
+                    22.0 - 2.0 * t,
+                    0.0,
+                    ACCENT,
+                );
+            }
+            canvas.rect(cx + 12.0, cy - 14.0, 5.0, 28.0, 2.0, ACCENT);
         }
         Icon::Width => {
             canvas.rect(cx - 20.0, cy - 2.5, 40.0, 5.0, 2.0, ACCENT);

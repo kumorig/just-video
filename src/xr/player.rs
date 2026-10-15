@@ -400,9 +400,18 @@ fn spawn_audio(
         .expect("spawn audio thread");
 }
 
-/// A seek: generation, target seconds and, for a jump forward, where
-/// playback was (frames before it are never shown).
-type SeekCommand = (u64, f64, Option<f64>);
+/// A seek: generation, target seconds and how it lands.
+type SeekCommand = (u64, f64, Landing);
+
+/// Where a seek shows from.
+#[derive(Clone, Copy, Debug)]
+enum Landing {
+    /// The keyframe at or before the target, at once; for a jump forward
+    /// from here, never behind where playback was.
+    Keyframe { from: Option<f64> },
+    /// The target itself: decode on to it, skipping what nothing refers to.
+    Exact,
+}
 
 struct DecodeThread {
     frames: mpsc::Receiver<Decoded>,
@@ -450,12 +459,18 @@ fn spawn_decoder(
                         eprintln!("Audio: can't decode track {track}");
                     }
                 }
-                while let Ok((g, t, from)) = commands.try_recv() {
+                while let Ok((g, t, how)) = commands.try_recv() {
                     if let Err(e) = decoder.seek(t) {
                         eprintln!("Seek to {t:.1}s failed: {e:#}");
                     }
                     (generation, start) = (g, t);
-                    landing = Some((t, from));
+                    landing = match how {
+                        Landing::Keyframe { from } => Some((t, from)),
+                        Landing::Exact => {
+                            decoder.skip_nonref_until(t);
+                            None
+                        }
+                    };
                 }
                 while let Ok(track) = subtitle_changes.try_recv() {
                     embedded_cues.lock().expect("cues").clear();
@@ -622,6 +637,8 @@ pub struct Playback {
     pub error: Option<String>,
     fps: f64,
     pub duration: f64,
+    /// Jumps decode on to their target (see [`config::seek_exact`]).
+    exact_seeks: bool,
     last_pts: f64,
     /// Display time (ns) corresponding to media time 0.
     clock_start: Option<i64>,
@@ -728,6 +745,7 @@ impl Playback {
             error: None,
             fps,
             duration,
+            exact_seeks: crate::config::seek_exact(),
             last_pts: start - 1.0 / fps,
             clock_start: None,
             paused_at: None,
@@ -1056,8 +1074,8 @@ impl Playback {
     }
 
     /// Jumps to `seconds`; the current picture stays until the new one
-    /// arrives, which is the keyframe at or before the target (a jump
-    /// forward never lands behind where it started).
+    /// arrives: the keyframe at or before the target (a jump forward never
+    /// lands behind where it started), or with exact seeks the target itself.
     pub fn seek(&mut self, seconds: f64) {
         let target = seconds.clamp(0.0, (self.duration - 0.5).max(0.0));
         self.generation += 1;
@@ -1068,8 +1086,14 @@ impl Playback {
             audio.generation.store(self.generation, Ordering::Relaxed);
             *audio.clock.lock().expect("audio clock") = None;
         }
-        let from = (target > self.last_pts).then_some(self.last_pts);
-        let _ = self.decode.control.send((self.generation, target, from));
+        let landing = if self.exact_seeks {
+            Landing::Exact
+        } else {
+            Landing::Keyframe {
+                from: (target > self.last_pts).then_some(self.last_pts),
+            }
+        };
+        let _ = self.decode.control.send((self.generation, target, landing));
         self.next = None;
         self.ended = false;
         self.error = None;

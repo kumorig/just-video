@@ -985,7 +985,7 @@ fn main() -> anyhow::Result<()> {
                         ..Row::new(Icon::Add, "Add server")
                     },
                     Row {
-                        detail: "Buffer ahead, screen curvature, browser width".into(),
+                        detail: "Buffer ahead, screen curvature, browser width, jumps".into(),
                         ..Row::new(Icon::Chevron(true), "Settings")
                     },
                     Row {
@@ -1002,6 +1002,12 @@ fn main() -> anyhow::Result<()> {
                         detail: "How wide this window is".into(),
                         inset: true,
                         ..Row::new(Icon::Width, "Browser width: 100%")
+                    },
+                    Row {
+                        detail: "Where a jump lands: the keyframe before the target at once, or exactly on it"
+                            .into(),
+                        inset: true,
+                        ..Row::new(Icon::Jump, "Jumps land on: Keyframe")
                     },
                 ],
                 tools: vec![Tool::icon(Icon::Exit)],

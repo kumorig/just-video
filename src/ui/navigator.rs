@@ -64,6 +64,8 @@ enum Item {
     Curvature,
     /// The browser panel's width; a dialog of presets.
     BrowserWidth,
+    /// Where a jump lands: the keyframe before the target, or exactly on it.
+    SeekLanding,
     Share(String),
     Dir(String),
     Video {
@@ -84,7 +86,12 @@ enum Item {
 }
 
 /// The rows under Settings, in order.
-const SETTINGS: [Item; 3] = [Item::BufferSize, Item::Curvature, Item::BrowserWidth];
+const SETTINGS: [Item; 4] = [
+    Item::BufferSize,
+    Item::Curvature,
+    Item::BrowserWidth,
+    Item::SeekLanding,
+];
 
 impl Item {
     fn name(&self) -> &str {
@@ -94,7 +101,8 @@ impl Item {
             | Item::Settings
             | Item::BufferSize
             | Item::Curvature
-            | Item::BrowserWidth => "",
+            | Item::BrowserWidth
+            | Item::SeekLanding => "",
             Item::Share(n)
             | Item::Dir(n)
             | Item::Video { name: n, .. }
@@ -154,6 +162,8 @@ enum Purpose {
     /// Choosing from [`config::CURVATURE_PRESETS`] / [`config::BROWSER_WIDTH_PRESETS`].
     Curvature,
     BrowserWidth,
+    /// Choosing from [`config::SEEK_LANDING_PRESETS`].
+    SeekLanding,
     Info,
 }
 
@@ -210,6 +220,7 @@ pub struct Navigator {
     /// Settings read once and kept up to date here.
     curvature: f32,
     browser_width: f32,
+    seek_exact: bool,
     /// Where the playing video is, for fetching its subtitle files.
     playing_source: Option<(Server, String)>,
     /// The subtitle fetch awaited (request id, track) and its answer.
@@ -247,6 +258,7 @@ impl Navigator {
             settings_open: false,
             curvature: config::curvature(),
             browser_width: config::browser_width(),
+            seek_exact: config::seek_exact(),
             playing_source: None,
             subtitle_request: None,
             subtitle_result: None,
@@ -435,6 +447,11 @@ impl Navigator {
         self.browser_width
     }
 
+    /// Whether jumps decode on to their exact target (see [`config::seek_exact`]).
+    pub fn seek_exact(&self) -> bool {
+        self.seek_exact
+    }
+
     /// What a settings dialog previews, given what the pointer is on: the
     /// choice pointed at, otherwise the saved one.
     pub fn preview(&self, hover: Hit) -> Option<Preview> {
@@ -506,8 +523,12 @@ impl Navigator {
     fn rebuild_rows(&mut self) {
         let editing = self.editing();
         let selecting = self.selecting.as_ref();
-        let (settings_open, curvature, browser_width) =
-            (self.settings_open, self.curvature, self.browser_width);
+        let (settings_open, curvature, browser_width, seek_exact) = (
+            self.settings_open,
+            self.curvature,
+            self.browser_width,
+            self.seek_exact,
+        );
         self.view.rows = self
             .items
             .iter()
@@ -534,7 +555,7 @@ impl Navigator {
                         ..Row::new(Icon::Add, "Add server")
                     },
                     Item::Settings => Row {
-                        detail: "Buffer ahead, screen curvature, browser width".into(),
+                        detail: "Buffer ahead, screen curvature, browser width, jumps".into(),
                         ..Row::new(Icon::Chevron(settings_open), "Settings")
                     },
                     Item::BufferSize => Row {
@@ -565,6 +586,18 @@ impl Navigator {
                         ..Row::new(
                             Icon::Width,
                             format!("Browser width: {}", config::percent(browser_width)),
+                        )
+                    },
+                    Item::SeekLanding => Row {
+                        detail: "Where a jump lands: the keyframe before the target at once, or exactly on it"
+                            .into(),
+                        inset: true,
+                        ..Row::new(
+                            Icon::Jump,
+                            format!(
+                                "Jumps land on: {}",
+                                config::SEEK_LANDING_PRESETS[seek_exact as usize].0
+                            ),
                         )
                     },
                     Item::Share(name) => Row::new(Icon::Share, name),
@@ -1318,6 +1351,23 @@ impl Navigator {
                 self.dirty = true;
             }
             (Item::Settings, _) => self.toggle_settings(),
+            (Item::SeekLanding, _) => {
+                self.view.dialog = Some(Dialog {
+                    title: "Where jumps land".into(),
+                    body: vec![
+                        "Keyframe: the picture before the target shows at once, up to a few seconds early. Exact: decodes on to the target first."
+                            .into(),
+                    ],
+                    buttons: config::SEEK_LANDING_PRESETS
+                        .iter()
+                        .map(|(name, _)| name.to_string())
+                        .collect(),
+                    danger: false,
+                    choice: Some(self.seek_exact as usize),
+                });
+                self.purpose = Some(Purpose::SeekLanding);
+                self.dirty = true;
+            }
             (Item::Curvature, _) => {
                 self.view.dialog = Some(Dialog {
                     title: "Screen curvature".into(),
@@ -1530,6 +1580,16 @@ impl Navigator {
                     self.curvature = curvature;
                     if let Err(e) = config::save_curvature(curvature) {
                         eprintln!("Can't save the curvature: {e:#}");
+                    }
+                }
+                self.rebuild_rows();
+                return;
+            }
+            Some(Purpose::SeekLanding) => {
+                if let Some(&(_, exact)) = config::SEEK_LANDING_PRESETS.get(button) {
+                    self.seek_exact = exact;
+                    if let Err(e) = config::save_seek_exact(exact) {
+                        eprintln!("Can't save where jumps land: {e:#}");
                     }
                 }
                 self.rebuild_rows();
@@ -2036,13 +2096,21 @@ mod tests {
 
     #[test]
     fn settings_row_expands_into_inset_children() {
+        // The jump choice below is saved: not into the user's settings.
+        let dir = config::temp_config("nav-settings");
         let mut nav = Navigator::new(Library::start(None));
         let last = nav.view().rows.len() - 1;
         nav.click(Hit::Row(last));
         let icons: Vec<Icon> = nav.view().rows.iter().map(|r| r.icon.clone()).collect();
         assert_eq!(
             &icons[last..],
-            [Icon::Chevron(true), Icon::Buffer, Icon::Curve, Icon::Width]
+            [
+                Icon::Chevron(true),
+                Icon::Buffer,
+                Icon::Curve,
+                Icon::Width,
+                Icon::Jump
+            ]
         );
         assert!(!nav.view().rows[last].inset);
         assert!(nav.view().rows[last + 1..].iter().all(|r| r.inset));
@@ -2068,8 +2136,21 @@ mod tests {
             Some(Preview::BrowserWidth(0.5))
         );
         nav.back();
+        // Where jumps land: a two-way choice, saved and shown in the row.
+        nav.click(Hit::Row(last + 4));
+        assert_eq!(
+            nav.view().dialog.as_ref().map(|d| d.title.as_str()),
+            Some("Where jumps land")
+        );
+        nav.click(Hit::DialogButton(1));
+        assert!(nav.seek_exact());
+        assert_eq!(nav.view().rows[last + 4].label, "Jumps land on: Exact");
+        nav.click(Hit::Row(last + 4));
+        nav.click(Hit::DialogButton(0));
+        assert!(!nav.seek_exact());
         nav.click(Hit::Row(last));
         assert_eq!(nav.view().rows.len(), last + 1, "closed again");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
