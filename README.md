@@ -33,7 +33,18 @@ bash scripts/build-frame.sh
    bash scripts/install-frame.sh   # FRAME_HOST=<ip> if frame.local doesn't resolve
    ```
 
+The same steps work from a Mac: the build cross-compiles with zig, and
+`ssh-copy-id` and `rsync` ship with macOS.
+
 ## Run
 
 Start **Just Video** from the Steam library on the Frame, choose **Add server**
 and enter your SMB server's address and login.
+
+## Controls
+
+- **Trigger** or **A**: select. **B**: back, or stop the video.
+- **Thumbstick**: scroll; hold the **grip** to scroll faster. **Click** it to reset the view.
+- **Grip**: drag the browser or control bar, nearer or farther.
+- **D-pad left/right** (or a sideways stick flick): jump 5 seconds.
+- **Hold** a file or server to rename, move or delete it.
