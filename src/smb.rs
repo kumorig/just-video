@@ -9,7 +9,14 @@ use smb::{
     Client, ClientConfig, ConnectionConfig, DirAccessMask, Directory, File, FileAccessMask,
     FileCreateArgs, FileDirectoryInformation, UncPath,
 };
-use std::{io, str::FromStr, sync::Arc};
+use std::{
+    io,
+    str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 use tokio::runtime::Runtime;
 
 /// `smb://[domain;]user@host[:port][/share[/path]]`. Passwords are never part of
@@ -378,10 +385,7 @@ impl SmbSession {
         let (file, len) = self.open_file(share, path)?;
         Ok(ReadAheadReader::new(
             self.runtime.clone(),
-            SmbFile {
-                file,
-                _session: None,
-            },
+            SmbFile::single(file, None),
             len,
             options,
         ))
@@ -396,13 +400,46 @@ impl SmbSession {
         path: &str,
         options: ReadAhead,
     ) -> anyhow::Result<SmbReader> {
-        let (file, len) = self.open_file(share, path)?;
+        Self::open_striped(std::slice::from_ref(self), share, path, options)
+    }
+
+    /// Like [`SmbSession::open_owned`] over several sessions (connections) to
+    /// the same server: each read goes to the one with the least data still
+    /// to come. Over Wi-Fi two TCP connections can carry more than one, and
+    /// ride out a stall of either (see `config::video_connections`). Sessions
+    /// after the first that can't open the file are left out.
+    pub fn open_striped(
+        sessions: &[Arc<Self>],
+        share: &str,
+        path: &str,
+        options: ReadAhead,
+    ) -> anyhow::Result<SmbReader> {
+        let first = sessions.first().context("No connection")?;
+        // Each open is a round trip (two before a share's first use): all at once.
+        let (opened, extra) = std::thread::scope(|scope| {
+            let extra: Vec<_> = sessions[1..]
+                .iter()
+                .map(|session| scope.spawn(move || (session, session.open_file(share, path))))
+                .collect();
+            let opened = first.open_file(share, path);
+            let extra: Vec<_> = extra.into_iter().filter_map(|h| h.join().ok()).collect();
+            (opened, extra)
+        });
+        let (file, len) = opened?;
+        let mut source = SmbFile::single(file, Some(first.clone()));
+        for (session, opened) in extra {
+            match opened {
+                Ok((file, _)) => source.lanes.push(Lane {
+                    file,
+                    busy: AtomicUsize::new(0),
+                    _session: Some(session.clone()),
+                }),
+                Err(e) => eprintln!("SMB: reading {path} over one connection less: {e:#}"),
+            }
+        }
         Ok(ReadAheadReader::new(
-            self.runtime.clone(),
-            SmbFile {
-                file,
-                _session: Some(self.clone()),
-            },
+            first.runtime.clone(),
+            source,
             len,
             options,
         ))
@@ -639,20 +676,60 @@ pub fn explain(error: &anyhow::Error) -> String {
     format!("{first}{}.", chars.as_str())
 }
 
-/// An open SMB file as a read-ahead block source.
+/// An open SMB file as a read-ahead block source: the file opened over one
+/// or more connections ("lanes", see [`SmbSession::open_striped`]).
 pub struct SmbFile {
+    lanes: Vec<Lane>,
+}
+
+/// The file opened on one connection.
+struct Lane {
     file: File,
+    /// Bytes requested on this lane and not yet received.
+    busy: AtomicUsize,
     /// Keeps a dedicated session (and its connection) alive while reading.
     _session: Option<Arc<SmbSession>>,
+}
+
+impl SmbFile {
+    fn single(file: File, session: Option<Arc<SmbSession>>) -> Self {
+        Self {
+            lanes: vec![Lane {
+                file,
+                busy: AtomicUsize::new(0),
+                _session: session,
+            }],
+        }
+    }
+
+    /// The lane with the least data still to come: a read after a jump goes
+    /// past reads left from before it (they can't be cancelled).
+    fn least_busy(&self) -> usize {
+        (0..self.lanes.len())
+            .min_by_key(|&i| self.lanes[i].busy.load(Ordering::SeqCst))
+            .unwrap_or(0)
+    }
+}
+
+/// Gives a lane's bytes back when its read ends (or is dropped).
+struct Busy<'a>(&'a AtomicUsize, usize);
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(self.1, Ordering::SeqCst);
+    }
 }
 
 impl BlockSource for SmbFile {
     fn fetch(self: Arc<Self>, offset: u64, len: usize) -> BoxFuture<'static, io::Result<Vec<u8>>> {
         Box::pin(async move {
+            let lane = &self.lanes[self.least_busy()];
+            lane.busy.fetch_add(len, Ordering::SeqCst);
+            let _busy = Busy(&lane.busy, len);
             let mut buffer = vec![0u8; len];
             let mut filled = 0;
             while filled < len {
-                let n = self
+                let n = lane
                     .file
                     .read_block(&mut buffer[filled..], offset + filled as u64, None, false)
                     .await?;
@@ -671,8 +748,10 @@ impl BlockSource for SmbFile {
     fn close(&self) -> BoxFuture<'_, ()> {
         // Closing marks the handle closed, so late drops of aborted reads are no-ops.
         Box::pin(async {
-            let _ =
-                tokio::time::timeout(std::time::Duration::from_secs(5), self.file.close()).await;
+            for lane in &self.lanes {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), lane.file.close())
+                    .await;
+            }
         })
     }
 }

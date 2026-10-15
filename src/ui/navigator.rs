@@ -89,6 +89,8 @@ enum Item {
     Resume,
     /// The D-pad moves through menus. Two-way.
     DpadMenus,
+    /// SMB connections a playing video is read over: one or two. Two-way.
+    VideoConnections,
     Share(String),
     Dir(String),
     Video {
@@ -109,7 +111,7 @@ enum Item {
 }
 
 /// The rows of the Settings page, in order.
-const SETTINGS: [Item; 9] = [
+const SETTINGS: [Item; 10] = [
     Item::ShortJump,
     Item::LongJump,
     Item::SeekLanding,
@@ -119,6 +121,7 @@ const SETTINGS: [Item; 9] = [
     Item::BufferSize,
     Item::Curvature,
     Item::BrowserWidth,
+    Item::VideoConnections,
 ];
 
 impl Item {
@@ -134,7 +137,8 @@ impl Item {
             | Item::LongJump
             | Item::VolumeStep
             | Item::Resume
-            | Item::DpadMenus => "",
+            | Item::DpadMenus
+            | Item::VideoConnections => "",
             Item::Settings => "Settings",
             Item::Share(n)
             | Item::Dir(n)
@@ -678,6 +682,17 @@ impl Navigator {
                         detail: "Move through menus with the D-pad; A chooses, B goes back".into(),
                         right: if prefs.dpad_menus { "On" } else { "Off" }.into(),
                         ..Row::new(Icon::Dpad, "D-pad in menus")
+                    },
+                    Item::VideoConnections => Row {
+                        detail: "Read a playing video over two SMB connections (experimental)"
+                            .into(),
+                        right: if config::video_connections() > 1 {
+                            "Two"
+                        } else {
+                            "One"
+                        }
+                        .into(),
+                        ..Row::new(Icon::Server, "Video connections")
                     },
                     Item::Share(name) => Row::new(Icon::Share, name),
                     Item::Dir(name) => Row::new(Icon::Folder, name),
@@ -1440,6 +1455,18 @@ impl Navigator {
             (Item::Settings, _) => self.navigate(Location::Settings),
             (Item::Resume, _) => self.change_preference(|p| p.resume = !p.resume),
             (Item::DpadMenus, _) => self.change_preference(|p| p.dpad_menus = !p.dpad_menus),
+            (Item::VideoConnections, _) => {
+                let next = if config::video_connections() > 1 {
+                    1
+                } else {
+                    2
+                };
+                if let Err(e) = config::save_video_connections(next) {
+                    eprintln!("Can't save the setting: {e:#}");
+                }
+                self.rebuild_rows();
+                self.dirty = true;
+            }
             (Item::ShortJump, _) => {
                 self.preset_dialog(
                     "Jump",
@@ -2254,11 +2281,19 @@ mod tests {
                 Icon::Dpad,
                 Icon::Buffer,
                 Icon::Curve,
-                Icon::Width
+                Icon::Width,
+                Icon::Server
             ]
         );
-        let (jump, long_jump, landing, volume, resume, dpad, curvature, width) =
-            (0, 1, 2, 3, 4, 5, 7, 8);
+        let (jump, long_jump, landing, volume, resume, dpad, curvature, width, lanes) =
+            (0, 1, 2, 3, 4, 5, 7, 8, 9);
+        // Video connections: two-way, saved outside the player preferences.
+        assert_eq!(nav.view().rows[lanes].right, "One");
+        nav.click(Hit::Row(lanes));
+        assert_eq!(nav.view().rows[lanes].right, "Two");
+        assert_eq!(config::video_connections(), 2, "saved");
+        nav.click(Hit::Row(lanes));
+        assert_eq!(config::video_connections(), 1);
         assert_eq!(nav.view().rows[curvature].right, "Full");
         // The curvature dialog previews the choice pointed at, else the saved one.
         nav.click(Hit::Row(curvature));

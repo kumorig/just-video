@@ -488,6 +488,26 @@ fn connect(server: &Server, password: Option<String>) -> Result<Arc<SmbSession>,
     )?))
 }
 
+/// Connects `count` sessions for one video, all at once (each is a round
+/// trip or two). Only the first must succeed; the rest are left out with a
+/// log line, so a flaky second connection never stops a video.
+fn connect_lanes(server: &Server, count: usize) -> Result<Vec<Arc<SmbSession>>, String> {
+    std::thread::scope(|scope| {
+        let extra: Vec<_> = (1..count)
+            .map(|_| scope.spawn(|| connect(server, None)))
+            .collect();
+        let mut sessions = vec![connect(server, None)?];
+        for handle in extra {
+            match handle.join() {
+                Ok(Ok(session)) => sessions.push(session),
+                Ok(Err(e)) => eprintln!("Library: playing over one connection less: {e}"),
+                Err(_) => {}
+            }
+        }
+        Ok(sessions)
+    })
+}
+
 fn session(
     sessions: &Sessions,
     server: &Server,
@@ -695,18 +715,20 @@ fn run(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
             share,
             path,
         } => {
-            // A dedicated connection per video: if it wedges, only this video
-            // is affected, and it closes when the video does.
-            let result = connect(&server, None).and_then(|s| {
+            // Dedicated connections per video (one, or two when the Settings
+            // page says so): if one wedges, only this video is affected, and
+            // they close when the video does.
+            let result = connect_lanes(&server, config::video_connections()).and_then(|sessions| {
+                let s = &sessions[0];
                 let external_subtitles =
                     find_sidecars(&path, |folder| s.list_in(&share, &smb_path(folder)));
                 let read_ahead = ReadAhead {
                     reserve_bytes: config::reserve_bytes(),
                     ..ReadAhead::default()
                 };
-                let reader = s
-                    .open_owned(&share, &smb_path(&path), read_ahead)
-                    .map_err(err)?;
+                let reader =
+                    SmbSession::open_striped(&sessions, &share, &smb_path(&path), read_ahead)
+                        .map_err(err)?;
                 let (buffer, reserve) = (Some(reader.watch()), Some(reader.reserve()));
                 open_video(
                     &server,

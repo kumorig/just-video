@@ -236,6 +236,9 @@ struct ReadAheadArgs {
     /// Reads kept in flight ahead of the demuxer.
     #[arg(long, default_value_t = 32)]
     blocks_ahead: usize,
+    /// SMB connections the file is read over (the player's "Video connections" setting).
+    #[arg(long, default_value_t = 1)]
+    connections: usize,
 }
 
 impl ReadAheadArgs {
@@ -1343,9 +1346,12 @@ fn main() -> anyhow::Result<()> {
             mib,
             read_ahead,
         } => {
-            let session = connect(&url)?;
-            let path = session.url().path.clone();
-            let mut reader = session.open(&path, read_ahead.get())?;
+            let sessions: Vec<std::sync::Arc<SmbSession>> = (0..read_ahead.connections.max(1))
+                .map(|_| connect(&url).map(std::sync::Arc::new))
+                .collect::<anyhow::Result<_>>()?;
+            let target = sessions[0].url().clone();
+            let mut reader =
+                SmbSession::open_striped(&sessions, &target.share, &target.path, read_ahead.get())?;
             let limit = mib.map_or(reader.len(), |m| (m << 20).min(reader.len()));
             let mut buffer = vec![0u8; 256 * 1024];
             let mut total = 0u64;
