@@ -226,6 +226,9 @@ struct JVDecoder {
     AVFrame *transfer;  // scratch for hwaccel -> CPU transfers
     FormatChoice choice;
     int flushing;
+    // While catching up to a seek target: video packets before this time
+    // (stream time base) skip non-reference frames, which nothing else needs.
+    int64_t skip_until;
     // V4L2 wrapper only: the driver's frame timestamps can't be used (the
     // Frame's iris decoder tags pictures with another packet's time when
     // the file's pts aren't in display order, and wraps negative ones), and
@@ -491,6 +494,7 @@ JVDecoder *jv_decoder_open(JVMedia *media, const char *hw_backend, int allow_sof
     if (!d) goto fail;
     d->media = media;
     d->subtitle_stream = -1;
+    d->skip_until = AV_NOPTS_VALUE;
     d->packet = av_packet_alloc();
     d->transfer = av_frame_alloc();
     if (!d->packet || !d->transfer) goto fail;
@@ -777,6 +781,13 @@ int jv_decoder_next(JVDecoder *d, JVFrame *out) {
             continue;
         }
         if (d->packet->stream_index != d->media->video_stream) { av_packet_unref(d->packet); continue; }
+        if (d->skip_until != AV_NOPTS_VALUE) {
+            // Decode order: once a packet reaches the target, every later one
+            // decodes normally (a packet without a time ends skipping too).
+            int skip = d->packet->pts != AV_NOPTS_VALUE && d->packet->pts < d->skip_until;
+            d->ctx->skip_frame = skip ? AVDISCARD_NONREF : AVDISCARD_DEFAULT;
+            if (!skip) d->skip_until = AV_NOPTS_VALUE;
+        }
         ret = avcodec_send_packet(d->ctx, d->packet);
         if (ret >= 0 && d->choice.hardware_wrapper) remember_packet(d, d->packet);
         av_packet_unref(d->packet);
@@ -790,13 +801,20 @@ void jv_frame_release(void *handle) {
     av_frame_free(&frame);
 }
 
-int jv_decoder_seek(JVDecoder *d, double seconds) {
-    AVStream *video = d->media->format->streams[d->media->video_stream];
+// `seconds` from the video's start in the video stream's time base.
+static int64_t video_ts(const JVDecoder *d, double seconds) {
+    const AVStream *video = d->media->format->streams[d->media->video_stream];
     int64_t start = video->start_time != AV_NOPTS_VALUE ? video->start_time : 0;
-    int64_t ts = start + (int64_t)(seconds / av_q2d(video->time_base));
-    int ret = av_seek_frame(d->media->format, d->media->video_stream, ts, AVSEEK_FLAG_BACKWARD);
+    return start + (int64_t)(seconds / av_q2d(video->time_base));
+}
+
+int jv_decoder_seek(JVDecoder *d, double seconds) {
+    int ret = av_seek_frame(d->media->format, d->media->video_stream, video_ts(d, seconds),
+                            AVSEEK_FLAG_BACKWARD);
     if (ret < 0) return ret;
     avcodec_flush_buffers(d->ctx);
+    d->ctx->skip_frame = AVDISCARD_DEFAULT;
+    d->skip_until = AV_NOPTS_VALUE;
     if (d->choice.hardware_wrapper) {
         // FFmpeg's V4L2 decoder has no flush: whatever the driver holds
         // still comes out, ahead of the pictures from the new position.
@@ -814,6 +832,11 @@ int jv_decoder_seek(JVDecoder *d, double seconds) {
     if (d->subtitle) avcodec_flush_buffers(d->subtitle);
     d->flushing = 0;
     return 0;
+}
+
+void jv_decoder_skip_nonref_until(JVDecoder *d, double seconds) {
+    d->skip_until = seconds > 0 ? video_ts(d, seconds) : AV_NOPTS_VALUE;
+    if (d->skip_until == AV_NOPTS_VALUE) d->ctx->skip_frame = AVDISCARD_DEFAULT;
 }
 
 int jv_media_decode(JVMedia *media, const char *hw_backend, int allow_software,

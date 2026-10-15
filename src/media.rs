@@ -439,6 +439,7 @@ unsafe extern "C" {
     ) -> *mut RawDecoder;
     fn jv_decoder_next(decoder: *mut RawDecoder, frame: *mut RawFrame) -> c_int;
     fn jv_decoder_seek(decoder: *mut RawDecoder, seconds: f64) -> c_int;
+    fn jv_decoder_skip_nonref_until(decoder: *mut RawDecoder, seconds: f64);
     fn jv_frame_release(handle: *mut c_void);
     fn jv_decoder_enable_audio(decoder: *mut RawDecoder, rate: c_int, channels: c_int) -> c_int;
     fn jv_decoder_audio_available(decoder: *const RawDecoder) -> c_int;
@@ -754,6 +755,14 @@ impl VideoDecoder {
             }
         }
         cues
+    }
+
+    /// Until a packet reaches `seconds`, skip decoding frames no other frame
+    /// refers to: after a seek they are only decoded to be thrown away. Ends
+    /// by itself at `seconds`; 0 turns it off. Hardware (V4L2) decoders
+    /// ignore this.
+    pub fn skip_nonref_until(&mut self, seconds: f64) {
+        unsafe { jv_decoder_skip_nonref_until(self.raw, seconds) }
     }
 
     pub fn seek(&mut self, seconds: f64) -> anyhow::Result<()> {
