@@ -1096,6 +1096,11 @@ fn main() -> anyhow::Result<()> {
                         ..Row::new(Icon::Continue, "Continue where I left off")
                     },
                     Row {
+                        detail: "Move through menus with the D-pad; A chooses, B goes back".into(),
+                        right: "Off".into(),
+                        ..Row::new(Icon::Dpad, "D-pad in menus")
+                    },
+                    Row {
                         detail: "Fetched while paused, to play on without the network".into(),
                         right: "1 GB".into(),
                         ..Row::new(Icon::Buffer, "Buffer ahead")

@@ -339,6 +339,8 @@ pub struct Preferences {
     pub volume_step: u32,
     /// Continue videos where they were left.
     pub resume: bool,
+    /// The D-pad moves through menus (focus, A clicks, B goes back).
+    pub dpad_menus: bool,
 }
 
 impl Default for Preferences {
@@ -348,6 +350,7 @@ impl Default for Preferences {
             long_jump: 60,
             volume_step: 10,
             resume: true,
+            dpad_menus: false,
         }
     }
 }

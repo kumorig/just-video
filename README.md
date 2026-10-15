@@ -49,3 +49,4 @@ under **This headset**: Videos, Downloads, the home folder, SD card and USB driv
 - **Grip**: drag the browser or control bar, nearer or farther.
 - **D-pad left/right** (or a sideways stick flick): jump 5 seconds, a minute with the grip held. **D-pad up/down**: headset volume. Lengths are in Settings.
 - **Hold** a file or server to rename, move or delete it.
+- **D-pad in menus** (off by default, in Settings): the D-pad moves through lists, forms and dialogs; A chooses, B goes back.

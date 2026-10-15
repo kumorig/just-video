@@ -79,6 +79,8 @@ enum Item {
     VolumeStep,
     /// Continue videos where they were left. Two-way.
     Resume,
+    /// The D-pad moves through menus. Two-way.
+    DpadMenus,
     Share(String),
     Dir(String),
     Video {
@@ -99,12 +101,13 @@ enum Item {
 }
 
 /// The rows of the Settings page, in order.
-const SETTINGS: [Item; 8] = [
+const SETTINGS: [Item; 9] = [
     Item::ShortJump,
     Item::LongJump,
     Item::SeekLanding,
     Item::VolumeStep,
     Item::Resume,
+    Item::DpadMenus,
     Item::BufferSize,
     Item::Curvature,
     Item::BrowserWidth,
@@ -122,7 +125,8 @@ impl Item {
             | Item::ShortJump
             | Item::LongJump
             | Item::VolumeStep
-            | Item::Resume => "",
+            | Item::Resume
+            | Item::DpadMenus => "",
             Item::Settings => "Settings",
             Item::Share(n)
             | Item::Dir(n)
@@ -660,6 +664,11 @@ impl Navigator {
                         detail: "Start videos from where they were stopped".into(),
                         right: if prefs.resume { "On" } else { "Off" }.into(),
                         ..Row::new(Icon::Continue, "Continue where I left off")
+                    },
+                    Item::DpadMenus => Row {
+                        detail: "Move through menus with the D-pad; A chooses, B goes back".into(),
+                        right: if prefs.dpad_menus { "On" } else { "Off" }.into(),
+                        ..Row::new(Icon::Dpad, "D-pad in menus")
                     },
                     Item::Share(name) => Row::new(Icon::Share, name),
                     Item::Dir(name) => Row::new(Icon::Folder, name),
@@ -1413,6 +1422,7 @@ impl Navigator {
             }
             (Item::Settings, _) => self.navigate(Location::Settings),
             (Item::Resume, _) => self.change_preference(|p| p.resume = !p.resume),
+            (Item::DpadMenus, _) => self.change_preference(|p| p.dpad_menus = !p.dpad_menus),
             (Item::ShortJump, _) => {
                 self.preset_dialog(
                     "Jump",
@@ -2215,14 +2225,14 @@ mod tests {
                 Icon::Jump,
                 Icon::Volume,
                 Icon::Continue,
+                Icon::Dpad,
                 Icon::Buffer,
                 Icon::Curve,
                 Icon::Width
             ]
         );
-        let (jump, long_jump, landing, volume, resume, buffer, curvature, width) =
-            (0, 1, 2, 3, 4, 5, 6, 7);
-        let _ = buffer;
+        let (jump, long_jump, landing, volume, resume, dpad, curvature, width) =
+            (0, 1, 2, 3, 4, 5, 7, 8);
         assert_eq!(nav.view().rows[curvature].right, "Full");
         // The curvature dialog previews the choice pointed at, else the saved one.
         nav.click(Hit::Row(curvature));
@@ -2267,9 +2277,11 @@ mod tests {
         assert_eq!(nav.view().rows[volume].right, "5 %");
         nav.click(Hit::Row(resume));
         assert_eq!(nav.view().rows[resume].right, "Off");
+        nav.click(Hit::Row(dpad));
+        assert_eq!(nav.view().rows[dpad].right, "On");
         let p = config::preferences();
         assert_eq!((p.short_jump, p.long_jump, p.volume_step), (15, 600, 5));
-        assert!(!p.resume);
+        assert!(!p.resume && p.dpad_menus);
         assert_eq!(nav.preferences(), p);
         // B goes back to the server list, which marks the way in.
         assert!(nav.back());
