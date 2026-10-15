@@ -1042,6 +1042,7 @@ mod tests {
             server: Server {
                 name: "NAS".into(),
                 url: "smb://u@nas".into(),
+                writable: true,
             },
             share: "media".into(),
             paths: vec![

@@ -3,3 +3,6 @@
 /reports/
 /samples/
 
+
+# Claude Code session data (agent worktrees).
+.claude/

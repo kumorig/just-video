@@ -16,6 +16,9 @@ pub fn server() -> Server {
     Server {
         name: "This headset".into(),
         url: URL.into(),
+        // Its own files can always be changed: there are no server settings
+        // to allow it in.
+        writable: true,
     }
 }
 
@@ -177,7 +180,8 @@ mod tests {
         assert!(is_local(&server()));
         assert!(!is_local(&Server {
             name: "NAS".into(),
-            url: "smb://u@nas".into()
+            url: "smb://u@nas".into(),
+            writable: false,
         }));
     }
 }

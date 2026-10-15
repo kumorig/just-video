@@ -415,6 +415,11 @@ fn main() -> anyhow::Result<()> {
                 just_video::config::Server {
                     name: name.unwrap_or_else(|| parsed.host.clone()),
                     url: parsed.server_url(),
+                    // Saving again keeps whether files may be changed.
+                    writable: just_video::config::servers()
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|s| s.url == parsed.server_url() && s.writable),
                 },
                 &password,
             )?;
@@ -1036,6 +1041,7 @@ fn main() -> anyhow::Result<()> {
             );
             // Part of the address selected by dragging across it.
             form.select_range(0, 4, 11);
+            form.toggle = Some(("Allow changing files".into(), false));
             adding.form = Some(form);
             just_video::ui::save_png(
                 &render(&adding, &mut fonts, Some((700.0, 700.0)), true),
@@ -1043,7 +1049,7 @@ fn main() -> anyhow::Result<()> {
             )?;
             // Editing a saved server: an empty password keeps the saved one.
             let mut editing_server = servers.clone();
-            editing_server.form = Some(Form::new(
+            let mut edit_form = Form::new(
                 "Edit NAS",
                 ["Address", "User", "Password", "Name"]
                     .iter()
@@ -1056,7 +1062,9 @@ fn main() -> anyhow::Result<()> {
                     })
                     .collect(),
                 "Save",
-            ));
+            );
+            edit_form.toggle = Some(("Allow changing files".into(), true));
+            editing_server.form = Some(edit_form);
             just_video::ui::save_png(
                 &render(&editing_server, &mut fonts, None, false),
                 &dir.join("form-edit.png"),

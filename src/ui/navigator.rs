@@ -5,6 +5,10 @@
 //! Move and (for one entry) Rename or Start over in place of the
 //! breadcrumbs, and other entries can be ticked. Holding select on a server
 //! reveals its Settings and Remove buttons.
+//!
+//! Changing files is opt-in per server: "Allow changing files" in its
+//! settings. Without it, holding an entry still selects it (for Start over)
+//! but offers no Delete, Move or Rename, and a notice says where to allow them.
 
 use super::browser::{Action, Dialog, Hit, Icon, Row, Tool, View, format_size};
 use super::form::{self, Field, Form, Key};
@@ -18,6 +22,10 @@ use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "m4v", "mkv", "mov", "webm", "avi", "ts", "m2ts"];
+
+/// Shown when an entry is held on a server that doesn't allow changing files.
+const READ_ONLY_NOTICE: &str =
+    "To change files, allow it in this server's settings (hold the server on the server list).";
 
 pub fn is_video(name: &str) -> bool {
     name.rsplit_once('.')
@@ -336,9 +344,10 @@ impl Navigator {
         self.next_id
     }
 
-    /// Files can be changed here (inside a share).
+    /// Files can be changed here: inside a share of a server that allows it
+    /// (see [`Server::writable`]).
     fn editing(&self) -> bool {
-        matches!(&self.location, Location::Folder { .. })
+        matches!(&self.location, Location::Folder { server, .. } if server.writable)
     }
 
     fn crumbs(&self) -> Vec<String> {
@@ -742,9 +751,11 @@ impl Navigator {
                         if selected.len() == 1 {
                             tools.push((Tool::text("Rename", false), ToolAction::RenameSelected));
                         }
-                        if self.selected_resume().is_some() {
-                            tools.push((Tool::text("Start over", false), ToolAction::ForgetResume));
-                        }
+                    }
+                    // Forgetting where a video was left changes nothing on
+                    // the server: offered on read-only servers too.
+                    if !selected.is_empty() && self.selected_resume().is_some() {
+                        tools.push((Tool::text("Start over", false), ToolAction::ForgetResume));
                     }
                     tools
                 }
@@ -755,6 +766,9 @@ impl Navigator {
             }
         };
         (self.view.tools, self.tool_actions) = tools.into_iter().unzip();
+        if self.selecting.is_none() && self.view.notice.as_deref() == Some(READ_ONLY_NOTICE) {
+            self.view.notice = None;
+        }
         // The selection's tools take the header; a count stands in for the crumbs.
         self.view.heading = match &self.selecting {
             Some(selected) if editing => Some(match selected.len() {
@@ -1284,6 +1298,9 @@ impl Navigator {
                 self.selecting
                     .get_or_insert_with(HashSet::new)
                     .insert(index);
+                if !self.editing() {
+                    self.view.notice = Some(READ_ONLY_NOTICE.into());
+                }
             }
             _ => return,
         }
@@ -1598,7 +1615,7 @@ impl Navigator {
             Some(s) => (format!("Edit {}", s.name), "Save"),
             None => ("Add server".to_string(), "Connect"),
         };
-        self.view.form = Some(Form::new(
+        let mut form = Form::new(
             title,
             vec![
                 field("Address", address, "IP or name, e.g. 192.168.1.10", false),
@@ -1612,7 +1629,12 @@ impl Navigator {
                 ),
             ],
             submit,
+        );
+        form.toggle = Some((
+            "Allow changing files".into(),
+            existing.as_ref().is_some_and(|s| s.writable),
         ));
+        self.view.form = Some(form);
         self.purpose = Some(match existing {
             Some(s) => Purpose::EditServer(s.url),
             None => Purpose::AddServer,
@@ -1774,6 +1796,7 @@ impl Navigator {
         self.dirty = true;
         match hit {
             form::Hit::Field(i, cursor) => f.focus(i, Some(cursor)),
+            form::Hit::Toggle => f.flip_toggle(),
             form::Hit::Key(key) => match f.press(key, &mut self.clipboard) {
                 Some(Key::Cancel) => {
                     self.view.form = None;
@@ -1860,6 +1883,7 @@ impl Navigator {
                         name
                     },
                     url: url.server_url(),
+                    writable: f.toggled(),
                 };
                 // Saving would replace that other entry, and its password.
                 if let Some(old) = &editing
@@ -1992,6 +2016,7 @@ mod tests {
         let server = Server {
             name: "NAS".into(),
             url: "smb://u@nas".into(),
+            writable: true,
         };
         nav.show_entries_for_test(server, &["a", "b", "destination"]);
         if let Location::Folder { path, .. } = &mut nav.location {
@@ -2133,6 +2158,7 @@ mod tests {
         let server = Server {
             name: "NAS".into(),
             url: "smb://u@nas".into(),
+            writable: true,
         };
         nav.show_entries_for_test(server, &["sub"]);
         assert_eq!(nav.progress(), None);
@@ -2321,6 +2347,7 @@ mod tests {
         let server = Server {
             name: "NAS".into(),
             url: "smb://u@nas".into(),
+            writable: true,
         };
         nav.show_entries_for_test(server.clone(), &["a", "b", "c"]);
         assert!(nav.view().rows.iter().all(|r| r.actions.is_empty()));
@@ -2359,6 +2386,7 @@ mod tests {
         let server = Server {
             name: "NAS".into(),
             url: "smb://u@nas".into(),
+            writable: true,
         };
         nav.show_entries_for_test(server.clone(), &["folder"]);
         // Marked directly: the config directory is the user's in tests, and
@@ -2388,16 +2416,61 @@ mod tests {
     }
 
     #[test]
+    fn read_only_servers_offer_start_over_but_no_changes() {
+        let mut nav = Navigator::new(Library::start(None));
+        let server = Server {
+            name: "NAS".into(),
+            url: "smb://u@nas".into(),
+            writable: false,
+        };
+        nav.show_entries_for_test(server.clone(), &["a", "b"]);
+        nav.items.push(Item::Video {
+            name: "clip.mp4".into(),
+            size: 1,
+            assessment: None,
+            layout: None,
+            broken: None,
+            resume: Some((1200.0, Some(2400.0))),
+        });
+        nav.rebuild_rows();
+        assert!(nav.view().notice.is_none());
+        nav.long_press(1);
+        assert_eq!(nav.view().rows[1].checked, Some(true), "still selectable");
+        let labels: Vec<&str> = nav.view().tools.iter().map(|t| t.label.as_str()).collect();
+        assert_eq!(labels, ["Cancel"], "nothing changes files");
+        assert_eq!(nav.view().notice.as_deref(), Some(READ_ONLY_NOTICE));
+        assert!(nav.back(), "leaves selection");
+        assert!(nav.view().notice.is_none(), "the hint goes with it");
+        nav.long_press(2);
+        let labels: Vec<&str> = nav.view().tools.iter().map(|t| t.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["Cancel", "Start over"],
+            "forgetting a position is local"
+        );
+        nav.back();
+        // The new server form starts read only; its checkbox allows changes.
+        nav.show_servers();
+        nav.start_server_form(None);
+        let form = nav.view().form.as_ref().expect("the server form");
+        assert!(!form.toggled());
+        nav.click(Hit::Form(form::Hit::Toggle));
+        assert!(nav.view().form.as_ref().unwrap().toggled());
+    }
+
+    #[test]
     fn holding_a_server_reveals_its_buttons() {
         let mut nav = Navigator::new(Library::start(None));
         nav.items = vec![
             Item::Server(Server {
                 name: "NAS".into(),
                 url: "smb://u@nas".into(),
+                writable: true,
             }),
             Item::Server(Server {
                 name: "PC".into(),
                 url: "smb://u@pc".into(),
+                writable: true,
             }),
             Item::AddServer,
         ];
@@ -2413,6 +2486,11 @@ mod tests {
         assert_eq!(nav.view().tools.len(), 1, "cancel");
         nav.click(Hit::RowAction(1, Action::Settings));
         assert!(matches!(nav.purpose, Some(Purpose::EditServer(ref u)) if u == "smb://u@pc"));
+        let form = nav.view().form.as_ref().expect("the server form");
+        assert_eq!(form.title, "Edit PC");
+        assert!(form.toggled(), "as saved");
+        nav.click(Hit::Form(form::Hit::Toggle));
+        assert!(!nav.view().form.as_ref().unwrap().toggled());
         nav.back();
         nav.long_press(1);
         assert!(nav.back(), "B closes the buttons");
@@ -2427,10 +2505,12 @@ mod tests {
         let pc = Server {
             name: "PC".into(),
             url: "smb://alice@pc".into(),
+            writable: true,
         };
         let nas = Server {
             name: "NAS".into(),
             url: "smb://bob@nas".into(),
+            writable: true,
         };
         config::save_server(pc.clone(), "a").unwrap();
         config::save_server(nas.clone(), "b").unwrap();
@@ -2455,6 +2535,7 @@ mod tests {
         let server = Server {
             name: "NAS".into(),
             url: "smb://u@nas".into(),
+            writable: true,
         };
         nav.show_entries_for_test(server, &[]);
         let a = crate::playability::assess(crate::playability::Platform::SteamFrame, None);
@@ -2493,6 +2574,7 @@ mod tests {
         let server = Server {
             name: "NAS".into(),
             url: "smb://u@nas".into(),
+            writable: true,
         };
         let names: Vec<String> = (0..40).map(|i| format!("f{i:02}")).collect();
         let names: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -2517,6 +2599,7 @@ mod tests {
         let server = Server {
             name: "NAS".into(),
             url: "smb://u@nas".into(),
+            writable: true,
         };
         nav.show_entries_for_test(server, &["folder"]);
         let video = |name: &str, broken: bool| Item::Video {

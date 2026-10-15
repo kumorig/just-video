@@ -17,6 +17,9 @@ pub struct Server {
     pub name: String,
     /// `smb://[domain;]user@host[:port]`, no password.
     pub url: String,
+    /// Renaming, moving and deleting files on it are allowed (off: read only).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub writable: bool,
 }
 
 #[cfg(test)]
@@ -325,6 +328,9 @@ struct Settings {
     /// Player preferences (jump lengths, volume step, continuing videos).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     player: Option<Preferences>,
+    /// SMB connections a playing video is read over (see [`video_connections`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    video_connections: Option<usize>,
 }
 
 /// Player choices made on the Settings page.
@@ -397,6 +403,28 @@ pub fn update_preferences(change: impl FnOnce(&mut Preferences)) -> anyhow::Resu
     settings.player = Some(prefs);
     write_json("settings.json", &settings, false)?;
     Ok(prefs)
+}
+
+/// Choices for how many SMB connections a playing video is read over.
+pub const VIDEO_CONNECTION_PRESETS: [usize; 2] = [1, 2];
+
+/// SMB connections a playing video is read over: one by default. With two,
+/// each read goes to the connection with the least data still to come, so
+/// a jump's first read gets past reads left from before it, and over Wi-Fi
+/// two TCP connections can carry more than one and ride out a stall of
+/// either. Experimental, chosen on the Settings page.
+pub fn video_connections() -> usize {
+    read_json::<Settings>("settings.json")
+        .ok()
+        .and_then(|s| s.video_connections)
+        .unwrap_or(1)
+        .clamp(1, 4)
+}
+
+pub fn save_video_connections(connections: usize) -> anyhow::Result<()> {
+    let mut settings: Settings = read_json("settings.json")?;
+    settings.video_connections = Some(connections.clamp(1, 4));
+    write_json("settings.json", &settings, false)
 }
 
 /// Where a jump lands: name and whether it is exact (see [`seek_exact`]).
@@ -634,6 +662,7 @@ mod tests {
         let server = Server {
             name: "PC".into(),
             url: "smb://alice@192.168.1.10".into(),
+            writable: true,
         };
         save_server(server.clone(), "secret").unwrap();
         assert_eq!(servers().unwrap(), vec![server.clone()]);
