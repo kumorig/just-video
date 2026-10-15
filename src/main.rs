@@ -1069,6 +1069,33 @@ fn main() -> anyhow::Result<()> {
                 crumbs: crumbs(&["Just Video", "Settings"]),
                 rows: vec![
                     Row {
+                        detail: "D-pad left/right or a sideways stick flick while playing".into(),
+                        right: "5 s".into(),
+                        ..Row::new(Icon::Jump, "Jump")
+                    },
+                    Row {
+                        detail: "The same with the grip held".into(),
+                        right: "1 min".into(),
+                        ..Row::new(Icon::Jump, "Long jump")
+                    },
+                    Row {
+                        detail: "The keyframe before the target at once, or exactly on it".into(),
+                        right: "Keyframe".into(),
+                        ..Row::new(Icon::Jump, "Jumps land on")
+                    },
+                    Row {
+                        detail:
+                            "D-pad up/down while playing set the headset volume; hold to repeat"
+                                .into(),
+                        right: "10 %".into(),
+                        ..Row::new(Icon::Volume, "Volume step")
+                    },
+                    Row {
+                        detail: "Start videos from where they were stopped".into(),
+                        right: "On".into(),
+                        ..Row::new(Icon::Continue, "Continue where I left off")
+                    },
+                    Row {
                         detail: "Fetched while paused, to play on without the network".into(),
                         right: "1 GB".into(),
                         ..Row::new(Icon::Buffer, "Buffer ahead")
@@ -1082,11 +1109,6 @@ fn main() -> anyhow::Result<()> {
                         detail: "How wide this window is".into(),
                         right: "100%".into(),
                         ..Row::new(Icon::Width, "Browser width")
-                    },
-                    Row {
-                        detail: "The keyframe before the target at once, or exactly on it".into(),
-                        right: "Keyframe".into(),
-                        ..Row::new(Icon::Jump, "Jumps land on")
                     },
                 ],
                 ..Default::default()

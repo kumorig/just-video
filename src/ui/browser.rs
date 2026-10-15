@@ -69,6 +69,10 @@ pub enum Icon {
     Jump,
     /// Settings: a gear.
     Settings,
+    /// Loudness: a speaker with sound waves.
+    Volume,
+    /// Continuing a video: a play triangle after a bar.
+    Continue,
     /// Close the app.
     Exit,
 }
@@ -598,6 +602,38 @@ fn draw_icon(canvas: &mut Canvas, icon: &Icon, cx: f32, cy: f32, bg: Rgb) {
             }
             canvas.circle(cx, cy, 15.0, SUBTLE);
             canvas.circle(cx, cy, 6.0, bg);
+        }
+        Icon::Volume => {
+            // Body, a cone widening to the right, and two waves.
+            canvas.rect(cx - 24.0, cy - 6.0, 8.0, 12.0, 2.0, ACCENT);
+            for i in 0..10 {
+                let t = i as f32;
+                canvas.rect(
+                    cx - 17.0 + t,
+                    cy - 6.0 - t,
+                    1.5,
+                    12.0 + 2.0 * t,
+                    0.0,
+                    ACCENT,
+                );
+            }
+            canvas.rect(cx + 2.0, cy - 8.0, 3.0, 16.0, 1.5, ACCENT);
+            canvas.rect(cx + 10.0, cy - 14.0, 3.0, 28.0, 1.5, ACCENT);
+        }
+        Icon::Continue => {
+            // A bar, then a play triangle.
+            canvas.rect(cx - 22.0, cy - 14.0, 5.0, 28.0, 2.0, ACCENT);
+            for i in 0..24 {
+                let t = i as f32;
+                canvas.rect(
+                    cx - 10.0 + t,
+                    cy - 14.0 + t * 0.58,
+                    1.5,
+                    28.0 - t * 1.16,
+                    0.0,
+                    ACCENT,
+                );
+            }
         }
         Icon::Jump => {
             // An arrow to a bar: the shaft, its head of shortening strokes, the bar.

@@ -71,6 +71,14 @@ enum Item {
     /// Where a jump lands: the keyframe before the target, or exactly on
     /// it. Two-way: a click switches.
     SeekLanding,
+    /// How far D-pad left/right jump; a dialog of presets.
+    ShortJump,
+    /// The same with the grip held.
+    LongJump,
+    /// How much D-pad up/down change the headset's volume.
+    VolumeStep,
+    /// Continue videos where they were left. Two-way.
+    Resume,
     Share(String),
     Dir(String),
     Video {
@@ -91,11 +99,15 @@ enum Item {
 }
 
 /// The rows of the Settings page, in order.
-const SETTINGS: [Item; 4] = [
+const SETTINGS: [Item; 8] = [
+    Item::ShortJump,
+    Item::LongJump,
+    Item::SeekLanding,
+    Item::VolumeStep,
+    Item::Resume,
     Item::BufferSize,
     Item::Curvature,
     Item::BrowserWidth,
-    Item::SeekLanding,
 ];
 
 impl Item {
@@ -106,7 +118,11 @@ impl Item {
             | Item::BufferSize
             | Item::Curvature
             | Item::BrowserWidth
-            | Item::SeekLanding => "",
+            | Item::SeekLanding
+            | Item::ShortJump
+            | Item::LongJump
+            | Item::VolumeStep
+            | Item::Resume => "",
             Item::Settings => "Settings",
             Item::Share(n)
             | Item::Dir(n)
@@ -167,6 +183,10 @@ enum Purpose {
     /// Choosing from [`config::CURVATURE_PRESETS`] / [`config::BROWSER_WIDTH_PRESETS`].
     Curvature,
     BrowserWidth,
+    /// Choosing from the jump length and volume step presets.
+    ShortJump,
+    LongJump,
+    VolumeStep,
     Info,
 }
 
@@ -222,6 +242,7 @@ pub struct Navigator {
     curvature: f32,
     browser_width: f32,
     seek_exact: bool,
+    prefs: config::Preferences,
     /// Where the playing video is, for fetching its subtitle files.
     playing_source: Option<(Server, String)>,
     /// The subtitle fetch awaited (request id, track) and its answer.
@@ -259,6 +280,7 @@ impl Navigator {
             curvature: config::curvature(),
             browser_width: config::browser_width(),
             seek_exact: config::seek_exact(),
+            prefs: config::preferences(),
             playing_source: None,
             subtitle_request: None,
             subtitle_result: None,
@@ -452,6 +474,42 @@ impl Navigator {
         self.seek_exact
     }
 
+    /// A dialog of presets for a setting, the saved one marked.
+    fn preset_dialog(
+        &mut self,
+        title: &str,
+        body: &str,
+        buttons: Vec<String>,
+        choice: Option<usize>,
+        purpose: Purpose,
+    ) {
+        self.view.dialog = Some(Dialog {
+            title: title.into(),
+            body: vec![body.into()],
+            buttons,
+            danger: false,
+            choice,
+        });
+        self.purpose = Some(purpose);
+        self.dirty = true;
+    }
+
+    /// Jump lengths, volume step and continuing, as last saved.
+    pub fn preferences(&self) -> config::Preferences {
+        self.prefs
+    }
+
+    /// Changes and saves a preference; on a failure to save it still applies
+    /// until Just Video quits.
+    fn change_preference(&mut self, change: impl FnOnce(&mut config::Preferences)) {
+        match config::update_preferences(change) {
+            Ok(prefs) => self.prefs = prefs,
+            Err(e) => eprintln!("Can't save the setting: {e:#}"),
+        }
+        self.rebuild_rows();
+        self.dirty = true;
+    }
+
     /// What a settings dialog previews, given what the pointer is on: the
     /// choice pointed at, otherwise the saved one.
     pub fn preview(&self, hover: Hit) -> Option<Preview> {
@@ -524,8 +582,12 @@ impl Navigator {
     fn rebuild_rows(&mut self) {
         let editing = self.editing();
         let selecting = self.selecting.as_ref();
-        let (curvature, browser_width, seek_exact) =
-            (self.curvature, self.browser_width, self.seek_exact);
+        let (curvature, browser_width, seek_exact, prefs) = (
+            self.curvature,
+            self.browser_width,
+            self.seek_exact,
+            self.prefs,
+        );
         self.view.rows = self
             .items
             .iter()
@@ -576,6 +638,28 @@ impl Navigator {
                         detail: "The keyframe before the target at once, or exactly on it".into(),
                         right: config::SEEK_LANDING_PRESETS[seek_exact as usize].0.into(),
                         ..Row::new(Icon::Jump, "Jumps land on")
+                    },
+                    Item::ShortJump => Row {
+                        detail: "D-pad left/right or a sideways stick flick while playing".into(),
+                        right: config::format_jump(prefs.short_jump),
+                        ..Row::new(Icon::Jump, "Jump")
+                    },
+                    Item::LongJump => Row {
+                        detail: "The same with the grip held".into(),
+                        right: config::format_jump(prefs.long_jump),
+                        ..Row::new(Icon::Jump, "Long jump")
+                    },
+                    Item::VolumeStep => Row {
+                        detail:
+                            "D-pad up/down while playing set the headset volume; hold to repeat"
+                                .into(),
+                        right: format!("{} %", prefs.volume_step),
+                        ..Row::new(Icon::Volume, "Volume step")
+                    },
+                    Item::Resume => Row {
+                        detail: "Start videos from where they were stopped".into(),
+                        right: if prefs.resume { "On" } else { "Off" }.into(),
+                        ..Row::new(Icon::Continue, "Continue where I left off")
                     },
                     Item::Share(name) => Row::new(Icon::Share, name),
                     Item::Dir(name) => Row::new(Icon::Folder, name),
@@ -1328,6 +1412,49 @@ impl Navigator {
                 self.dirty = true;
             }
             (Item::Settings, _) => self.navigate(Location::Settings),
+            (Item::Resume, _) => self.change_preference(|p| p.resume = !p.resume),
+            (Item::ShortJump, _) => {
+                self.preset_dialog(
+                    "Jump",
+                    "How far D-pad left/right (or a sideways stick flick) jump.",
+                    config::SHORT_JUMP_PRESETS
+                        .iter()
+                        .map(|&s| config::format_jump(s))
+                        .collect(),
+                    config::SHORT_JUMP_PRESETS
+                        .iter()
+                        .position(|&s| s == self.prefs.short_jump),
+                    Purpose::ShortJump,
+                );
+            }
+            (Item::LongJump, _) => {
+                self.preset_dialog(
+                    "Long jump",
+                    "How far a D-pad jump goes with the grip held.",
+                    config::LONG_JUMP_PRESETS
+                        .iter()
+                        .map(|&s| config::format_jump(s))
+                        .collect(),
+                    config::LONG_JUMP_PRESETS
+                        .iter()
+                        .position(|&s| s == self.prefs.long_jump),
+                    Purpose::LongJump,
+                );
+            }
+            (Item::VolumeStep, _) => {
+                self.preset_dialog(
+                    "Volume step",
+                    "How much D-pad up/down change the headset's volume.",
+                    config::VOLUME_STEP_PRESETS
+                        .iter()
+                        .map(|&s| format!("{s} %"))
+                        .collect(),
+                    config::VOLUME_STEP_PRESETS
+                        .iter()
+                        .position(|&s| s == self.prefs.volume_step),
+                    Purpose::VolumeStep,
+                );
+            }
             (Item::SeekLanding, _) => {
                 self.seek_exact = !self.seek_exact;
                 if let Err(e) = config::save_seek_exact(self.seek_exact) {
@@ -1551,6 +1678,24 @@ impl Navigator {
                     }
                 }
                 self.rebuild_rows();
+                return;
+            }
+            Some(Purpose::ShortJump) => {
+                if let Some(&s) = config::SHORT_JUMP_PRESETS.get(button) {
+                    self.change_preference(|p| p.short_jump = s);
+                }
+                return;
+            }
+            Some(Purpose::LongJump) => {
+                if let Some(&s) = config::LONG_JUMP_PRESETS.get(button) {
+                    self.change_preference(|p| p.long_jump = s);
+                }
+                return;
+            }
+            Some(Purpose::VolumeStep) => {
+                if let Some(&s) = config::VOLUME_STEP_PRESETS.get(button) {
+                    self.change_preference(|p| p.volume_step = s);
+                }
                 return;
             }
             Some(Purpose::BrowserWidth) => {
@@ -2062,10 +2207,25 @@ mod tests {
         assert_eq!(nav.view().crumbs, ["Just Video", "Settings"]);
         assert!(nav.view().tools.is_empty(), "no exit button here");
         let icons: Vec<Icon> = nav.view().rows.iter().map(|r| r.icon.clone()).collect();
-        assert_eq!(icons, [Icon::Buffer, Icon::Curve, Icon::Width, Icon::Jump]);
-        assert_eq!(nav.view().rows[1].right, "Full");
+        assert_eq!(
+            icons,
+            [
+                Icon::Jump,
+                Icon::Jump,
+                Icon::Jump,
+                Icon::Volume,
+                Icon::Continue,
+                Icon::Buffer,
+                Icon::Curve,
+                Icon::Width
+            ]
+        );
+        let (jump, long_jump, landing, volume, resume, buffer, curvature, width) =
+            (0, 1, 2, 3, 4, 5, 6, 7);
+        let _ = buffer;
+        assert_eq!(nav.view().rows[curvature].right, "Full");
         // The curvature dialog previews the choice pointed at, else the saved one.
-        nav.click(Hit::Row(1));
+        nav.click(Hit::Row(curvature));
         assert_eq!(
             nav.view().dialog.as_ref().map(|d| d.title.as_str()),
             Some("Screen curvature")
@@ -2080,19 +2240,37 @@ mod tests {
         );
         nav.back();
         assert_eq!(nav.preview(Hit::Nothing), None);
-        nav.click(Hit::Row(2));
+        nav.click(Hit::Row(width));
         assert_eq!(
             nav.preview(Hit::DialogButton(0)),
             Some(Preview::BrowserWidth(0.5))
         );
         nav.back();
         // Where jumps land: two-way, so a click switches, saved and shown.
-        nav.click(Hit::Row(3));
+        nav.click(Hit::Row(landing));
         assert!(nav.seek_exact());
-        assert_eq!(nav.view().rows[3].right, "Exact");
+        assert_eq!(nav.view().rows[landing].right, "Exact");
         assert!(config::seek_exact(), "saved");
-        nav.click(Hit::Row(3));
+        nav.click(Hit::Row(landing));
         assert!(!nav.seek_exact());
+        // Jump lengths and the volume step: preset dialogs, saved together.
+        assert_eq!(nav.view().rows[jump].right, "5 s");
+        nav.click(Hit::Row(jump));
+        assert_eq!(nav.view().dialog.as_ref().map(|d| d.choice), Some(Some(0)));
+        nav.click(Hit::DialogButton(2));
+        assert_eq!(nav.view().rows[jump].right, "15 s");
+        nav.click(Hit::Row(long_jump));
+        nav.click(Hit::DialogButton(4));
+        assert_eq!(nav.view().rows[long_jump].right, "10 min");
+        nav.click(Hit::Row(volume));
+        nav.click(Hit::DialogButton(0));
+        assert_eq!(nav.view().rows[volume].right, "5 %");
+        nav.click(Hit::Row(resume));
+        assert_eq!(nav.view().rows[resume].right, "Off");
+        let p = config::preferences();
+        assert_eq!((p.short_jump, p.long_jump, p.volume_step), (15, 600, 5));
+        assert!(!p.resume);
+        assert_eq!(nav.preferences(), p);
         // B goes back to the server list, which marks the way in.
         assert!(nav.back());
         assert_eq!(nav.view().crumbs, ["Just Video"]);
