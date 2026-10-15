@@ -485,6 +485,14 @@ void jv_decoder_close(JVDecoder *d) {
     av_free(d);
 }
 
+// Buffer counts for the V4L2 decoder. FFmpeg's default of 20 capture buffers
+// fails to allocate at 8K.
+static void set_v4l2_buffers(AVDictionary **options, const AVCodecParameters *par) {
+    int64_t pixels = (int64_t)par->width * par->height;
+    av_dict_set_int(options, "num_capture_buffers", pixels > 4096 * 2304 ? 6 : 12, 0);
+    av_dict_set_int(options, "num_output_buffers", 16, 0);
+}
+
 JVDecoder *jv_decoder_open(JVMedia *media, const char *hw_backend, int allow_software,
                            const char *decoder_options, JVDecodeStats *s) {
     memset(s, 0, sizeof(*s));
@@ -522,10 +530,7 @@ JVDecoder *jv_decoder_open(JVMedia *media, const char *hw_backend, int allow_sof
             codec = wrapper;
             d->choice.hardware_wrapper = 1;
             copy_name(s->hw_backend, sizeof(s->hw_backend), "v4l2m2m");
-            // FFmpeg's default of 20 capture buffers fails to allocate at 8K.
-            int64_t pixels = (int64_t)video->codecpar->width * video->codecpar->height;
-            av_dict_set_int(&open_options, "num_capture_buffers", pixels > 4096 * 2304 ? 6 : 12, 0);
-            av_dict_set_int(&open_options, "num_output_buffers", 16, 0);
+            set_v4l2_buffers(&open_options, video->codecpar);
         } else if (!allow_software) {
             ret = AVERROR(ENOSYS);
             snprintf(s->error, sizeof(s->error), "%s", why);
@@ -535,6 +540,7 @@ JVDecoder *jv_decoder_open(JVMedia *media, const char *hw_backend, int allow_sof
             codec = avcodec_find_decoder(id);
         }
     }
+    int hw_retries = 0;
 reopen:
     for (int attempt = 0; attempt < 2; ++attempt) {
         avcodec_free_context(&d->ctx);
@@ -571,6 +577,18 @@ reopen:
         snprintf(s->error, sizeof(s->error), "Unknown decoder option: %s", unused->key);
         ret = AVERROR_OPTION_NOT_FOUND;
         goto fail;
+    }
+    if (ret < 0 && d->choice.hardware_wrapper && hw_retries < 2) {
+        // The driver sometimes can't get buffers right away ("REQBUFS: Cannot
+        // allocate memory", seen while an earlier session is still closing):
+        // try again shortly before settling for the CPU, which can't keep up
+        // with 8K.
+        ++hw_retries;
+        av_log(NULL, AV_LOG_ERROR, "Hardware decoder failed to open (%s); trying again\n", av_err2str(ret));
+        av_usleep(250000 * hw_retries);
+        av_dict_free(&open_options);
+        set_v4l2_buffers(&open_options, video->codecpar);
+        goto reopen;
     }
     if (ret < 0 && d->choice.hardware_wrapper && allow_software) {
         // Device missing, busy or its firmware recovering: never fail playback
