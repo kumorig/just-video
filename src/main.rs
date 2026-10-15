@@ -919,6 +919,22 @@ fn main() -> anyhow::Result<()> {
                 &render(&browsing, &mut fonts, Some((700.0, 400.0)), true),
                 &dir.join("browsing.png"),
             )?;
+            // Choosing where to move to, deep in a share: the crumbs fold.
+            let mut moving = browsing.clone();
+            moving.crumbs = crumbs(&[
+                "Just Video",
+                "NAS",
+                "media",
+                "Series",
+                "Slow.Horses.S01.1080p.WEBRip.x265[eztv.re]",
+                "Subs",
+                "Slow.Horses.S01E01.1080p.WEBRip.x265-RARBG[eztv.re]",
+            ]);
+            moving.tools = vec![Tool::text("Cancel", false), Tool::text("Move here", false)];
+            just_video::ui::save_png(
+                &render(&moving, &mut fonts, Some((120.0, 70.0)), true),
+                &dir.join("browsing-move.png"),
+            )?;
             let mut adding = servers.clone();
             adding.form = Some(Form::new(
                 "Add server",
