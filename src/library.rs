@@ -1535,6 +1535,7 @@ mod tests {
             server: Server {
                 name: "nas".into(),
                 url: "smb://me@nas".into(),
+                writable: false,
             },
             share: "media".into(),
             folder: vec!["vr".into()],
@@ -1638,6 +1639,7 @@ mod tests {
         let server = Server {
             name: "nas".into(),
             url: "smb://me@nas".into(),
+            writable: false,
         };
         library.send(Request::Probe {
             generation: 1,

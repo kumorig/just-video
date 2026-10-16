@@ -2651,6 +2651,7 @@ mod tests {
         nav.items.push(Item::Video {
             name: "clip.mp4".into(),
             size: 1,
+            modified: 0,
             assessment: None,
             layout: None,
             broken: None,
@@ -2860,6 +2861,7 @@ mod tests {
         let server = Server {
             name: "nas".into(),
             url: "smb://me@nas".into(),
+            writable: false,
         };
         nav.show_entries_for_test(server, &["sub"]);
         let a = crate::playability::assess(crate::playability::Platform::SteamFrame, None);
@@ -2898,6 +2900,7 @@ mod tests {
             Server {
                 name: "nas".into(),
                 url: "smb://me@nas".into(),
+                writable: false,
             },
             &["a", "b"],
         );
