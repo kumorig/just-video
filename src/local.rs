@@ -111,12 +111,25 @@ pub fn list(share: &str, path: &[String]) -> anyhow::Result<Vec<Entry>> {
             name: entry.file_name().to_string_lossy().into_owned(),
             is_dir: meta.is_dir(),
             size: if meta.is_dir() { 0 } else { meta.len() },
+            modified: meta.modified().map_or(0, file_time),
         });
     }
     entries.sort_by(|a, b| {
         (!a.is_dir, a.name.to_lowercase()).cmp(&(!b.is_dir, b.name.to_lowercase()))
     });
     Ok(entries)
+}
+
+/// Seconds between 1601-01-01 (FILETIME's epoch) and 1970-01-01.
+const FILETIME_UNIX_OFFSET: u64 = 11_644_473_600;
+
+/// A file's modification time in SMB's units (100 ns ticks since 1601), so
+/// local and remote entries key the thumbnail cache the same way; a time
+/// before 1970 (clock mishaps) is 0.
+fn file_time(time: std::time::SystemTime) -> u64 {
+    time.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| {
+        (d.as_nanos() / 100) as u64 + FILETIME_UNIX_OFFSET * 10_000_000
+    })
 }
 
 pub fn open(share: &str, path: &[String]) -> anyhow::Result<BufReader<fs::File>> {
@@ -173,6 +186,15 @@ mod tests {
         }
         assert!(check_name("clip_180_LR.mp4").is_ok());
         assert!(check_name("..hidden").is_ok());
+    }
+
+    #[test]
+    fn file_times_are_in_smb_units() {
+        assert_eq!(file_time(std::time::UNIX_EPOCH), 116_444_736_000_000_000);
+        let later = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        assert_eq!(file_time(later), 116_444_736_000_000_000 + 10_000_000);
+        let before = std::time::UNIX_EPOCH - std::time::Duration::from_secs(1);
+        assert_eq!(file_time(before), 0);
     }
 
     #[test]

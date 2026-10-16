@@ -1365,7 +1365,8 @@ pub fn run(
                                 // Drag the list like a touch screen.
                                 p.dragging = true;
                                 nav.set_scroll(
-                                    p.start_scroll - browser::rows_for_drag(y - p.start_y),
+                                    p.start_scroll
+                                        - browser::rows_for_drag(nav.view(), y - p.start_y),
                                 );
                             }
                         }

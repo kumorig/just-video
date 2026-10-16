@@ -1,8 +1,10 @@
 //! Background SMB work for the headset browser. Network calls never run on the
 //! XR frame loop: requests go to worker threads and results come back on a
 //! channel. Navigation and opening use one worker, playability probes another,
-//! so a slow probe never delays browsing. Requests for the headset's own
-//! storage ([`local`]) take the same path, served from the filesystem.
+//! so a slow probe never delays browsing. List thumbnails have a third,
+//! low-priority worker that only runs while nothing else does. Requests for
+//! the headset's own storage ([`local`]) take the same path, served from the
+//! filesystem.
 
 use crate::config::{self, LayoutOverride, Server};
 use crate::local;
@@ -10,6 +12,7 @@ use crate::media::{Media, VideoDecoder};
 use crate::playability::{self, Assessment, Platform};
 use crate::readahead::ReadAhead;
 use crate::smb::{Entry, SmbSession, SmbUrl};
+use crate::thumb_cache::{self, THUMB_H, THUMB_W, ThumbCache};
 use crate::vr::{self, Layout};
 use std::{
     collections::HashMap,
@@ -87,6 +90,25 @@ pub enum Request {
         share: String,
         path: Path,
     },
+    /// Makes list thumbnails for a folder's videos, nearest `first_visible`
+    /// first, on a low-priority worker that waits for probes and playback.
+    /// Sent again with the same generation, it adds videos and updates the
+    /// layout of known ones (merged by name); a new generation (see
+    /// [`Library::set_thumbnail_generation`]) replaces the queue.
+    ThumbnailFolder {
+        generation: u64,
+        server: Server,
+        share: String,
+        folder: Path,
+        videos: Vec<ThumbVideo>,
+        first_visible: usize,
+    },
+    /// The list scrolled: pending thumbnails are reordered around this video
+    /// (an index as in [`ThumbVideo::index`]). Ignored for other generations.
+    ThumbnailFocus {
+        generation: u64,
+        first_visible: usize,
+    },
     Open {
         id: u64,
         server: Server,
@@ -124,6 +146,19 @@ pub enum Request {
         server: Server,
         password: String,
     },
+}
+
+/// A video to make a thumbnail for (see [`Request::ThumbnailFolder`]).
+#[derive(Clone, Debug)]
+pub struct ThumbVideo {
+    /// Position among the folder's videos, for the order of work.
+    pub index: usize,
+    pub name: String,
+    pub size: u64,
+    /// Last write time from the listing (see [`crate::smb::Entry`]).
+    pub modified: u64,
+    /// As probed, with the user's override: decides the crop.
+    pub layout: Layout,
 }
 
 pub struct Opened {
@@ -419,6 +454,13 @@ pub enum Response {
         id: u64,
         result: Result<Box<Opened>, String>,
     },
+    /// One finished thumbnail (see [`Request::ThumbnailFolder`]), sent as
+    /// each is ready. A video that can't be read gets none.
+    Thumbnail {
+        generation: u64,
+        name: String,
+        image: Arc<crate::media::Thumb>,
+    },
     /// Rename or delete finished.
     Changed {
         id: u64,
@@ -452,14 +494,23 @@ pub struct Library {
     responses: mpsc::Receiver<Response>,
     /// Probes for other generations (folders left behind) are skipped.
     probe_generation: Arc<AtomicU64>,
+    /// Probes sent and not yet answered or skipped: thumbnails wait for them.
+    queued: Arc<AtomicU64>,
+    thumbnails: mpsc::Sender<Request>,
+    /// Thumbnails for other generations are dropped. Separate from the
+    /// probes', so switching them off doesn't cancel probing.
+    thumbnail_generation: Arc<AtomicU64>,
 }
 
-/// What a connection is used for. Browsing and playability probes keep one
-/// connection each per server; every playing video gets its own (see Open).
+/// What a connection is used for. Browsing, playability probes and thumbnails
+/// keep one connection each per server; every playing video gets its own (see
+/// Open). Thumbnails read megabytes per video: on the probes' connection they
+/// would hold up header reads.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Purpose {
     Browse,
     Probe,
+    Thumbnail,
 }
 
 type Sessions = Arc<Mutex<HashMap<(String, Purpose), Arc<SmbSession>>>>;
@@ -613,6 +664,9 @@ fn handle(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
         Request::Move { selection, .. } => (selection.server.clone(), "move"),
         Request::AddServer { server, .. } => (server.clone(), "add server"),
         Request::Subtitle { server, .. } => (server.clone(), "subtitle"),
+        Request::ThumbnailFolder { .. } | Request::ThumbnailFocus { .. } => {
+            unreachable!("thumbnails have their own worker")
+        }
     };
     let response = if local::is_local(&server) {
         run_local(request, hw)
@@ -808,6 +862,9 @@ fn run(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
             });
             Response::ServerAdded { id, result }
         }
+        Request::ThumbnailFolder { .. } | Request::ThumbnailFocus { .. } => {
+            unreachable!("thumbnails have their own worker")
+        }
     }
 }
 
@@ -913,6 +970,9 @@ fn run_local(request: Request, hw: Option<&str>) -> Response {
             id,
             result: Err("The headset's storage is built in and can't be added".into()),
         },
+        Request::ThumbnailFolder { .. } | Request::ThumbnailFocus { .. } => {
+            unreachable!("thumbnails have their own worker")
+        }
     }
 }
 
@@ -949,6 +1009,12 @@ fn move_entries(
     result
 }
 
+/// A video is opening or playing (thumbnail decoders don't count): the
+/// background workers give way.
+fn video_busy(opening: &AtomicU64) -> bool {
+    opening.load(Ordering::SeqCst) > 0 || crate::media::open_decoders() > 0
+}
+
 /// Holds a probe while a video opens or plays: probes read other files over
 /// the same link (and disks), slowing the video. False when the probe's
 /// folder was left meanwhile.
@@ -957,10 +1023,337 @@ fn wait_for_quiet(current: &AtomicU64, generation: u64, opening: &AtomicU64) -> 
         if generation != current.load(Ordering::Relaxed) {
             return false;
         }
-        if opening.load(Ordering::SeqCst) == 0 && crate::media::open_decoders() == 0 {
+        if !video_busy(opening) {
             return true;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Pending thumbnails for the folder on screen, nearest the view first.
+#[derive(Default)]
+struct ThumbQueue {
+    generation: u64,
+    /// Which folder the generation is for (a new one starts over).
+    folder: Option<(String, String, Path)>,
+    server: Option<Server>,
+    first_visible: usize,
+    pending: Vec<ThumbPending>,
+    /// Made, or failed (never retried), with the layout used.
+    done: HashMap<String, Layout>,
+}
+
+struct ThumbPending {
+    video: ThumbVideo,
+    /// Looked up in the disk cache already.
+    checked: bool,
+}
+
+impl ThumbQueue {
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Takes in a request, unless it is for a generation that has passed.
+    fn apply(&mut self, request: Request, current: u64) {
+        match request {
+            Request::ThumbnailFolder {
+                generation,
+                server,
+                share,
+                folder,
+                videos,
+                first_visible,
+            } if generation == current => {
+                let id = (server.url.clone(), share, folder);
+                if self.generation != generation || self.folder.as_ref() != Some(&id) {
+                    self.clear();
+                    self.generation = generation;
+                    self.folder = Some(id);
+                }
+                self.server = Some(server);
+                self.first_visible = first_visible;
+                for video in videos {
+                    self.add(video);
+                }
+            }
+            Request::ThumbnailFocus {
+                generation,
+                first_visible,
+            } if generation == self.generation => self.first_visible = first_visible,
+            _ => {}
+        }
+    }
+
+    fn add(&mut self, video: ThumbVideo) {
+        match self.done.get(&video.name) {
+            Some(layout) if *layout == video.layout => return,
+            // The layout changed since: a different picture.
+            Some(_) => {
+                self.done.remove(&video.name);
+            }
+            None => {}
+        }
+        match self.pending.iter_mut().find(|p| p.video.name == video.name) {
+            Some(p) => {
+                let changed = (p.video.size, p.video.modified, p.video.layout)
+                    != (video.size, video.modified, video.layout);
+                p.checked &= !changed;
+                p.video = video;
+            }
+            None => self.pending.push(ThumbPending {
+                video,
+                checked: false,
+            }),
+        }
+    }
+
+    /// Smaller is sooner: by distance from the view, rows below it a little
+    /// ahead of rows above it (the way people scroll).
+    fn rank(&self, video: &ThumbVideo) -> usize {
+        video.index.abs_diff(self.first_visible) * 2 + (video.index < self.first_visible) as usize
+    }
+
+    /// Position of the soonest pending video, among those not yet looked up
+    /// in the disk cache (`unchecked`) or all.
+    fn soonest(&self, unchecked: bool) -> Option<usize> {
+        (0..self.pending.len())
+            .filter(|&i| !unchecked || !self.pending[i].checked)
+            .min_by_key(|&i| self.rank(&self.pending[i].video))
+    }
+
+    /// Takes a video off the queue as made or given up on.
+    fn finish(&mut self, position: usize) -> ThumbVideo {
+        let video = self.pending.remove(position).video;
+        self.done.insert(video.name.clone(), video.layout);
+        video
+    }
+}
+
+/// Lowers this thread's priority, so thumbnails (and the decoder threads they
+/// start) give way to the app and the video: on Linux, `setpriority` with a
+/// thread id affects that thread only.
+fn lower_priority() {
+    // SAFETY: plain system calls with no pointers.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+        libc::setpriority(libc::PRIO_PROCESS, tid, 10);
+    }
+}
+
+/// Thumbnail reads: a keyframe of an 8K video is several MB, so bigger
+/// blocks than a header probe's. No reserve: nothing plays from these.
+const THUMB_READ_AHEAD: ReadAhead = ReadAhead {
+    block_size: 1024 * 1024,
+    blocks_ahead: 4,
+    reserve_bytes: 0,
+};
+/// Thumbnail reads on the wire at once.
+const THUMB_IN_FLIGHT: usize = 3;
+/// How far into the video the picture is taken.
+const THUMB_AT: f64 = 0.10;
+
+/// Makes one thumbnail. `Ok(None)` when it stopped, for playback or because
+/// the folder was left; the job is then queued again.
+fn make_thumbnail(
+    video: &ThumbVideo,
+    queue: &ThumbQueue,
+    sessions: &Sessions,
+    opening: &Arc<AtomicU64>,
+    current: &Arc<AtomicU64>,
+) -> Result<Option<crate::media::Thumb>, String> {
+    let (Some(server), Some((_, share, folder))) = (&queue.server, &queue.folder) else {
+        return Ok(None);
+    };
+    let generation = queue.generation;
+    let mut path = folder.clone();
+    path.push(video.name.clone());
+    let stop = || video_busy(opening) || current.load(Ordering::Relaxed) != generation;
+    if local::is_local(server) {
+        // The headset's own files: nothing on the network to give up, so
+        // only the checks between the steps.
+        return local::open(share, &path)
+            .and_then(|reader| {
+                crate::media::thumbnail_unless(
+                    &video.name,
+                    reader,
+                    THUMB_AT,
+                    &video.layout,
+                    THUMB_W,
+                    THUMB_H,
+                    &stop,
+                )
+            })
+            .map_err(|e| format!("{e:#}"));
+    }
+    let err = |e: anyhow::Error| crate::smb::explain(&e);
+    let paused = Arc::new(AtomicBool::new(false));
+    // The reads give up the moment a video starts or the folder is left, also
+    // while waiting for data: a thumbnail never holds up playback.
+    let cancel: crate::readahead::Cancel = {
+        let (opening, current, paused) = (opening.clone(), current.clone(), paused.clone());
+        Arc::new(move || {
+            if video_busy(&opening) {
+                paused.store(true, Ordering::SeqCst);
+                return true;
+            }
+            current.load(Ordering::Relaxed) != generation
+        })
+    };
+    // Only opening the file goes through the kept connection's retry: a
+    // read that failed for `cancel`, or a file FFmpeg can't read, is no
+    // reason to reconnect.
+    let result = with_session(sessions, server, Purpose::Thumbnail, |s| {
+        let reader = s
+            .open_in(share, &smb_path(&path), THUMB_READ_AHEAD)
+            .map_err(err)?;
+        let reader = reader
+            .with_cancel(cancel.clone())
+            .with_max_in_flight(THUMB_IN_FLIGHT);
+        Ok(crate::media::thumbnail_unless(
+            &video.name,
+            reader,
+            THUMB_AT,
+            &video.layout,
+            THUMB_W,
+            THUMB_H,
+            &stop,
+        )
+        .map_err(err))
+    })?;
+    // Stopped by `cancel` (FFmpeg only sees a read error): not a failure.
+    if paused.load(Ordering::SeqCst) || result.is_err() && stop() {
+        return Ok(None);
+    }
+    // A connection that died mid-read is replaced for the next thumbnail.
+    if let Err(e) = &result
+        && (e.contains("did not answer") || e.contains("stopped sending"))
+    {
+        evict(sessions, server, Purpose::Thumbnail);
+    }
+    result
+}
+
+/// The thumbnail worker: serves disk cache hits as soon as they are asked
+/// for (a small local read), and makes the others one at a time, only while
+/// no probe is pending and no video is opening or playing.
+fn thumbnail_worker(
+    requests: mpsc::Receiver<Request>,
+    sessions: Sessions,
+    out: mpsc::Sender<Response>,
+    queued: Arc<AtomicU64>,
+    opening: Arc<AtomicU64>,
+    current: Arc<AtomicU64>,
+) {
+    lower_priority();
+    let mut cache = ThumbCache::open();
+    if let Some(cache) = &cache {
+        cache.prune_old();
+    }
+    let mut queue = ThumbQueue::default();
+    let send = |queue: &ThumbQueue, name: String, image: crate::media::Thumb| {
+        out.send(Response::Thumbnail {
+            generation: queue.generation,
+            name,
+            image: Arc::new(image),
+        })
+        .is_ok()
+    };
+    loop {
+        // Scrolling and new folders apply between jobs.
+        loop {
+            match requests.try_recv() {
+                Ok(request) => queue.apply(request, current.load(Ordering::Relaxed)),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => return,
+            }
+        }
+        if queue.generation != current.load(Ordering::Relaxed) {
+            queue.clear();
+        }
+        let key_of = |queue: &ThumbQueue, video: &ThumbVideo| {
+            let (Some(server), Some((_, share, folder))) = (&queue.server, &queue.folder) else {
+                return String::new();
+            };
+            let mut path = folder.clone();
+            path.push(video.name.clone());
+            thumb_cache::key(
+                &file_key(server, share, &path),
+                video.size,
+                video.modified,
+                &video.layout,
+            )
+        };
+        // Cache hits first, nearest the view first, even while probes run.
+        if let Some(position) = queue.soonest(true) {
+            let key = key_of(&queue, &queue.pending[position].video);
+            match cache.as_ref().and_then(|c| c.load(&key)) {
+                Some(image) => {
+                    let video = queue.finish(position);
+                    if !send(&queue, video.name, image) {
+                        return;
+                    }
+                }
+                None => queue.pending[position].checked = true,
+            }
+            continue;
+        }
+        let waiting = queued.load(Ordering::SeqCst) > 0 || video_busy(&opening);
+        let Some(position) = queue.soonest(false).filter(|_| !waiting) else {
+            // Nothing to make (or not now): wait for a request, or look again.
+            let request = if queue.pending.is_empty() {
+                requests.recv().map_err(|_| ())
+            } else {
+                match requests.recv_timeout(std::time::Duration::from_millis(100)) {
+                    Ok(request) => Ok(request),
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => Err(()),
+                }
+            };
+            match request {
+                Ok(request) => queue.apply(request, current.load(Ordering::Relaxed)),
+                Err(()) => return,
+            }
+            continue;
+        };
+        let key = key_of(&queue, &queue.pending[position].video);
+        let video = queue.pending[position].video.clone();
+        let started = std::time::Instant::now();
+        match make_thumbnail(&video, &queue, &sessions, &opening, &current) {
+            Ok(Some(image)) => {
+                queue.finish(position);
+                if let Some(cache) = &mut cache {
+                    cache.store(&key, &image);
+                }
+                if current.load(Ordering::Relaxed) == queue.generation
+                    && !send(&queue, video.name.clone(), image)
+                {
+                    return;
+                }
+                eprintln!(
+                    "Thumbnails: {} in {:.0} ms",
+                    video.name,
+                    started.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            // Stopped for a video (or the folder was left): the job stays
+            // queued, and runs again once it is quiet (a left folder's queue
+            // is dropped at the top of the loop).
+            Ok(None) => {
+                let stale = queue.generation != current.load(Ordering::Relaxed);
+                if stale {
+                    eprintln!("Thumbnails: {} stopped, folder left", video.name);
+                } else {
+                    eprintln!("Thumbnails: {} paused for playback", video.name);
+                }
+            }
+            Err(e) => {
+                // A bad file keeps its icon; never retried in this folder.
+                eprintln!("Thumbnails: {} failed: {e}", video.name);
+                queue.finish(position);
+            }
+        }
     }
 }
 
@@ -975,10 +1368,21 @@ impl Library {
                 main,
                 responses,
                 probe_generation: Default::default(),
+                queued: Default::default(),
+                thumbnails: mpsc::channel().0,
+                thumbnail_generation: Default::default(),
             },
             requests,
             out,
         )
+    }
+
+    /// A library without workers: requests go nowhere, and the returned
+    /// sender feeds its responses (for navigator tests).
+    #[cfg(test)]
+    pub(crate) fn detached() -> (Self, mpsc::Sender<Response>) {
+        let (library, _requests, responses) = Self::for_test();
+        (library, responses)
     }
 
     /// `hw` is the preferred hardware backend for playback (see `media::default_hw_backend`).
@@ -987,20 +1391,24 @@ impl Library {
         let probe_generation = Arc::new(AtomicU64::new(0));
         // Videos being opened right now (see `wait_for_quiet`).
         let opening = Arc::new(AtomicU64::new(0));
+        // Probes sent and not yet done (see `thumbnail_worker`).
+        let queued = Arc::new(AtomicU64::new(0));
         let (response_tx, responses) = mpsc::channel();
         let mut senders = Vec::new();
         for name in ["library", "probe"] {
             let (tx, rx) = mpsc::channel::<Request>();
             let (sessions, out) = (sessions.clone(), response_tx.clone());
             let current = probe_generation.clone();
-            let opening = opening.clone();
+            let (opening, queued) = (opening.clone(), queued.clone());
             std::thread::Builder::new()
                 .name(name.into())
                 .spawn(move || {
                     for request in rx {
+                        let probe = matches!(request, Request::Probe { .. });
                         if let Request::Probe { generation, .. } = &request
                             && !wait_for_quiet(&current, *generation, &opening)
                         {
+                            queued.fetch_sub(1, Ordering::SeqCst);
                             continue;
                         }
                         let open = matches!(request, Request::Open { .. });
@@ -1010,6 +1418,9 @@ impl Library {
                         let response = handle(request, &sessions, hw);
                         if open {
                             opening.fetch_sub(1, Ordering::SeqCst);
+                        }
+                        if probe {
+                            queued.fetch_sub(1, Ordering::SeqCst);
                         }
                         if out.send(response).is_err() {
                             return;
@@ -1021,11 +1432,24 @@ impl Library {
         }
         let probes = senders.pop().expect("probe worker");
         let main = senders.pop().expect("main worker");
+        let thumbnail_generation = Arc::new(AtomicU64::new(0));
+        let (thumbnails, rx) = mpsc::channel::<Request>();
+        {
+            let (sessions, out, queued) = (sessions.clone(), response_tx.clone(), queued.clone());
+            let (opening, current) = (opening.clone(), thumbnail_generation.clone());
+            std::thread::Builder::new()
+                .name("thumbnail".into())
+                .spawn(move || thumbnail_worker(rx, sessions, out, queued, opening, current))
+                .expect("spawn thumbnail worker");
+        }
         Self {
             main,
             probes,
             responses,
             probe_generation,
+            queued,
+            thumbnails,
+            thumbnail_generation,
         }
     }
 
@@ -1034,11 +1458,23 @@ impl Library {
         self.probe_generation.store(generation, Ordering::Relaxed);
     }
 
+    /// Only thumbnails tagged with this generation will be made from now on
+    /// (set it before sending requests for it). Bump it when the folder
+    /// changes and when thumbnails are switched off: pending work stops at
+    /// once, and what the worker has queued is dropped.
+    pub fn set_thumbnail_generation(&self, generation: u64) {
+        self.thumbnail_generation
+            .store(generation, Ordering::Relaxed);
+    }
+
     pub fn send(&self, request: Request) {
-        let worker = if matches!(request, Request::Probe { .. }) {
-            &self.probes
-        } else {
-            &self.main
+        let worker = match request {
+            Request::ThumbnailFolder { .. } | Request::ThumbnailFocus { .. } => &self.thumbnails,
+            Request::Probe { .. } => {
+                self.queued.fetch_add(1, Ordering::SeqCst);
+                &self.probes
+            }
+            _ => &self.main,
         };
         let _ = worker.send(request);
     }
@@ -1079,7 +1515,139 @@ mod tests {
             name: name.into(),
             is_dir,
             size: if is_dir { 0 } else { 90_000 },
+            modified: 0,
         }
+    }
+
+    fn thumb_video(index: usize, name: &str) -> ThumbVideo {
+        ThumbVideo {
+            index,
+            name: name.into(),
+            size: 10,
+            modified: 5,
+            layout: vr::detect(name, None),
+        }
+    }
+
+    fn thumb_folder(generation: u64, videos: Vec<ThumbVideo>, first_visible: usize) -> Request {
+        Request::ThumbnailFolder {
+            generation,
+            server: Server {
+                name: "nas".into(),
+                url: "smb://me@nas".into(),
+            },
+            share: "media".into(),
+            folder: vec!["vr".into()],
+            videos,
+            first_visible,
+        }
+    }
+
+    /// Takes everything off the queue in the order it would be made.
+    fn thumb_order(queue: &mut ThumbQueue) -> Vec<String> {
+        let mut names = Vec::new();
+        while let Some(position) = queue.soonest(false) {
+            names.push(queue.finish(position).name);
+        }
+        names
+    }
+
+    #[test]
+    fn thumbnails_start_at_the_view_and_follow_scrolling() {
+        let videos: Vec<_> = (0..7)
+            .map(|i| thumb_video(i, &format!("{i}.mp4")))
+            .collect();
+        let mut queue = ThumbQueue::default();
+        queue.apply(thumb_folder(1, videos.clone(), 3), 1);
+        let mut first = ThumbQueue::default();
+        first.apply(thumb_folder(1, videos, 3), 1);
+        // Outward from row 3, a row below a little ahead of the one above.
+        assert_eq!(
+            thumb_order(&mut first),
+            [
+                "3.mp4", "4.mp4", "2.mp4", "5.mp4", "1.mp4", "6.mp4", "0.mp4"
+            ]
+        );
+        queue.apply(
+            Request::ThumbnailFocus {
+                generation: 1,
+                first_visible: 6,
+            },
+            1,
+        );
+        assert_eq!(thumb_order(&mut queue)[..3], ["6.mp4", "5.mp4", "4.mp4"]);
+    }
+
+    #[test]
+    fn thumbnail_requests_of_other_generations_are_ignored() {
+        let mut queue = ThumbQueue::default();
+        queue.apply(thumb_folder(1, vec![thumb_video(0, "a.mp4")], 0), 2);
+        assert!(queue.pending.is_empty());
+        queue.apply(thumb_folder(2, vec![thumb_video(0, "a.mp4")], 0), 2);
+        assert_eq!(queue.pending.len(), 1);
+        // A focus for an old generation changes nothing.
+        queue.apply(
+            Request::ThumbnailFocus {
+                generation: 1,
+                first_visible: 9,
+            },
+            2,
+        );
+        assert_eq!(queue.first_visible, 0);
+        // A new generation starts over.
+        queue.apply(thumb_folder(3, vec![thumb_video(0, "b.mp4")], 0), 3);
+        assert_eq!(thumb_order(&mut queue), ["b.mp4"]);
+    }
+
+    #[test]
+    fn sending_a_folder_again_merges_by_name() {
+        let mut queue = ThumbQueue::default();
+        queue.apply(
+            thumb_folder(1, vec![thumb_video(0, "a.mp4"), thumb_video(1, "b.mp4")], 0),
+            1,
+        );
+        let first = queue.soonest(false).unwrap();
+        let done = queue.finish(first);
+        assert_eq!(done.name, "a.mp4");
+        queue.pending[0].checked = true;
+        // Again: a.mp4 is made already, b.mp4 is not duplicated, c.mp4 is new.
+        let mut b = thumb_video(1, "b.mp4");
+        queue.apply(
+            thumb_folder(
+                1,
+                vec![thumb_video(0, "a.mp4"), b.clone(), thumb_video(2, "c.mp4")],
+                0,
+            ),
+            1,
+        );
+        assert_eq!(queue.pending.len(), 2);
+        assert!(queue.pending[0].checked);
+        // A changed layout is a new picture: looked up again.
+        b.layout.stereo = vr::Stereo::SideBySide;
+        queue.apply(thumb_folder(1, vec![b], 0), 1);
+        assert!(!queue.pending[0].checked);
+        let mut a = thumb_video(0, "a.mp4");
+        a.layout.projection = vr::Projection::Equirect180;
+        queue.apply(thumb_folder(1, vec![a], 0), 1);
+        assert_eq!(queue.pending.len(), 3);
+    }
+
+    #[test]
+    fn probes_are_counted_until_the_worker_takes_them() {
+        let (library, requests, _responses) = Library::for_test();
+        let server = Server {
+            name: "nas".into(),
+            url: "smb://me@nas".into(),
+        };
+        library.send(Request::Probe {
+            generation: 1,
+            server: server.clone(),
+            share: "media".into(),
+            path: vec!["a.mp4".into()],
+        });
+        library.send(Request::Shares { id: 1, server });
+        assert_eq!(library.queued.load(Ordering::SeqCst), 1, "only probes");
+        assert_eq!(requests.try_iter().count(), 2);
     }
 
     #[test]

@@ -385,6 +385,25 @@ pub struct ReadAheadReader<S: BlockSource> {
     stats: ReadStats,
     watch: BufferWatch,
     reserve: Arc<Reserve>,
+    /// Asked before a read and while it waits for a block: true makes the
+    /// read fail at once (see [`ReadAheadReader::with_cancel`]).
+    cancel: Option<Cancel>,
+    /// Set when a read failed for `cancel`: no more requests are issued, and
+    /// dropping does not wait for those in flight.
+    cancelled: bool,
+    /// A cap on reads in flight that holds even right after a jump (see
+    /// [`ReadAheadReader::with_max_in_flight`]); None for the playback rules.
+    max_in_flight: Option<usize>,
+}
+
+/// See [`ReadAheadReader::with_cancel`].
+pub type Cancel = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// How often a read waiting for a block looks at `cancel`.
+const CANCEL_POLL: Duration = Duration::from_millis(10);
+
+fn interrupted() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "Read cancelled")
 }
 
 impl<S: BlockSource> ReadAheadReader<S> {
@@ -430,7 +449,35 @@ impl<S: BlockSource> ReadAheadReader<S> {
             stats: ReadStats::default(),
             watch,
             reserve,
+            cancel: None,
+            cancelled: false,
+            max_in_flight: None,
         }
+    }
+
+    /// Reads fail with `ErrorKind::Interrupted` as soon as `cancel` says so,
+    /// also while waiting for data, and no read is requested after that.
+    /// (Requests already sent can't be taken back, see `detached`; dropping
+    /// the reader then leaves them to finish in the background.)
+    pub fn with_cancel(mut self, cancel: Cancel) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    /// Most reads in flight at a time, also right after a jump (playback
+    /// requests a few blocks past its cap then): less data still on the
+    /// link when the reader is abandoned.
+    pub fn with_max_in_flight(mut self, reads: usize) -> Self {
+        self.max_in_flight = Some(reads.max(1));
+        self
+    }
+
+    /// True once `cancel` has stopped a read.
+    fn check_cancel(&mut self) -> bool {
+        if self.cancelled || self.cancel.as_ref().is_some_and(|c| c()) {
+            self.cancelled = true;
+        }
+        self.cancelled
     }
 
     /// The reader's buffer state, kept up to date as it reads.
@@ -543,9 +590,12 @@ impl<S: BlockSource> ReadAheadReader<S> {
             if self.reserve.is_pending(index) {
                 continue; // on its way; `read` waits for it if needed
             }
-            if index >= current + JUMP_BLOCKS
-                && self.in_flight.load(Ordering::SeqCst) >= self.options.blocks_ahead
-            {
+            let in_flight = self.in_flight.load(Ordering::SeqCst);
+            let full = match self.max_in_flight {
+                Some(cap) => index != current && in_flight >= cap,
+                None => index >= current + JUMP_BLOCKS && in_flight >= self.options.blocks_ahead,
+            };
+            if full {
                 break;
             }
             self.spawn(index);
@@ -584,6 +634,9 @@ impl<S: BlockSource> ReadAheadReader<S> {
                     "The server stopped sending data",
                 ));
             }
+            if self.check_cancel() {
+                return Err(interrupted());
+            }
             let wake = &self.reserve.wake;
             self.runtime.block_on(async {
                 let _ = tokio::time::timeout(Duration::from_millis(10), wake.notified()).await;
@@ -597,6 +650,9 @@ impl<S: BlockSource> Read for ReadAheadReader<S> {
         if out.is_empty() || self.pos >= self.len {
             return Ok(0);
         }
+        if self.check_cancel() {
+            return Err(interrupted());
+        }
         let size = self.options.block_size as u64;
         let index = self.pos / size;
         self.schedule(index);
@@ -608,15 +664,34 @@ impl<S: BlockSource> Read for ReadAheadReader<S> {
         }
         let mut retries = 0;
         let mut waited = Duration::ZERO;
+        let mut logged = Duration::ZERO;
         loop {
             let block = self.blocks.get_mut(&index).expect("scheduled block");
             let Block::Pending(handle) = block else { break };
             let started = Instant::now();
+            // Short slices while cancellable, to look at `cancel` between.
+            let slice = if self.cancel.is_some() {
+                CANCEL_POLL
+            } else {
+                BLOCK_WAIT
+            };
             let result = self
                 .runtime
-                .block_on(async { tokio::time::timeout(BLOCK_WAIT, &mut *handle).await });
+                .block_on(async { tokio::time::timeout(slice, &mut *handle).await });
             waited += started.elapsed();
             self.stats.stall_seconds += started.elapsed().as_secs_f64();
+            if result.is_err() {
+                if self.cancel.as_ref().is_some_and(|c| c()) {
+                    self.cancelled = true;
+                    return Err(interrupted());
+                }
+                // Short slices only look at `cancel`: logging and giving up
+                // keep their pace (every BLOCK_WAIT, and at STALL_LIMIT).
+                if waited < logged + BLOCK_WAIT && waited < STALL_LIMIT {
+                    continue;
+                }
+                logged = waited;
+            }
             match result {
                 Ok(Ok(Ok(data))) => *block = Block::Ready(data),
                 // Keep the request running (see `detached`) and keep waiting:
@@ -689,6 +764,21 @@ impl<S: BlockSource> Drop for ReadAheadReader<S> {
             if let Block::Pending(handle) = block {
                 pending.push(handle);
             }
+        }
+        if self.cancelled {
+            // Abandoned: whoever dropped us goes on; the reads finish (never
+            // aborted; see `detached`) and the file closes behind them.
+            let source = self.source.clone();
+            runtime.spawn(async move {
+                let _ = tokio::time::timeout(CLOSE_WAIT, async {
+                    for handle in pending {
+                        let _ = handle.await;
+                    }
+                })
+                .await;
+                source.close().await;
+            });
+            return;
         }
         // Let outstanding reads finish (never abort them; see `detached`).
         runtime.block_on(async {
@@ -784,6 +874,57 @@ mod tests {
             state.ranges.iter().any(|&(a, b)| a <= 3000 && b >= 4096),
             "{state:?}"
         );
+    }
+
+    #[test]
+    fn cancel_fails_a_read_waiting_for_data_and_requests_nothing_more() {
+        let options = ReadAhead {
+            block_size: 1000,
+            blocks_ahead: 8,
+            reserve_bytes: 0,
+        };
+        let (r, _) = reader(100_000, 400, options);
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let mut r = r.with_cancel(Arc::new(move || flag.load(Ordering::SeqCst)));
+        let completed = r.source.completed.clone();
+        let mut buf = [0u8; 10];
+        let flag = stop.clone();
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            flag.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        let error = r.read(&mut buf).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(started.elapsed() < Duration::from_millis(250));
+        stopper.join().unwrap();
+        let requests = r.stats().requests;
+        // Failed for good, with nothing new requested, also after a seek.
+        r.seek(SeekFrom::Start(50_000)).unwrap();
+        assert!(r.read(&mut buf).is_err());
+        assert_eq!(r.stats().requests, requests);
+        // Dropping doesn't wait for the reads in flight, which still finish.
+        let _runtime = r.runtime.clone();
+        let dropping = Instant::now();
+        drop(r);
+        assert!(dropping.elapsed() < Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(completed.load(Ordering::SeqCst) as u64, requests);
+    }
+
+    #[test]
+    fn max_in_flight_limits_read_ahead() {
+        let options = ReadAhead {
+            block_size: 1000,
+            blocks_ahead: 8,
+            reserve_bytes: 0,
+        };
+        let (r, _) = reader(100_000, 50, options);
+        let mut r = r.with_max_in_flight(1);
+        let mut buf = [0u8; 10];
+        r.read_exact(&mut buf).unwrap();
+        assert_eq!(r.stats().requests, 1);
     }
 
     #[test]

@@ -127,6 +127,10 @@ pub struct Entry {
     pub name: String,
     pub is_dir: bool,
     pub size: u64,
+    /// Last write time as the server reports it: 100 ns ticks since 1601
+    /// (SMB's FILETIME). Only compared, never shown, so local listings may
+    /// use any stable per-file value in the same units.
+    pub modified: u64,
 }
 
 /// One authenticated server connection plus the runtime that drives it.
@@ -356,6 +360,7 @@ impl SmbSession {
                         name,
                         is_dir: item.file_attributes.directory(),
                         size: item.end_of_file,
+                        modified: *item.last_write_time,
                     });
                     if !watch(entries.len()) {
                         drop(stream);

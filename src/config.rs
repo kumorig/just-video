@@ -347,6 +347,8 @@ pub struct Preferences {
     pub resume: bool,
     /// The D-pad moves through menus (focus, A clicks, B goes back).
     pub dpad_menus: bool,
+    /// Thumbnails in video lists.
+    pub thumbnails: bool,
 }
 
 impl Default for Preferences {
@@ -357,6 +359,7 @@ impl Default for Preferences {
             volume_step: 10,
             resume: true,
             dpad_menus: false,
+            thumbnails: false,
         }
     }
 }
@@ -621,6 +624,9 @@ mod tests {
         let p = s.player.unwrap();
         assert_eq!((p.volume_step, p.short_jump), (5, 5));
         assert!(p.resume);
+        assert!(!p.thumbnails);
+        let s: Settings = serde_json::from_str(r#"{"player":{"thumbnails":true}}"#).unwrap();
+        assert!(s.player.unwrap().thumbnails);
     }
 
     #[test]

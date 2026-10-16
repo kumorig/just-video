@@ -97,6 +97,9 @@ int jv_decoder_seek(JVDecoder *decoder, double seconds);
 // `seconds` (they would be discarded anyway); <= 0 turns it off. Ends by
 // itself once a packet reaches `seconds`. Hardware (V4L2) decoders ignore it.
 void jv_decoder_skip_nonref_until(JVDecoder *decoder, double seconds);
+// Makes the next jv_decoder_next return the first keyframe's picture without
+// reading further (thumbnails). Call after a seek; a seek turns it off.
+void jv_decoder_first_picture(JVDecoder *decoder);
 // Also decode the audio stream, resampled to interleaved float at `rate` Hz
 // with `channels` channels. AVERROR_STREAM_NOT_FOUND when there is none.
 int jv_decoder_enable_audio(JVDecoder *decoder, int rate, int channels);

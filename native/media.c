@@ -229,6 +229,8 @@ struct JVDecoder {
     // `packet` holds a video packet the decoder refused for now (EAGAIN): it
     // is sent again once a picture has been taken out.
     int packet_held;
+    // Decode one picture, then drain (see `jv_decoder_first_picture`).
+    int one_shot;
     // While catching up to a seek target: video packets before this time
     // (stream time base) skip non-reference frames, which nothing else needs.
     int64_t skip_until;
@@ -835,9 +837,17 @@ int jv_decoder_next(JVDecoder *d, JVFrame *out) {
         ret = avcodec_send_packet(d->ctx, d->packet);
         if (ret == AVERROR(EAGAIN)) { d->packet_held = 1; continue; }  // take a picture first
         if (ret >= 0 && d->choice.hardware_wrapper) remember_packet(d, d->packet);
+        int key = d->packet->flags & AV_PKT_FLAG_KEY;
         av_packet_unref(d->packet);
         // A damaged packet costs a glitch, not the whole playback.
         if (ret < 0 && ret != AVERROR_INVALIDDATA) { av_frame_free(&frame); return ret; }
+        if (d->one_shot && key) {
+            // Frame threads and reordering hold the picture back for later
+            // packets: drain instead of reading on.
+            d->one_shot = 0;
+            d->flushing = 1;
+            avcodec_send_packet(d->ctx, NULL);
+        }
     }
 }
 
@@ -880,7 +890,13 @@ int jv_decoder_seek(JVDecoder *d, double seconds) {
     }
     if (d->subtitle) avcodec_flush_buffers(d->subtitle);
     d->flushing = 0;
+    d->one_shot = 0;
     return 0;
+}
+
+void jv_decoder_first_picture(JVDecoder *d) {
+    d->one_shot = 1;
+    d->ctx->skip_frame = AVDISCARD_NONKEY;
 }
 
 void jv_decoder_skip_nonref_until(JVDecoder *d, double seconds) {

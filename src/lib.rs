@@ -19,6 +19,8 @@ pub mod srvsvc;
 pub mod subtitles;
 pub mod system_volume;
 #[cfg(feature = "decode")]
+pub mod thumb_cache;
+#[cfg(feature = "decode")]
 pub mod ui;
 #[cfg(feature = "decode")]
 pub mod vr;

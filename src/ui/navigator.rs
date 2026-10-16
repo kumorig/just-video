@@ -13,12 +13,16 @@
 use super::browser::{Action, Dialog, Hit, Icon, Row, Tool, View, format_size};
 use super::form::{self, Field, Form, Key};
 use crate::config::{self, Server};
-use crate::library::{Library, Listing, MoveSelection, Opened, Path, Request, Response, file_key};
+use crate::library::{
+    Library, Listing, MoveSelection, Opened, Path, Request, Response, ThumbVideo, file_key,
+};
 use crate::local;
+use crate::media::Thumb;
 use crate::playability::{Assessment, Verdict};
 use crate::smb::SmbUrl;
 use crate::vr::Layout;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "m4v", "mkv", "mov", "webm", "avi", "ts", "m2ts"];
@@ -91,11 +95,16 @@ enum Item {
     DpadMenus,
     /// SMB connections a playing video is read over: one or two. Two-way.
     VideoConnections,
+    /// Pictures of the videos in folder lists. Two-way, like the header's
+    /// button in a folder.
+    Thumbnails,
     Share(String),
     Dir(String),
     Video {
         name: String,
         size: u64,
+        /// Last write time from the listing (keys the thumbnail cache).
+        modified: u64,
         assessment: Option<Assessment>,
         /// How it will be shown (once probed).
         layout: Option<Layout>,
@@ -111,13 +120,14 @@ enum Item {
 }
 
 /// The rows of the Settings page, in order.
-const SETTINGS: [Item; 10] = [
+const SETTINGS: [Item; 11] = [
     Item::ShortJump,
     Item::LongJump,
     Item::SeekLanding,
     Item::VolumeStep,
     Item::Resume,
     Item::DpadMenus,
+    Item::Thumbnails,
     Item::BufferSize,
     Item::Curvature,
     Item::BrowserWidth,
@@ -138,7 +148,8 @@ impl Item {
             | Item::VolumeStep
             | Item::Resume
             | Item::DpadMenus
-            | Item::VideoConnections => "",
+            | Item::VideoConnections
+            | Item::Thumbnails => "",
             Item::Settings => "Settings",
             Item::Share(n)
             | Item::Dir(n)
@@ -174,6 +185,8 @@ enum ToolAction {
     MoveHere,
     /// Closes the app (top right of the top page).
     Exit,
+    /// Thumbnails in this folder on or off (a setting).
+    ToggleThumbnails,
 }
 
 /// Work in progress behind the browser, for a progress bar.
@@ -264,6 +277,15 @@ pub struct Navigator {
     /// The subtitle fetch awaited (request id, track) and its answer.
     subtitle_request: Option<(u64, usize)>,
     subtitle_result: Option<(usize, Result<Vec<crate::subtitles::Cue>, String>)>,
+    /// Which folder's thumbnails the worker is making (see
+    /// [`Library::set_thumbnail_generation`]); bumped on leaving and toggling off.
+    thumb_generation: u64,
+    /// Ready thumbnails of this folder, by video name.
+    thumbs: std::collections::HashMap<String, Arc<Thumb>>,
+    /// Videos already handed to the worker (it is told as probes land).
+    thumbs_sent: HashSet<String>,
+    /// The first visible video last told to the worker.
+    thumb_focus: usize,
 }
 
 impl Navigator {
@@ -300,6 +322,10 @@ impl Navigator {
             playing_source: None,
             subtitle_request: None,
             subtitle_result: None,
+            thumb_generation: 0,
+            thumbs: Default::default(),
+            thumbs_sent: HashSet::new(),
+            thumb_focus: 0,
         };
         nav.show_servers();
         nav
@@ -336,6 +362,7 @@ impl Navigator {
         self.view.clamp_scroll();
         if self.view.scroll != before {
             self.dirty = true;
+            self.focus_thumbnails();
         }
     }
 
@@ -411,12 +438,14 @@ impl Navigator {
     /// Once a list has loaded: back to its old scroll, with the entry we
     /// came out of in view.
     fn restore_scroll(&mut self) {
+        // The row height decides what fits.
+        self.view.thumbnails = self.thumbnails_on();
         if let Some(scroll) = self.return_scroll.take() {
             self.view.scroll = scroll;
         }
         let Some(name) = &self.came_from else { return };
         if let Some(i) = self.items.iter().position(|it| it.trail_name() == name) {
-            let (i, visible) = (i as f32, super::browser::visible_rows());
+            let (i, visible) = (i as f32, self.view.visible_rows());
             if i < self.view.scroll || i + 1.0 > self.view.scroll + visible {
                 self.view.scroll = i - (visible / 2.0).floor();
             }
@@ -527,6 +556,122 @@ impl Navigator {
         self.dirty = true;
     }
 
+    /// Thumbnails are shown: switched on, in a folder with videos.
+    fn thumbnails_on(&self) -> bool {
+        self.prefs.thumbnails && self.in_video_folder()
+    }
+
+    fn in_video_folder(&self) -> bool {
+        matches!(self.location, Location::Folder { .. })
+            && self.items.iter().any(|i| matches!(i, Item::Video { .. }))
+    }
+
+    /// Starts a new thumbnail generation: work for the old one stops, and
+    /// its pictures go.
+    fn reset_thumbnails(&mut self) {
+        self.thumb_generation += 1;
+        self.library.set_thumbnail_generation(self.thumb_generation);
+        self.thumbs.clear();
+        self.thumbs_sent.clear();
+        self.thumb_focus = 0;
+    }
+
+    /// The video at the top of the list, as an index among the folder's videos.
+    fn first_visible_video(&self) -> usize {
+        let first = self.view.scroll.floor() as usize;
+        self.items
+            .iter()
+            .take(first)
+            .filter(|i| matches!(i, Item::Video { .. }))
+            .count()
+    }
+
+    /// Hands the worker the videos whose layout is now known (as probed, with
+    /// the user's override), nearest the top first by index.
+    fn request_thumbnails(&mut self) {
+        let Location::Folder {
+            server,
+            share,
+            path,
+        } = &self.location
+        else {
+            return;
+        };
+        if !self.prefs.thumbnails {
+            return;
+        }
+        let mut videos = Vec::new();
+        let mut index = 0;
+        for item in &self.items {
+            let Item::Video {
+                name,
+                size,
+                modified,
+                layout,
+                broken: None,
+                ..
+            } = item
+            else {
+                if matches!(item, Item::Video { .. }) {
+                    index += 1;
+                }
+                continue;
+            };
+            if let Some(layout) = layout
+                && !self.thumbs_sent.contains(name)
+            {
+                videos.push(ThumbVideo {
+                    index,
+                    name: name.clone(),
+                    size: *size,
+                    modified: *modified,
+                    layout: *layout,
+                });
+            }
+            index += 1;
+        }
+        if videos.is_empty() {
+            return;
+        }
+        self.thumbs_sent
+            .extend(videos.iter().map(|v| v.name.clone()));
+        self.thumb_focus = self.first_visible_video();
+        self.library.send(Request::ThumbnailFolder {
+            generation: self.thumb_generation,
+            server: server.clone(),
+            share: share.clone(),
+            folder: path.clone(),
+            videos,
+            first_visible: self.thumb_focus,
+        });
+    }
+
+    /// The list scrolled: the worker reorders around the new top video.
+    fn focus_thumbnails(&mut self) {
+        if !self.thumbnails_on() || self.thumbs_sent.is_empty() {
+            return;
+        }
+        let first_visible = self.first_visible_video();
+        if first_visible != self.thumb_focus {
+            self.thumb_focus = first_visible;
+            self.library.send(Request::ThumbnailFocus {
+                generation: self.thumb_generation,
+                first_visible,
+            });
+        }
+    }
+
+    /// Thumbnails on or off, from the header's button or the Settings row:
+    /// one saved preference, so both stay in step.
+    fn toggle_thumbnails(&mut self) {
+        // Off: pending work stops and the pictures go. On: start afresh.
+        self.reset_thumbnails();
+        // Rebuilds the rows at the new height; the entry the scroll was at
+        // stays on top.
+        self.change_preference(|p| p.thumbnails = !p.thumbnails);
+        self.request_thumbnails();
+    }
+
     /// What a settings dialog previews, given what the pointer is on: the
     /// choice pointed at, otherwise the saved one.
     pub fn preview(&self, hover: Hit) -> Option<Preview> {
@@ -557,6 +702,7 @@ impl Navigator {
         self.items.clear();
         self.generation += 1;
         self.library.set_probe_generation(self.generation);
+        self.reset_thumbnails();
         self.cancel_listing();
         self.probes = (0, 0);
         self.reset_view();
@@ -694,6 +840,12 @@ impl Navigator {
                         .into(),
                         ..Row::new(Icon::Server, "Video connections")
                     },
+                    Item::Thumbnails => Row {
+                        detail: "Pictures of videos in folder lists; slower browsing on Wi-Fi"
+                            .into(),
+                        right: if prefs.thumbnails { "On" } else { "Off" }.into(),
+                        ..Row::new(Icon::Thumbnails(prefs.thumbnails), "Thumbnails")
+                    },
                     Item::Share(name) => Row::new(Icon::Share, name),
                     Item::Dir(name) => Row::new(Icon::Folder, name),
                     Item::Video {
@@ -703,6 +855,7 @@ impl Navigator {
                         layout,
                         broken,
                         resume,
+                        ..
                     } => Row {
                         icon: match (assessment, broken) {
                             (_, Some(_)) => Icon::Broken,
@@ -723,6 +876,7 @@ impl Navigator {
                         right: format_size(*size),
                         progress: resume
                             .and_then(|(at, duration)| duration.map(|d| (at / d) as f32)),
+                        thumbnail: self.thumbs.get(name).cloned(),
                         ..Row::new(Icon::Video(None), name)
                     },
                     Item::File { name, size } => Row {
@@ -740,6 +894,7 @@ impl Navigator {
                 row
             })
             .collect();
+        self.view.thumbnails = self.thumbnails_on();
         let tools: Vec<(Tool, ToolAction)> = if self.move_request.is_some() {
             Vec::new()
         } else if self.listing.is_some() && self.pending.is_some() {
@@ -777,6 +932,12 @@ impl Navigator {
                 None if matches!(self.location, Location::Servers) => {
                     vec![(Tool::icon(Icon::Exit), ToolAction::Exit)]
                 }
+                // Only where there are videos: the same setting as on the
+                // Settings page, to hand when the pictures are wanted.
+                None if self.in_video_folder() => vec![(
+                    Tool::icon(Icon::Thumbnails(prefs.thumbnails)),
+                    ToolAction::ToggleThumbnails,
+                )],
                 None => Vec::new(),
             }
         };
@@ -821,6 +982,9 @@ impl Navigator {
                 self.dirty = true;
             }
         }
+        // Thumbnails arriving together (a cached folder's come all at once)
+        // make one rebuild.
+        let mut thumbnails = false;
         while let Some(response) = self.library.try_recv() {
             match response {
                 Response::Shares { id, result } if Some(id) == self.pending => {
@@ -867,6 +1031,7 @@ impl Navigator {
                                         Item::Video {
                                             name: e.name,
                                             size: e.size,
+                                            modified: e.modified,
                                             assessment: None,
                                             layout: None,
                                             broken: None,
@@ -928,6 +1093,17 @@ impl Navigator {
                         }
                     }
                     self.rebuild_rows();
+                    // The layout decides the crop, so a video is handed to
+                    // the thumbnail worker once its mark has landed.
+                    self.request_thumbnails();
+                }
+                Response::Thumbnail {
+                    generation,
+                    name,
+                    image,
+                } if generation == self.thumb_generation && self.prefs.thumbnails => {
+                    self.thumbs.insert(name, image);
+                    thumbnails = true;
                 }
                 Response::Opened { id, result } if Some(id) == self.pending => {
                     self.pending = None;
@@ -1007,6 +1183,9 @@ impl Navigator {
                 } => crate::xr::app::drop_in_background(opened),
                 _ => {} // stale response for a place we already left
             }
+        }
+        if thumbnails {
+            self.rebuild_rows();
         }
         None
     }
@@ -1097,6 +1276,7 @@ impl Navigator {
             }
             Some(ToolAction::CancelMove) => self.moving = None,
             Some(ToolAction::Exit) => self.exit_requested = true,
+            Some(ToolAction::ToggleThumbnails) => self.toggle_thumbnails(),
             Some(ToolAction::MoveHere) => self.move_here(),
             Some(ToolAction::CancelLoad) => {
                 self.back();
@@ -1467,6 +1647,7 @@ impl Navigator {
                 self.rebuild_rows();
                 self.dirty = true;
             }
+            (Item::Thumbnails, _) => self.toggle_thumbnails(),
             (Item::ShortJump, _) => {
                 self.preset_dialog(
                     "Jump",
@@ -2215,6 +2396,7 @@ mod tests {
             name: name.into(),
             is_dir: false,
             size: 1,
+            modified: 0,
         };
         responses
             .send(Response::List {
@@ -2279,14 +2461,15 @@ mod tests {
                 Icon::Volume,
                 Icon::Continue,
                 Icon::Dpad,
+                Icon::Thumbnails(false),
                 Icon::Buffer,
                 Icon::Curve,
                 Icon::Width,
                 Icon::Server
             ]
         );
-        let (jump, long_jump, landing, volume, resume, dpad, curvature, width, lanes) =
-            (0, 1, 2, 3, 4, 5, 7, 8, 9);
+        let (jump, long_jump, landing, volume, resume, dpad, thumbnails, curvature, width, lanes) =
+            (0, 1, 2, 3, 4, 5, 6, 8, 9, 10);
         // Video connections: two-way, saved outside the player preferences.
         assert_eq!(nav.view().rows[lanes].right, "One");
         nav.click(Hit::Row(lanes));
@@ -2340,9 +2523,14 @@ mod tests {
         assert_eq!(nav.view().rows[resume].right, "Off");
         nav.click(Hit::Row(dpad));
         assert_eq!(nav.view().rows[dpad].right, "On");
+        // Thumbnails: off by default, the same setting as the folder button.
+        assert_eq!(nav.view().rows[thumbnails].right, "Off");
+        nav.click(Hit::Row(thumbnails));
+        assert_eq!(nav.view().rows[thumbnails].right, "On");
+        assert_eq!(nav.view().rows[thumbnails].icon, Icon::Thumbnails(true));
         let p = config::preferences();
         assert_eq!((p.short_jump, p.long_jump, p.volume_step), (15, 600, 5));
-        assert!(!p.resume && p.dpad_menus);
+        assert!(!p.resume && p.dpad_menus && p.thumbnails);
         assert_eq!(nav.preferences(), p);
         // B goes back to the server list, which marks the way in.
         assert!(nav.back());
@@ -2429,6 +2617,7 @@ mod tests {
         nav.items.push(Item::Video {
             name: "clip.mp4".into(),
             size: 1,
+            modified: 0,
             assessment: None,
             layout: None,
             broken: None,
@@ -2579,6 +2768,7 @@ mod tests {
             .map(|name| Item::Video {
                 name: name.into(),
                 size: 1,
+                modified: 0,
                 assessment: Some(a.clone()),
                 layout: Some(crate::vr::detect(name, None)),
                 broken: None,
@@ -2640,6 +2830,7 @@ mod tests {
         let video = |name: &str, broken: bool| Item::Video {
             name: name.into(),
             size: 1,
+            modified: 0,
             assessment: None,
             layout: None,
             broken: broken.then(|| "bad".to_string()),
@@ -2663,5 +2854,118 @@ mod tests {
         nav.playback_ended();
         assert!(nav.view().rows[4].outlined, "the video just played");
         assert_eq!(nav.view().rows.iter().filter(|r| r.outlined).count(), 1);
+    }
+
+    fn video_folder(nav: &mut Navigator, names: &[&str]) {
+        let server = Server {
+            name: "nas".into(),
+            url: "smb://me@nas".into(),
+        };
+        nav.show_entries_for_test(server, &["sub"]);
+        let a = crate::playability::assess(crate::playability::Platform::SteamFrame, None);
+        nav.items.extend(names.iter().map(|name| Item::Video {
+            name: name.to_string(),
+            size: 1,
+            modified: 7,
+            assessment: Some(a.clone()),
+            layout: Some(crate::vr::detect(name, None)),
+            broken: None,
+            resume: None,
+        }));
+        nav.rebuild_rows();
+    }
+
+    fn thumb() -> Arc<Thumb> {
+        Arc::new(Thumb {
+            width: 220,
+            height: 124,
+            rgba: vec![255; 220 * 124 * 4],
+        })
+    }
+
+    #[test]
+    fn the_thumbnails_tool_is_only_in_folders_with_videos() {
+        let (library, _responses) = Library::detached();
+        let mut nav = Navigator::new(library);
+        let tool = |nav: &Navigator| {
+            nav.view()
+                .tools
+                .iter()
+                .any(|t| matches!(t.icon, Some(Icon::Thumbnails(_))))
+        };
+        assert!(!tool(&nav), "server list");
+        nav.show_entries_for_test(
+            Server {
+                name: "nas".into(),
+                url: "smb://me@nas".into(),
+            },
+            &["a", "b"],
+        );
+        assert!(!tool(&nav), "only folders");
+        video_folder(&mut nav, &["x.mp4"]);
+        assert!(tool(&nav));
+        assert!(!nav.view().thumbnails, "off by default");
+        nav.selecting = Some(HashSet::new());
+        nav.rebuild_rows();
+        assert!(!tool(&nav), "not while selecting");
+    }
+
+    #[test]
+    fn toggling_thumbnails_changes_rows_and_drops_pictures() {
+        let dir = config::temp_config("nav-thumb-toggle");
+        let (library, responses) = Library::detached();
+        let mut nav = Navigator::new(library);
+        let names: Vec<String> = (0..20).map(|i| format!("clip {i}.mp4")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        video_folder(&mut nav, &names);
+        nav.view.scroll = 5.0;
+        nav.click(Hit::Tool(0));
+        assert!(nav.view().thumbnails);
+        assert!(
+            nav.preferences().thumbnails && config::preferences().thumbnails,
+            "saved"
+        );
+        assert_eq!(nav.view().scroll, 5.0, "top row stays");
+        assert_eq!(nav.thumbs_sent.len(), 20, "all handed to the worker");
+
+        // Pictures arriving together make one rebuild; stale ones are ignored.
+        let g = nav.thumb_generation;
+        for (generation, name) in [(g, "clip 3.mp4"), (g, "clip 4.mp4"), (g - 1, "clip 5.mp4")] {
+            responses
+                .send(Response::Thumbnail {
+                    generation,
+                    name: name.into(),
+                    image: thumb(),
+                })
+                .unwrap();
+        }
+        nav.take_dirty();
+        nav.poll();
+        assert!(nav.take_dirty());
+        let shown: Vec<bool> = nav
+            .view()
+            .rows
+            .iter()
+            .map(|r| r.thumbnail.is_some())
+            .collect();
+        assert_eq!(shown.iter().filter(|s| **s).count(), 2);
+        assert!(shown[1 + 3] && shown[1 + 4], "after the folder row");
+
+        nav.click(Hit::Tool(0));
+        assert!(!nav.view().thumbnails);
+        assert!(nav.thumbs.is_empty() && nav.thumbs_sent.is_empty());
+        assert_eq!(nav.thumb_generation, g + 1, "pending work is dropped");
+        assert!(nav.view().rows.iter().all(|r| r.thumbnail.is_none()));
+        // A straggler from the old generation is ignored.
+        responses
+            .send(Response::Thumbnail {
+                generation: g,
+                name: "clip 3.mp4".into(),
+                image: thumb(),
+            })
+            .unwrap();
+        nav.poll();
+        assert!(nav.thumbs.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
