@@ -32,6 +32,10 @@ const TOOL_W: f32 = 220.0;
 /// An icon-only tool: a square.
 const TOOL_ICON_W: f32 = 62.0;
 const TOOL_GAP: f32 = 12.0;
+/// The watched-state mark: its radius, ring width, and the room it takes in a row.
+const MARK_R: f32 = 12.0;
+const MARK_RING: f32 = 3.5;
+const MARK_W: f32 = 40.0;
 
 /// Shown top right so installs can be told apart.
 pub const BUILD: &str = env!("JUST_VIDEO_BUILD");
@@ -132,6 +136,17 @@ impl Action {
     }
 }
 
+/// How much of a video has been watched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Watch {
+    /// Never played: a filled circle.
+    Unwatched,
+    /// Left part way, to resume: a ring, half filled.
+    Partial,
+    /// Played to the end: an empty ring.
+    Watched,
+}
+
 #[derive(Clone, Debug)]
 pub struct Row {
     pub icon: Icon,
@@ -148,6 +163,8 @@ pub struct Row {
     pub outlined: bool,
     /// How much of a video was watched (a line along the row's foot).
     pub progress: Option<f32>,
+    /// A video's watched state, drawn as a mark (`None`: not a video).
+    pub watch: Option<Watch>,
     /// Indented: part of the section above it.
     pub inset: bool,
     /// A video's picture (for views with [`View::thumbnails`]).
@@ -166,6 +183,7 @@ impl Row {
             dimmed: false,
             outlined: false,
             progress: None,
+            watch: None,
             inset: false,
             thumbnail: None,
         }
@@ -847,6 +865,35 @@ impl<'a> Pen<'a> {
         let (x, y) = (self.cx + x * s, self.cy + y * s);
         self.canvas.circle(x, y, radius * s, color);
     }
+
+    fn ring(&mut self, x: f32, y: f32, radius: f32, thickness: f32, color: Rgb) {
+        let s = self.scale;
+        let (x, y) = (self.cx + x * s, self.cy + y * s);
+        self.canvas.ring(x, y, radius * s, thickness * s, color);
+    }
+
+    /// The left half of a disc.
+    fn half_disc(&mut self, x: f32, y: f32, radius: f32, color: Rgb) {
+        let s = self.scale;
+        let (x, y) = (self.cx + x * s, self.cy + y * s);
+        self.canvas.half_disc(x, y, radius * s, color);
+    }
+}
+
+/// A video's watched state, centred on (cx, cy): filled when unwatched, a ring
+/// half filled when left part way, an empty ring when watched. Blue, so it is
+/// not mistaken for the verdict colours of the video's own mark.
+fn draw_watch(canvas: &mut Canvas, watch: Watch, cx: f32, cy: f32) {
+    let mut pen = Pen::new(canvas, cx, cy, 1.0);
+    match watch {
+        Watch::Unwatched => pen.circle(0.0, 0.0, MARK_R, ACCENT),
+        Watch::Partial => {
+            pen.ring(0.0, 0.0, MARK_R, MARK_RING, ACCENT);
+            // Runs under the ring's inner edge, so there is no seam.
+            pen.half_disc(0.0, 0.0, MARK_R - MARK_RING + 1.0, ACCENT);
+        }
+        Watch::Watched => pen.ring(0.0, 0.0, MARK_R, MARK_RING, ACCENT),
+    }
 }
 
 /// How well a video plays; grey while that is being checked.
@@ -897,8 +944,9 @@ pub(super) fn draw_checkbox(
 }
 
 /// The left slot of a tall row: a video's thumbnail (or a dark placeholder)
-/// with its mark as a badge in the bottom-left corner, or another entry's
-/// icon centred. `slot` is its top-left, `cy` the row's vertical centre.
+/// with its mark as a badge in the bottom-left corner and its watched state
+/// in the top-right, or another entry's icon centred. `slot` is its top-left,
+/// `cy` the row's vertical centre.
 fn draw_slot(canvas: &mut Canvas, row: &Row, slot: (f32, f32), cy: f32, bg: Rgb) {
     let (sx, sy) = slot;
     let cx = sx + SLOT_W / 2.0;
@@ -934,6 +982,13 @@ fn draw_slot(canvas: &mut Canvas, row: &Row, slot: (f32, f32), cy: f32, bg: Rgb)
                 None => draw_icon(canvas, &row.icon, cx, cy, SLOT_BG),
             }
         }
+    }
+    if let Some(watch) = row.watch {
+        // Top-right, on its own backing like the badge: it reads over any picture.
+        let side = 2.0 * MARK_R + 16.0;
+        let (bx, by) = (sx + SLOT_W - 6.0 - side, sy + 6.0);
+        canvas.rect(bx, by, side, side, 10.0, SLOT_BG);
+        draw_watch(canvas, watch, bx + side / 2.0, by + side / 2.0);
     }
 }
 
@@ -1037,6 +1092,17 @@ pub fn render(
                 }
             }
             let has_actions = !row.actions.is_empty();
+            // The watched mark takes the right end; the size text moves left of it.
+            let mark = row.watch.filter(|_| !has_actions && !view.thumbnails);
+            if let Some(watch) = mark {
+                draw_watch(&mut canvas, watch, right_edge - MARK_R, cy);
+            }
+            let progress_edge = right_edge;
+            let right_edge = if mark.is_some() {
+                right_edge - MARK_W
+            } else {
+                right_edge
+            };
             let right_w = if row.right.is_empty() || has_actions {
                 0.0
             } else {
@@ -1086,7 +1152,7 @@ pub fn render(
             }
             // Where a video was left: a line along the row's foot.
             if let Some(progress) = row.progress {
-                let (px, pw) = (text_x, right_edge - text_x);
+                let (px, pw) = (text_x, progress_edge - text_x);
                 canvas.rect(px, ry + rh - 5.0, pw, 3.0, 1.5, [0x3a, 0x42, 0x50]);
                 canvas.rect(
                     px,
@@ -1331,6 +1397,97 @@ mod tests {
             Hit::DialogButton(1)
         );
         assert_eq!(hit(&view, &mut fonts, 400.0, HEADER + 10.0), Hit::Nothing);
+    }
+
+    /// A view of three videos, one per watched state.
+    fn watched_view(thumbnails: bool) -> View {
+        let states = [Watch::Unwatched, Watch::Partial, Watch::Watched];
+        View {
+            rows: states
+                .iter()
+                .map(|&w| Row {
+                    watch: Some(w),
+                    right: "1.0 GB".into(),
+                    ..Row::new(Icon::Video(Some(Verdict::Hardware)), "clip.mp4")
+                })
+                .collect(),
+            thumbnails,
+            ..Default::default()
+        }
+    }
+
+    /// Where row `i`'s watched mark is centred.
+    fn mark_centre(view: &View, i: usize) -> (f32, f32) {
+        let (rx, ry, rw, rh) = row_rect(view, i);
+        if view.thumbnails {
+            let (sx, sy) = (rx + 4.0, ry + (rh - SLOT_H) / 2.0);
+            let side = 2.0 * MARK_R + 16.0;
+            (sx + SLOT_W - 6.0 - side / 2.0, sy + 6.0 + side / 2.0)
+        } else {
+            (rx + rw - 24.0 - MARK_R, ry + rh / 2.0)
+        }
+    }
+
+    #[test]
+    fn watched_states_look_different_in_lists_and_thumbnails() {
+        let mut fonts = Fonts::load().expect("fonts");
+        for thumbnails in [false, true] {
+            let view = watched_view(thumbnails);
+            let canvas = render(&view, &mut fonts, None, false);
+            // Just left of the centre, further left, right of it, and the ring at the right.
+            let probe = |i: usize| {
+                let (cx, cy) = mark_centre(&view, i);
+                [
+                    pixel(&canvas, cx - 1.0, cy),
+                    pixel(&canvas, cx - 3.0, cy),
+                    pixel(&canvas, cx + 3.0, cy),
+                    pixel(&canvas, cx + MARK_R - 1.5, cy),
+                ]
+            };
+            let hole = if thumbnails { SLOT_BG } else { ROW_BG };
+            assert_eq!(
+                probe(0),
+                [ACCENT, ACCENT, ACCENT, ACCENT],
+                "unwatched is filled (thumbnails: {thumbnails})"
+            );
+            assert_eq!(
+                probe(1),
+                [ACCENT, ACCENT, hole, ACCENT],
+                "partial is filled on the left only (thumbnails: {thumbnails})"
+            );
+            assert_eq!(
+                probe(2),
+                [hole, hole, hole, ACCENT],
+                "watched is an empty ring (thumbnails: {thumbnails})"
+            );
+        }
+    }
+
+    #[test]
+    fn no_state_no_mark_and_the_size_text_stays_clear_of_it() {
+        let mut fonts = Fonts::load().expect("fonts");
+        let mut view = watched_view(false);
+        view.rows[0].watch = None;
+        let with_mark = render(&view, &mut fonts, None, false);
+        let (cx, cy) = mark_centre(&view, 0);
+        assert_eq!(pixel(&with_mark, cx, cy), ROW_BG, "a folder has none");
+        // The size is drawn left of the mark, with a gap of background.
+        view.rows[1].watch = Some(Watch::Watched);
+        let canvas = render(&view, &mut fonts, None, false);
+        let (cx, cy) = mark_centre(&view, 1);
+        let mut ink = 0;
+        for x in (cx - 90.0) as u32..(cx - MARK_R - 3.0) as u32 {
+            for y in (cy - 14.0) as u32..(cy + 14.0) as u32 {
+                if pixel(&canvas, x as f32, y as f32) != ROW_BG {
+                    ink += 1;
+                    assert!(
+                        (x as f32) < cx - MARK_R - 14.0,
+                        "text reaches the mark at ({x}, {y})"
+                    );
+                }
+            }
+        }
+        assert!(ink > 0, "the size is still drawn");
     }
 
     #[test]
