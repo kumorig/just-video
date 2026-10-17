@@ -1533,6 +1533,14 @@ impl Navigator {
         self.rebuild_rows();
     }
 
+    /// As [`Self::playback_ended`], for decoding that stopped early (the
+    /// connection dropped, the file is damaged): tells the viewer why instead
+    /// of just leaving the video.
+    pub fn playback_failed(&mut self, error: String) {
+        self.playback_ended();
+        self.dialog("Playback stopped", vec![error]);
+    }
+
     /// The video that played may have had its format changed: mark it as saved.
     fn reload_played_layout(&mut self) {
         if let (
@@ -2879,6 +2887,12 @@ mod tests {
         nav.playback_ended();
         assert!(nav.view().rows[4].outlined, "the video just played");
         assert_eq!(nav.view().rows.iter().filter(|r| r.outlined).count(), 1);
+        assert!(!nav.dialog_open());
+        // Decoding that stopped on an error says so.
+        nav.playback_failed("The server stopped sending data".into());
+        let dialog = nav.view().dialog.as_ref().expect("explained");
+        assert_eq!(dialog.title, "Playback stopped");
+        assert!(dialog.body[0].contains("stopped sending"));
     }
 
     fn video_folder(nav: &mut Navigator, names: &[&str]) {

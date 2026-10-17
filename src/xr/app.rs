@@ -1050,7 +1050,14 @@ pub fn run(
         if stop_playback {
             set_phase(3);
             let mut saved: Option<ResumeSaved> = None;
+            let mut failure = None;
             if let Mode::Playing(playback) = std::mem::replace(&mut mode, Mode::Browser) {
+                // A read that fails in the last moments is the end of a
+                // video that was watched: nothing to explain.
+                failure = playback
+                    .error
+                    .clone()
+                    .filter(|_| !crate::config::near_end(playback.position(), playback.duration));
                 input.wait_for_dpad_release();
                 timing.report(period);
                 timing.restart();
@@ -1076,7 +1083,10 @@ pub fn run(
                     nav.open_adjacent(delta);
                     nav.redraw();
                 }
-                Some(nav) => nav.playback_ended(),
+                Some(nav) => match failure {
+                    Some(error) => nav.playback_failed(error),
+                    None => nav.playback_ended(),
+                },
                 None => options.quit.store(true, Ordering::Relaxed),
             }
         }
