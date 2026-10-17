@@ -479,25 +479,29 @@ fn save_layout(
 
 /// Remembers where the playing file was left (off the frame loop: the
 /// write may be slow). Returns what was saved: None when nothing was, Some(None)
-/// when the place was forgotten (watched to the end, or back at the start).
-fn save_resume(key: Option<&String>, playback: &Playback) -> Option<ResumeSaved> {
+/// when the place was forgotten (back at the start). `previous` is what the
+/// browser showed before: a watched video opened for a moment stays watched.
+fn save_resume(
+    key: Option<&String>,
+    playback: &Playback,
+    previous: Option<crate::config::Place>,
+) -> Option<ResumeSaved> {
     let key = key.cloned()?;
     // Nothing shown yet: the position is still the saved one, not a new place.
     playback.current()?;
-    let point = crate::config::resume_point(playback.position(), playback.duration)
-        .map(|s| (s, Some(playback.duration)));
+    let (position, duration) = (playback.position(), playback.duration);
     let _ = std::thread::Builder::new()
         .name("save resume".into())
         .spawn(move || {
-            if let Err(e) = crate::config::save_resume_position(&key, point) {
+            if let Err(e) = crate::config::save_stop(&key, position, duration) {
                 eprintln!("Can't save where the video was left: {e:#}");
             }
         });
-    Some(point)
+    Some(crate::config::stop_place(position, duration, previous))
 }
 
-/// A saved place: seconds and the video's length, or None for "from the top".
-type ResumeSaved = Option<(f64, Option<f64>)>;
+/// A saved place, or None for "from the top".
+type ResumeSaved = Option<crate::config::Place>;
 
 /// How often the place in the playing video is saved (for a crash or power-off).
 const RESUME_SAVE_INTERVAL: Duration = Duration::from_secs(15);
@@ -1054,7 +1058,11 @@ pub fn run(
                 input.wait_for_dpad_release();
                 timing.report(period);
                 timing.restart();
-                saved = save_resume(playing_key.as_ref(), &playback);
+                let previous = navigator
+                    .as_ref()
+                    .zip(playing_key.as_ref())
+                    .and_then(|(nav, key)| nav.place_of_key(key));
+                saved = save_resume(playing_key.as_ref(), &playback, previous);
                 stats.displayed_frames += playback.stats.displayed_frames;
                 stats.uploaded_frames += playback.stats.uploaded_frames;
                 stats.skipped_frames += playback.stats.skipped_frames;
@@ -1459,7 +1467,7 @@ pub fn run(
                 set_phase(5);
                 if resume_saved_at.elapsed() >= RESUME_SAVE_INTERVAL {
                     resume_saved_at = Instant::now();
-                    save_resume(playing_key.as_ref(), playback);
+                    save_resume(playing_key.as_ref(), playback, None);
                 }
                 let curved_applies = playback.layout.projection == Projection::Flat;
                 let screen = screen_size(
@@ -2316,11 +2324,9 @@ pub fn run(
     options.quit.store(true, Ordering::Relaxed);
     if let Mode::Playing(playback) = mode {
         // Written here, not in the background: the app is about to exit.
-        let point = crate::config::resume_point(playback.position(), playback.duration)
-            .map(|s| (s, Some(playback.duration)));
         if let Some(key) = &playing_key
             && playback.current().is_some()
-            && let Err(e) = crate::config::save_resume_position(key, point)
+            && let Err(e) = crate::config::save_stop(key, playback.position(), playback.duration)
         {
             eprintln!("Can't save where the video was left: {e:#}");
         }
