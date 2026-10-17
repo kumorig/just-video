@@ -97,6 +97,8 @@ pub enum Icon {
     Loop,
     /// List thumbnails, on (true) or off: a picture in a frame.
     Thumbnails(bool),
+    /// Tips: a light bulb.
+    Tips,
     /// Close the app.
     Exit,
 }
@@ -726,6 +728,14 @@ fn draw_icon_scaled(canvas: &mut Canvas, icon: &Icon, cx: f32, cy: f32, scale: f
                     frame,
                 );
             }
+        }
+        Icon::Tips => {
+            // A light bulb: glass, and a screw base.
+            let mut pen = Pen::new(canvas, cx, cy, scale);
+            pen.circle(0.0, -6.0, 14.0, YELLOW);
+            pen.rect(-8.0, 4.0, 16.0, 10.0, 3.0, YELLOW);
+            pen.rect(-8.0, 15.0, 16.0, 4.0, 2.0, SUBTLE);
+            pen.rect(-5.0, 20.0, 10.0, 3.0, 1.5, SUBTLE);
         }
         Icon::File => {
             // A page with a folded top-right corner.

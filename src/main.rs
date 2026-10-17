@@ -1572,6 +1572,15 @@ fn main() -> anyhow::Result<()> {
                         right: "100%".into(),
                         ..Row::new(Icon::Width, "Browser width")
                     },
+                    Row {
+                        detail: "Short hints about gestures, such as holding a file".into(),
+                        right: "On".into(),
+                        ..Row::new(Icon::Tips, "Tips")
+                    },
+                    Row {
+                        detail: "Show the tips again that were learned or dismissed".into(),
+                        ..Row::new(Icon::Tips, "Reset tips")
+                    },
                 ],
                 ..Default::default()
             };

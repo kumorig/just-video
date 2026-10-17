@@ -111,6 +111,10 @@ enum Item {
     /// Pictures of the videos in folder lists. Two-way, like the header's
     /// button in a folder.
     Thumbnails,
+    /// Hints about hidden gestures. Two-way.
+    Tips,
+    /// Makes every tip show again.
+    ResetTips,
     Share(String),
     Dir(String),
     Video {
@@ -133,7 +137,7 @@ enum Item {
 }
 
 /// The rows of the Settings page, in order.
-const SETTINGS: [Item; 12] = [
+const SETTINGS: [Item; 14] = [
     Item::ShortJump,
     Item::LongJump,
     Item::SeekLanding,
@@ -146,6 +150,8 @@ const SETTINGS: [Item; 12] = [
     Item::Curvature,
     Item::BrowserWidth,
     Item::VideoConnections,
+    Item::Tips,
+    Item::ResetTips,
 ];
 
 impl Item {
@@ -164,7 +170,9 @@ impl Item {
             | Item::AbLoop
             | Item::DpadMenus
             | Item::VideoConnections
-            | Item::Thumbnails => "",
+            | Item::Thumbnails
+            | Item::Tips
+            | Item::ResetTips => "",
             Item::Settings => "Settings",
             Item::Share(n)
             | Item::Dir(n)
@@ -878,6 +886,15 @@ impl Navigator {
                             .into(),
                         right: if prefs.thumbnails { "On" } else { "Off" }.into(),
                         ..Row::new(Icon::Thumbnails(prefs.thumbnails), "Thumbnails")
+                    },
+                    Item::Tips => Row {
+                        detail: "Short hints about gestures, such as holding a file".into(),
+                        right: if prefs.tips { "On" } else { "Off" }.into(),
+                        ..Row::new(Icon::Tips, "Tips")
+                    },
+                    Item::ResetTips => Row {
+                        detail: "Show the tips again that were learned or dismissed".into(),
+                        ..Row::new(Icon::Tips, "Reset tips")
                     },
                     Item::Share(name) => Row::new(Icon::Share, name),
                     Item::Dir(name) => Row::new(Icon::Folder, name),
@@ -1822,6 +1839,17 @@ impl Navigator {
                 self.dirty = true;
             }
             (Item::Thumbnails, _) => self.toggle_thumbnails(),
+            (Item::Tips, _) => self.change_preference(|p| p.tips = !p.tips),
+            (Item::ResetTips, _) => {
+                match config::reset_tips() {
+                    Ok(()) => {
+                        self.tips_done.clear();
+                        self.view.notice = Some("Tips will show again".into());
+                    }
+                    Err(e) => eprintln!("Can't reset the tips: {e:#}"),
+                }
+                self.rebuild_rows();
+            }
             (Item::ShortJump, _) => {
                 self.preset_dialog(
                     "Jump",
@@ -2640,7 +2668,9 @@ mod tests {
                 Icon::Buffer,
                 Icon::Curve,
                 Icon::Width,
-                Icon::Server
+                Icon::Server,
+                Icon::Tips,
+                Icon::Tips
             ]
         );
         let (jump, long_jump, landing, volume, resume, dpad, thumbnails, curvature, width, lanes) =
@@ -2653,6 +2683,19 @@ mod tests {
         assert!(config::preferences().ab_loop, "saved");
         nav.click(Hit::Row(ab_loop));
         assert!(!config::preferences().ab_loop);
+        // Tips: on by default, switched here; reset says so.
+        let (tips, reset) = (12, 13);
+        assert_eq!(nav.view().rows[tips].right, "On");
+        nav.click(Hit::Row(tips));
+        assert_eq!(nav.view().rows[tips].right, "Off");
+        assert!(!config::preferences().tips, "saved");
+        nav.click(Hit::Row(tips));
+        config::mark_tip_done("hold_server").unwrap();
+        nav.tips_done.insert("hold_server".into());
+        assert!(nav.view().notice.is_none());
+        nav.click(Hit::Row(reset));
+        assert_eq!(nav.view().notice.as_deref(), Some("Tips will show again"));
+        assert!(config::tips_done().is_empty() && nav.tips_done.is_empty());
         // Video connections: two-way, saved outside the player preferences.
         assert_eq!(nav.view().rows[lanes].right, "One");
         nav.click(Hit::Row(lanes));
