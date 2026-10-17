@@ -557,6 +557,9 @@ impl<S: BlockSource> ReadAheadReader<S> {
             Some(last) if last + 1 == current => {
                 self.window = (self.window + RAMP_BLOCKS).min(blocks_ahead);
             }
+            // Back into (or a few blocks past) what is already held is a
+            // demuxer going between its audio and video, not a jump.
+            Some(_) if self.blocks.contains_key(&current) => {}
             _ => self.window = JUMP_BLOCKS.min(blocks_ahead),
         }
         self.last_block = Some(current);
@@ -1032,6 +1035,36 @@ mod tests {
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         assert_eq!(out, data);
+    }
+
+    /// A demuxer alternating between streams stored a block or two apart reads
+    /// into blocks already held (the one behind, or ahead): that must not
+    /// shrink the window.
+    #[test]
+    fn reading_between_held_blocks_keeps_the_window() {
+        let options = ReadAhead {
+            block_size: 1000,
+            blocks_ahead: 16,
+            reserve_bytes: 0,
+        };
+        let (mut r, _) = reader(200_000, 0, options);
+        let mut buf = [0u8; 10];
+        for block in 0..20u64 {
+            r.seek(SeekFrom::Start(block * 1000)).unwrap();
+            r.read_exact(&mut buf).unwrap();
+        }
+        assert_eq!(r.window, 16);
+        for block in 20..60u64 {
+            for at in [block + 2, block + 1] {
+                r.seek(SeekFrom::Start(at * 1000)).unwrap();
+                r.read_exact(&mut buf).unwrap();
+                assert_eq!(r.window, 16, "after block {at}");
+            }
+        }
+        // A jump to blocks not held still starts small.
+        r.seek(SeekFrom::Start(150_000)).unwrap();
+        r.read_exact(&mut buf).unwrap();
+        assert_eq!(r.window, JUMP_BLOCKS);
     }
 
     /// A jump requests a few blocks, not the whole window: the next seek
