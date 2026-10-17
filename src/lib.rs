@@ -21,6 +21,7 @@ pub mod subtitles;
 pub mod system_volume;
 #[cfg(feature = "decode")]
 pub mod thumb_cache;
+pub mod tips;
 #[cfg(feature = "decode")]
 pub mod ui;
 #[cfg(feature = "decode")]
