@@ -1903,7 +1903,8 @@ pub fn run(
                 // D-pad left/right (or a sideways stick flick): a jump, long
                 // with the grip held. D-pad up/down: the headset's volume.
                 if buttons.seek != 0 {
-                    playback.seek(playback.position() + prefs.jump(buttons.seek, buttons.grip));
+                    let jump = prefs.jump(buttons.seek, buttons.grip);
+                    playback.seek(jump_target(playback.position(), jump, playback.duration));
                     controls_drawn = None;
                 }
                 if buttons.volume != 0 {
@@ -2346,9 +2347,35 @@ fn pointer_moved(now: Option<(f32, f32)>, then: Option<(f32, f32)>) -> bool {
     }
 }
 
+/// Seconds a forward button jump leaves before the end, so it never finishes
+/// the video (the seek bar can still go to the very end).
+const END_MARGIN: f64 = 5.0;
+
+/// Where a button jump of `jump` seconds from `position` lands in a video of
+/// `duration` (0: unknown). A forward jump stops `END_MARGIN` short of the
+/// end, or stays put when already closer than that.
+fn jump_target(position: f64, jump: f64, duration: f64) -> f64 {
+    let target = position + jump;
+    if jump > 0.0 && duration > 0.0 {
+        target.min((duration - END_MARGIN).max(position))
+    } else {
+        target
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forward_jumps_stop_short_of_the_end() {
+        assert_eq!(jump_target(100.0, 60.0, 3600.0), 160.0);
+        assert_eq!(jump_target(3500.0, 600.0, 3600.0), 3595.0);
+        assert_eq!(jump_target(3598.0, 5.0, 3600.0), 3598.0, "already close");
+        assert_eq!(jump_target(100.0, 600.0, 0.0), 700.0, "unknown length");
+        assert_eq!(jump_target(100.0, -60.0, 3600.0), 40.0);
+        assert_eq!(jump_target(3598.0, -60.0, 3600.0), 3538.0);
+    }
 
     #[test]
     fn only_pointing_at_the_panel_ends_focus() {
