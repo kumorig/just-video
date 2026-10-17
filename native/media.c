@@ -490,12 +490,17 @@ void jv_decoder_close(JVDecoder *d) {
     av_free(d);
 }
 
+// Each output (bitstream) buffer is sized for the stream's worst packet and
+// is resident once the driver touches it: FFmpeg's default of 16 held 108 MiB
+// at 1080p. The decoder hands packets back as it parses them, so 6 keep it fed.
+#define OUTPUT_BUFFERS 6
+
 // Buffer counts for the V4L2 decoder. FFmpeg's default of 20 capture buffers
 // fails to allocate at 8K.
 static void set_v4l2_buffers(AVDictionary **options, const AVCodecParameters *par) {
     int64_t pixels = (int64_t)par->width * par->height;
     av_dict_set_int(options, "num_capture_buffers", pixels > 4096 * 2304 ? 6 : 12, 0);
-    av_dict_set_int(options, "num_output_buffers", 16, 0);
+    av_dict_set_int(options, "num_output_buffers", OUTPUT_BUFFERS, 0);
 }
 
 JVDecoder *jv_decoder_open(JVMedia *media, const char *hw_backend, int allow_software,
