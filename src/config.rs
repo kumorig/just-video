@@ -333,6 +333,33 @@ struct Settings {
     video_connections: Option<usize>,
 }
 
+/// Writes `settings.json`, keeping keys this build doesn't know (top level and
+/// inside `player`) that another version saved, so rolling back to an older
+/// build and forward again doesn't lose settings the older one lacks.
+fn write_settings(settings: &Settings) -> anyhow::Result<()> {
+    let mut new = serde_json::to_value(settings)?;
+    if let Ok(serde_json::Value::Object(old)) = read_json::<serde_json::Value>("settings.json")
+        && let Some(map) = new.as_object_mut()
+    {
+        for (key, value) in old {
+            match (map.get_mut(&key), value) {
+                (None, value) => {
+                    map.insert(key, value);
+                }
+                (Some(serde_json::Value::Object(mine)), serde_json::Value::Object(theirs))
+                    if key == "player" =>
+                {
+                    for (k, v) in theirs {
+                        mine.entry(k).or_insert(v);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    write_json("settings.json", &new, false)
+}
+
 /// Player choices made on the Settings page.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -404,7 +431,7 @@ pub fn update_preferences(change: impl FnOnce(&mut Preferences)) -> anyhow::Resu
     let mut prefs = settings.player.unwrap_or_default();
     change(&mut prefs);
     settings.player = Some(prefs);
-    write_json("settings.json", &settings, false)?;
+    write_settings(&settings)?;
     Ok(prefs)
 }
 
@@ -427,7 +454,7 @@ pub fn video_connections() -> usize {
 pub fn save_video_connections(connections: usize) -> anyhow::Result<()> {
     let mut settings: Settings = read_json("settings.json")?;
     settings.video_connections = Some(connections.clamp(1, 4));
-    write_json("settings.json", &settings, false)
+    write_settings(&settings)
 }
 
 /// Where a jump lands: name and whether it is exact (see [`seek_exact`]).
@@ -446,7 +473,7 @@ pub fn seek_exact() -> bool {
 pub fn save_seek_exact(exact: bool) -> anyhow::Result<()> {
     let mut settings: Settings = read_json("settings.json")?;
     settings.seek_exact = Some(exact);
-    write_json("settings.json", &settings, false)
+    write_settings(&settings)
 }
 
 /// Choices for how much a curved screen bends: name and the fraction of
@@ -468,7 +495,7 @@ pub fn curvature() -> f32 {
 pub fn save_curvature(curvature: f32) -> anyhow::Result<()> {
     let mut settings: Settings = read_json("settings.json")?;
     settings.curvature = Some(curvature);
-    write_json("settings.json", &settings, false)
+    write_settings(&settings)
 }
 
 /// The preset nearest to `curvature` (index into [`CURVATURE_PRESETS`]).
@@ -493,7 +520,7 @@ pub fn browser_width() -> f32 {
 pub fn save_browser_width(width: f32) -> anyhow::Result<()> {
     let mut settings: Settings = read_json("settings.json")?;
     settings.browser_width = Some(width);
-    write_json("settings.json", &settings, false)
+    write_settings(&settings)
 }
 
 /// "75%".
@@ -511,7 +538,7 @@ pub fn buffer_button() -> bool {
 pub fn save_buffer_button(shown: bool) -> anyhow::Result<()> {
     let mut settings: Settings = read_json("settings.json")?;
     settings.buffer_button = Some(shown);
-    write_json("settings.json", &settings, false)
+    write_settings(&settings)
 }
 
 /// Choices for how much to buffer ahead while paused (bytes).
@@ -527,7 +554,7 @@ pub fn reserve_bytes() -> u64 {
 pub fn save_reserve_bytes(bytes: u64) -> anyhow::Result<()> {
     let mut settings: Settings = read_json("settings.json")?;
     settings.reserve_mib = Some(bytes >> 20);
-    write_json("settings.json", &settings, false)
+    write_settings(&settings)
 }
 
 /// Subtitle size and position, the same for every video.
@@ -558,7 +585,7 @@ pub fn caption_settings() -> CaptionSettings {
 pub fn save_caption_settings(captions: CaptionSettings) -> anyhow::Result<()> {
     let mut settings: Settings = read_json("settings.json")?;
     settings.captions = Some(captions);
-    write_json("settings.json", &settings, false)
+    write_settings(&settings)
 }
 
 /// Formats the format button cycles through. Default: flat 2D and VR180 3D.
@@ -584,7 +611,7 @@ pub fn favourite_formats() -> Vec<Format> {
 pub fn save_favourite_formats(formats: &[Format]) -> anyhow::Result<()> {
     let mut settings: Settings = read_json("settings.json")?;
     settings.favourite_formats = Some(formats.to_vec());
-    write_json("settings.json", &settings, false)
+    write_settings(&settings)
 }
 
 #[cfg(test)]
@@ -703,6 +730,27 @@ mod tests {
         assert!(remove_server("PC").unwrap());
         assert!(servers().unwrap().is_empty());
         assert_eq!(password(&server.url).unwrap(), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn saving_keeps_settings_from_other_versions() {
+        let dir = temp_config("unknown-keys");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"future":{"a":1},"player":{"short_jump":7,"future_pref":true}}"#,
+        )
+        .unwrap();
+        update_preferences(|p| p.long_jump = 90).unwrap();
+        save_curvature(0.5).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(v["future"]["a"], 1);
+        assert_eq!(v["player"]["future_pref"], true);
+        assert_eq!(v["player"]["short_jump"], 7);
+        assert_eq!(v["player"]["long_jump"], 90);
+        assert_eq!(v["curvature"], 0.5);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
