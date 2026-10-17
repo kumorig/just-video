@@ -1,5 +1,6 @@
 //! Just Video: standalone Steam Frame VR player reading directly from SMB shares.
 
+pub mod ab_loop;
 #[cfg(feature = "decode")]
 pub mod audio;
 pub mod config;

@@ -1521,6 +1521,11 @@ fn main() -> anyhow::Result<()> {
                         ..Row::new(Icon::Continue, "Continue where I left off")
                     },
                     Row {
+                        detail: "A button on the player bar to repeat a section".into(),
+                        right: "Off".into(),
+                        ..Row::new(Icon::Loop, "A-B loop")
+                    },
+                    Row {
                         detail: "Move through menus with the D-pad; A chooses, B goes back".into(),
                         right: "Off".into(),
                         ..Row::new(Icon::Dpad, "D-pad in menus")
@@ -1648,6 +1653,13 @@ fn main() -> anyhow::Result<()> {
                 },
                 dialog: None,
                 caption_edit: false,
+                ab_loop: {
+                    let mut l = just_video::ab_loop::AbLoop::default();
+                    l.press(1000.0);
+                    l.press(2500.0);
+                    l
+                },
+                ab_loop_enabled: true,
             };
             just_video::ui::save_png(
                 &controls::render(&state, &mut fonts, controls::Hit::Seek(0.62), None),
