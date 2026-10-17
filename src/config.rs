@@ -382,12 +382,15 @@ struct Settings {
     /// How folders are ordered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sort: Option<SortMode>,
+    /// Start the next video in the folder when one ends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    autoplay_next: Option<bool>,
 }
 
 /// How a folder's files are ordered (folders always come first, by name).
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SortMode {
-    /// A-Z, as the server lists them.
+    /// A-Z.
     #[default]
     Name,
     /// Largest first.
@@ -412,6 +415,19 @@ impl SortMode {
             SortMode::Unwatched => "Unwatched",
         }
     }
+}
+
+pub fn autoplay_next() -> bool {
+    read_json::<Settings>("settings.json")
+        .ok()
+        .and_then(|s| s.autoplay_next)
+        .unwrap_or(false)
+}
+
+pub fn save_autoplay_next(on: bool) -> anyhow::Result<()> {
+    let mut settings: Settings = read_json("settings.json")?;
+    settings.autoplay_next = Some(on);
+    write_json("settings.json", &settings, false)
 }
 
 pub fn sort_mode() -> SortMode {
@@ -742,6 +758,10 @@ mod tests {
         assert_eq!(sort_mode(), SortMode::Name);
         save_curvature(0.5).unwrap();
         save_sort_mode(SortMode::Unwatched).unwrap();
+        assert_eq!(sort_mode(), SortMode::Unwatched);
+        assert!(!autoplay_next(), "off unless chosen");
+        save_autoplay_next(true).unwrap();
+        assert!(autoplay_next());
         assert_eq!(sort_mode(), SortMode::Unwatched);
         assert_eq!(curvature(), 0.5);
         assert_eq!(SortMode::Name.next().next().next(), SortMode::Name);

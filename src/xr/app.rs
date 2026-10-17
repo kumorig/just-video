@@ -1042,6 +1042,16 @@ pub fn run(
             dialog_drawn = None;
             buttons.back = false;
         }
+        // A video that ends by itself may lead into the next one.
+        if let Mode::Playing(playback) = &mode
+            && switch_video.is_none()
+            && !buttons.back
+            && playback.error.is_none()
+            && playback.finished(now)
+            && navigator.as_ref().is_some_and(|n| n.autoplay_next())
+        {
+            switch_video = Some(1);
+        }
         // Leaving playback: B, end of video, or --duration reached.
         let mut stop_playback = switch_video.is_some();
         if let Mode::Playing(playback) = &mut mode {

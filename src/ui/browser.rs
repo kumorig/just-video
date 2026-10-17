@@ -1492,7 +1492,7 @@ mod tests {
     }
 
     #[test]
-    fn sort_labels_fit_the_tool_button() {
+    fn sort_and_autoplay_labels_fit_the_tool_button() {
         let mut fonts = Fonts::load().expect("fonts");
         let mut mode = crate::config::SortMode::Name;
         for _ in 0..3 {
@@ -1500,6 +1500,9 @@ mod tests {
             let w = fonts.measure(&label, 30.0);
             assert!(w < TOOL_W - 24.0, "{label}: {w}");
             mode = mode.next();
+        }
+        for label in ["Autoplay: Off", "Autoplay: On"] {
+            assert!(fonts.measure(label, 30.0) < TOOL_W - 24.0, "{label}");
         }
     }
 
