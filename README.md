@@ -54,5 +54,5 @@ under **This headset**: Videos, Downloads, the home folder, SD card and USB driv
 - **Thumbstick**: scroll; hold the **grip** to scroll faster. **Click** it to reset the view.
 - **Grip**: drag the browser or control bar, nearer or farther.
 - **D-pad left/right** (or a sideways stick flick): jump 5 seconds, a minute with the grip held. **D-pad up/down**: headset volume. Lengths are in Settings.
-- **Hold** a file or server to rename, move or delete it.
+- **Hold** a file or server to rename, move or delete it. A tip on the server and file lists says so until you do it or tap **Got it**.
 - **D-pad in menus** (off by default, in Settings): the D-pad moves through lists, forms and dialogs; A chooses, B goes back.

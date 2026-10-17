@@ -12,6 +12,9 @@ pub const WIDTH: u32 = 1600;
 pub const HEIGHT: u32 = 1000;
 const HEADER: f32 = 120.0;
 const BOTTOM: f32 = 24.0;
+/// The bottom strip while a tip is shown: its text and "Got it" button.
+const TIP_STRIP: f32 = 76.0;
+const TIP_BUTTON_W: f32 = 150.0;
 /// Row heights: plain, and with a thumbnail slot.
 const ROW: f32 = 88.0;
 const ROW_THUMB: f32 = 140.0;
@@ -268,6 +271,8 @@ pub struct View {
     pub scroll: f32,
     /// Tall rows with a thumbnail slot (a folder of videos, thumbnails on).
     pub thumbnails: bool,
+    /// A hint in a strip along the bottom (shown while nothing else covers it).
+    pub tip: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -278,6 +283,8 @@ pub enum Hit {
     Tool(usize),
     /// The scrollbar: scroll with [`scroll_at`].
     ScrollBar,
+    /// The tip line's "Got it" button.
+    TipDismiss,
     DialogButton(usize),
     Form(form::Hit),
     Nothing,
@@ -298,6 +305,25 @@ pub fn list_top() -> f32 {
 }
 
 impl View {
+    /// Height of the strip below the list: a tip's, or just a margin.
+    fn bottom(&self) -> f32 {
+        if self.tip.is_some() {
+            TIP_STRIP
+        } else {
+            BOTTOM
+        }
+    }
+
+    /// The tip is on screen: not under the notice, a dialog or a form, and
+    /// not in place of the list.
+    fn tip_shown(&self) -> bool {
+        self.tip.is_some()
+            && self.notice.is_none()
+            && self.dialog.is_none()
+            && self.form.is_none()
+            && self.status.is_none()
+    }
+
     /// Height of one row, in canvas pixels.
     pub fn row_h(&self) -> f32 {
         if self.thumbnails { ROW_THUMB } else { ROW }
@@ -305,7 +331,7 @@ impl View {
 
     /// How many rows fit in the list (fractional).
     pub fn visible_rows(&self) -> f32 {
-        (HEIGHT as f32 - HEADER - BOTTOM) / self.row_h()
+        (HEIGHT as f32 - HEADER - self.bottom()) / self.row_h()
     }
 
     pub fn max_scroll(&self) -> f32 {
@@ -358,17 +384,27 @@ fn tool_rect(view: &View, k: usize) -> Rect {
     )
 }
 
-fn scroll_track() -> (f32, f32) {
-    (HEADER, HEIGHT as f32 - BOTTOM - HEADER)
+fn scroll_track(view: &View) -> (f32, f32) {
+    (HEADER, HEIGHT as f32 - view.bottom() - HEADER)
+}
+
+/// The tip line's "Got it" button.
+fn tip_button() -> Rect {
+    (
+        WIDTH as f32 - PAD - TIP_BUTTON_W,
+        HEIGHT as f32 - TIP_STRIP + 12.0,
+        TIP_BUTTON_W,
+        50.0,
+    )
 }
 
 fn thumb_height(view: &View) -> f32 {
-    (view.visible_rows() / view.rows.len().max(1) as f32 * scroll_track().1).max(60.0)
+    (view.visible_rows() / view.rows.len().max(1) as f32 * scroll_track(view).1).max(60.0)
 }
 
 /// The scroll position that puts the scrollbar's thumb under canvas `y`.
 pub fn scroll_at(view: &View, y: f32) -> f32 {
-    let (top, track) = scroll_track();
+    let (top, track) = scroll_track(view);
     let thumb = thumb_height(view);
     let f = ((y - top - thumb / 2.0) / (track - thumb).max(1.0)).clamp(0.0, 1.0);
     f * view.max_scroll()
@@ -534,7 +570,8 @@ pub fn fixed_targets(view: &View, fonts: &mut Fonts) -> Vec<(Hit, Rect)> {
             .collect()
     };
     let tools = (0..view.tools.len()).map(|k| (Hit::Tool(k), tool_rect(view, k)));
-    crumbs.into_iter().chain(tools).collect()
+    let tip = view.tip_shown().then_some((Hit::TipDismiss, tip_button()));
+    tip.into_iter().chain(crumbs).chain(tools).collect()
 }
 
 /// Row `i`'s targets, left to right: the row itself, then its buttons.
@@ -578,7 +615,14 @@ pub fn hit(view: &View, fonts: &mut Fonts, x: f32, y: f32) -> Hit {
             .filter(|&(_, _, i)| i < last)
             .map_or(Hit::Nothing, |(_, _, i)| Hit::Crumb(i));
     }
-    if view.status.is_some() || y > HEIGHT as f32 - BOTTOM || x < PAD || x > WIDTH as f32 - PAD {
+    if view.tip_shown() && inside(tip_button(), x, y) {
+        return Hit::TipDismiss;
+    }
+    if view.status.is_some()
+        || y > HEIGHT as f32 - view.bottom()
+        || x < PAD
+        || x > WIDTH as f32 - PAD
+    {
         return Hit::Nothing;
     }
     if x > WIDTH as f32 - PAD - SCROLL_W + 8.0 {
@@ -1014,7 +1058,7 @@ pub fn render(
     let w = WIDTH as f32;
     let crumbs = crumb_layout(view, fonts);
     let hover = pointer.map(|(x, y)| hit(view, fonts, x, y));
-    let bottom = HEIGHT as f32 - BOTTOM;
+    let bottom = HEIGHT as f32 - view.bottom();
 
     if let Some(f) = &view.form {
         let form_hover = match hover {
@@ -1175,10 +1219,10 @@ pub fn render(
         }
         // Cover rows that scrolled under the header or off the bottom.
         canvas.rect(0.0, 0.0, w, HEADER - 8.0, 0.0, BG);
-        canvas.rect(0.0, bottom, w, BOTTOM, 0.0, BG);
+        canvas.rect(0.0, bottom, w, view.bottom(), 0.0, BG);
         let max = view.max_scroll();
         if max > 0.0 {
-            let (track_top, track) = scroll_track();
+            let (track_top, track) = scroll_track(view);
             let thumb = thumb_height(view);
             let top = track_top + view.scroll / max * (track - thumb);
             let hovered = hover == Some(Hit::ScrollBar);
@@ -1266,6 +1310,37 @@ pub fn render(
             2.0,
             0.0,
             [0x2a, 0x2f, 0x38],
+        );
+    }
+    if let (true, Some(tip)) = (view.tip_shown(), &view.tip) {
+        let (bx, by, bw, bh) = tip_button();
+        let fill = if hover == Some(Hit::TipDismiss) {
+            HOVER
+        } else {
+            [0x2a, 0x2f, 0x38]
+        };
+        canvas.rect(PAD, by - 14.0, w - 2.0 * PAD, 2.0, 0.0, [0x2a, 0x2f, 0x38]);
+        canvas.rect(bx, by, bw, bh, 12.0, fill);
+        let label = "Got it";
+        let lw = fonts.measure(label, 28.0);
+        fonts.draw(
+            &mut canvas,
+            label,
+            bx + (bw - lw) / 2.0,
+            by + bh / 2.0 + 10.0,
+            28.0,
+            TEXT,
+            bw,
+        );
+        let text = format!("Tip: {tip}");
+        fonts.draw(
+            &mut canvas,
+            &text,
+            PAD,
+            by + bh / 2.0 + 10.0,
+            28.0,
+            SUBTLE,
+            bx - PAD - 24.0,
         );
     }
     if let Some(notice) = &view.notice {
@@ -1618,6 +1693,49 @@ mod tests {
     }
 
     #[test]
+    fn the_tip_strip_clears_the_list_and_gives_way_to_a_notice() {
+        let mut fonts = Fonts::load().expect("fonts");
+        let mut v = tall();
+        let (plain_rows, plain_track) = (v.visible_rows(), scroll_track(&v).1);
+        v.tip = Some("Hold a thing".into());
+        assert!(v.visible_rows() < plain_rows && scroll_track(&v).1 < plain_track);
+        let (bx, by, bw, bh) = tip_button();
+        assert!(by >= HEIGHT as f32 - v.bottom(), "below the last row");
+        assert!(by + bh <= HEIGHT as f32 && bx + bw <= WIDTH as f32);
+        let (cx, cy) = (bx + bw / 2.0, by + bh / 2.0);
+        assert_eq!(hit(&v, &mut fonts, cx, cy), Hit::TipDismiss);
+        assert!(
+            fixed_targets(&v, &mut fonts)
+                .iter()
+                .any(|(h, _)| *h == Hit::TipDismiss)
+        );
+        // A notice covers the strip: nothing to hit, nothing to focus.
+        v.notice = Some("Opening".into());
+        assert_ne!(hit(&v, &mut fonts, cx, cy), Hit::TipDismiss);
+        assert!(
+            fixed_targets(&v, &mut fonts)
+                .iter()
+                .all(|(h, _)| *h != Hit::TipDismiss)
+        );
+        // A dialog does too.
+        v.notice = None;
+        v.dialog = Some(Dialog {
+            title: "t".into(),
+            body: Vec::new(),
+            buttons: vec!["OK".into()],
+            danger: false,
+            choice: None,
+        });
+        assert_ne!(hit(&v, &mut fonts, cx, cy), Hit::TipDismiss);
+        // The tip strip draws something: the button differs from the bare panel.
+        v.dialog = None;
+        let with_tip = render(&v, &mut fonts, None, false);
+        v.tip = None;
+        let without = render(&v, &mut fonts, None, false);
+        assert_ne!(pixel(&with_tip, cx, cy), pixel(&without, cx, cy));
+    }
+
+    #[test]
     fn sizes_are_readable() {
         assert_eq!(format_size(512), "512 B");
         assert_eq!(format_size(5_097_390_883), "5.1 GB");
@@ -1674,7 +1792,7 @@ mod tests {
             assert_eq!(rh, h - 8.0);
             assert_eq!(hit(&v, &mut fonts, 400.0, y + rh / 2.0), Hit::Row(6));
             let thumb = thumb_height(&v);
-            assert!(thumb >= 60.0 && thumb < scroll_track().1);
+            assert!(thumb >= 60.0 && thumb < scroll_track(&v).1);
             assert_eq!(scroll_at(&v, HEIGHT as f32), v.max_scroll());
         }
     }
