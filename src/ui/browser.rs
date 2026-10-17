@@ -27,8 +27,9 @@ const ACTION_W: f32 = 150.0;
 const ICON_ACTION_W: f32 = 84.0;
 /// The scrollbar's grab zone at the right edge of the list.
 const SCROLL_W: f32 = 64.0;
-/// Header tool buttons (e.g. "Cancel", "Delete 3").
-const TOOL_W: f32 = 220.0;
+/// Header tool buttons (e.g. "Cancel", "Delete 3"); wide enough for
+/// "Sort: Unwatched".
+const TOOL_W: f32 = 264.0;
 /// An icon-only tool: a square.
 const TOOL_ICON_W: f32 = 62.0;
 const TOOL_GAP: f32 = 12.0;
@@ -1488,6 +1489,18 @@ mod tests {
             }
         }
         assert!(ink > 0, "the size is still drawn");
+    }
+
+    #[test]
+    fn sort_labels_fit_the_tool_button() {
+        let mut fonts = Fonts::load().expect("fonts");
+        let mut mode = crate::config::SortMode::Name;
+        for _ in 0..3 {
+            let label = format!("Sort: {}", mode.label());
+            let w = fonts.measure(&label, 30.0);
+            assert!(w < TOOL_W - 24.0, "{label}: {w}");
+            mode = mode.next();
+        }
     }
 
     #[test]

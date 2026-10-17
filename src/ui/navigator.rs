@@ -13,7 +13,7 @@
 use super::browser::{Action, Dialog, Hit, Icon, Row, Tool, View, Watch, format_size};
 use super::controls::format_time;
 use super::form::{self, Field, Form, Key};
-use crate::config::{self, Place, Server};
+use crate::config::{self, Place, Server, SortMode};
 use crate::library::{
     Library, Listing, MoveSelection, Opened, Path, Request, Response, ThumbVideo, file_key,
 };
@@ -183,6 +183,8 @@ impl Item {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ToolAction {
+    /// Next sort order.
+    CycleSort,
     CancelSelect,
     /// Forget where the selected video was left.
     ForgetResume,
@@ -255,6 +257,8 @@ pub struct Navigator {
     tool_actions: Vec<ToolAction>,
     /// The item being played (for previous/next).
     playing: Option<usize>,
+    /// How folders are ordered.
+    sort: SortMode,
     /// Navigation request whose answer we wait for.
     pending: Option<u64>,
     /// The folder listing in progress, and the count last shown.
@@ -311,6 +315,7 @@ impl Navigator {
             move_request: None,
             folder_loaded: false,
             tool_actions: Vec::new(),
+            sort: config::sort_mode(),
             playing: None,
             pending: None,
             listing: None,
@@ -955,10 +960,24 @@ impl Navigator {
                 }
                 // Only where there are videos: the same setting as on the
                 // Settings page, to hand when the pictures are wanted.
-                None if self.in_video_folder() => vec![(
-                    Tool::icon(Icon::Thumbnails(prefs.thumbnails)),
-                    ToolAction::ToggleThumbnails,
-                )],
+                None if self.in_video_folder() => {
+                    let mut tools = vec![(
+                        Tool::icon(Icon::Thumbnails(prefs.thumbnails)),
+                        ToolAction::ToggleThumbnails,
+                    )];
+                    // Ordering matters with two or more videos.
+                    if self
+                        .items
+                        .iter()
+                        .filter(|i| matches!(i, Item::Video { .. }))
+                        .count()
+                        >= 2
+                    {
+                        let label = format!("Sort: {}", self.sort.label());
+                        tools.push((Tool::text(label, false), ToolAction::CycleSort));
+                    }
+                    tools
+                }
                 None => Vec::new(),
             }
         };
@@ -1083,7 +1102,11 @@ impl Navigator {
                                 None
                             };
                             self.restore_scroll();
-                            self.rebuild_rows();
+                            if self.sort == SortMode::Name {
+                                self.rebuild_rows();
+                            } else {
+                                self.sort_items();
+                            }
                         }
                         Err(e) => self.set_status(format!("Can't open this folder: {e}")),
                     }
@@ -1282,6 +1305,13 @@ impl Navigator {
 
     fn click_tool(&mut self, k: usize) {
         match self.tool_actions.get(k) {
+            Some(ToolAction::CycleSort) => {
+                self.sort = self.sort.next();
+                if let Err(e) = config::save_sort_mode(self.sort) {
+                    eprintln!("Can't save the sort order: {e:#}");
+                }
+                self.sort_items();
+            }
             Some(ToolAction::CancelSelect) => self.selecting = None,
             Some(ToolAction::ForgetResume) => self.forget_resume(),
             Some(ToolAction::DeleteSelected) => {
@@ -1378,6 +1408,34 @@ impl Navigator {
             *resume = None;
         }
         self.selecting = None;
+    }
+
+    /// Orders the open folder by the chosen sort (folders first, by name).
+    /// Row positions change, so the playing index (previous/next) is dropped.
+    fn sort_items(&mut self) {
+        let mode = self.sort;
+        let rank = |item: &Item| -> (u8, std::cmp::Reverse<u64>, u8, String) {
+            let name = item.name().to_lowercase();
+            match (item, mode) {
+                (Item::Dir(_), _) => (0, std::cmp::Reverse(0), 0, name),
+                (_, SortMode::Name) => (1, std::cmp::Reverse(0), 0, name),
+                (Item::Video { size, .. } | Item::File { size, .. }, SortMode::Size) => {
+                    (1, std::cmp::Reverse(*size), 0, name)
+                }
+                (Item::Video { resume, .. }, SortMode::Unwatched) => {
+                    let group = match resume {
+                        Some(Place::Resume(..)) => 0,
+                        None => 1,
+                        Some(Place::Watched) => 2,
+                    };
+                    (1, std::cmp::Reverse(0), group, name)
+                }
+                (_, _) => (1, std::cmp::Reverse(0), 3, name),
+            }
+        };
+        self.items.sort_by_cached_key(rank);
+        self.playing = None;
+        self.rebuild_rows();
     }
 
     /// Marks the videos in this folder that were left part way.
@@ -2678,6 +2736,94 @@ mod tests {
         let key = crate::library::file_key(&server, "s", &vec!["clip.mp4".to_string()]);
         nav.note_resume(&key, Some(Place::Resume(1200.0, Some(2400.0))));
         assert_eq!(nav.view().rows[1].progress, Some(0.5));
+    }
+
+    fn video(name: &str, size: u64) -> Item {
+        Item::Video {
+            name: name.into(),
+            size,
+            modified: 0,
+            assessment: None,
+            layout: None,
+            broken: None,
+            resume: None,
+        }
+    }
+
+    fn names(nav: &Navigator) -> Vec<&str> {
+        nav.items.iter().map(Item::name).collect()
+    }
+
+    #[test]
+    fn sort_orders_folders_first_then_by_mode() {
+        let mut nav = Navigator::new(Library::start(None));
+        let server = Server {
+            name: "NAS".into(),
+            url: "smb://u@nas".into(),
+            writable: false,
+        };
+        nav.show_entries_for_test(server, &["zeta", "alpha"]);
+        let mut done = video("a.mp4", 50);
+        let mut half = video("c.mp4", 20);
+        if let (Item::Video { resume: d, .. }, Item::Video { resume: h, .. }) =
+            (&mut done, &mut half)
+        {
+            *d = Some(Place::Watched);
+            *h = Some(Place::Resume(60.0, Some(600.0)));
+        }
+        nav.items.extend([
+            video("b.mp4", 5),
+            done,
+            half,
+            Item::File {
+                name: "notes.txt".into(),
+                size: 1,
+            },
+        ]);
+        nav.sort = SortMode::Size;
+        nav.sort_items();
+        assert_eq!(
+            names(&nav),
+            ["alpha", "zeta", "a.mp4", "c.mp4", "b.mp4", "notes.txt"]
+        );
+        nav.sort = SortMode::Unwatched;
+        nav.sort_items();
+        assert_eq!(
+            names(&nav),
+            ["alpha", "zeta", "c.mp4", "b.mp4", "a.mp4", "notes.txt"],
+            "started, then unwatched, then watched"
+        );
+        nav.sort = SortMode::Name;
+        nav.sort_items();
+        assert_eq!(
+            names(&nav),
+            ["alpha", "zeta", "a.mp4", "b.mp4", "c.mp4", "notes.txt"]
+        );
+    }
+
+    #[test]
+    fn sort_tool_needs_two_videos_and_cycles() {
+        let mut nav = Navigator::new(Library::start(None));
+        let server = Server {
+            name: "NAS".into(),
+            url: "smb://u@nas".into(),
+            writable: false,
+        };
+        nav.show_entries_for_test(server, &[]);
+        nav.items.push(video("a.mp4", 1));
+        nav.rebuild_rows();
+        let labels = |nav: &Navigator| -> Vec<String> {
+            nav.view().tools.iter().map(|t| t.label.clone()).collect()
+        };
+        assert_eq!(labels(&nav), [""], "only the thumbnails toggle");
+        nav.items.push(video("b.mp4", 2));
+        nav.sort = SortMode::Name;
+        nav.rebuild_rows();
+        assert_eq!(labels(&nav), ["", "Sort: A-Z"]);
+        // Not while selecting: the header belongs to the selection.
+        nav.selecting = Some(HashSet::new());
+        nav.rebuild_rows();
+        assert!(!labels(&nav).iter().any(|l| l.starts_with("Sort")));
     }
 
     #[test]
