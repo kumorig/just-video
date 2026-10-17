@@ -299,8 +299,13 @@ fn remap_file_keys<T>(entries: &mut BTreeMap<String, T>, from: &str, to: &str) -
 /// The place worth remembering for a video stopped at `position`: none near
 /// its start (nothing to skip) or its end (watched).
 pub fn resume_point(position: f64, duration: f64) -> Option<f64> {
-    let near_end = duration > 0.0 && (duration - position < 30.0 || position > duration * 0.95);
-    (position >= 10.0 && !near_end).then_some(position)
+    (position >= 10.0 && !near_end(position, duration)).then_some(position)
+}
+
+/// Whether `position` is in the last moments of a video of `duration`
+/// (unknown: 0): it counts as watched.
+pub fn near_end(position: f64, duration: f64) -> bool {
+    duration > 0.0 && (duration - position < 30.0 || position > duration * 0.95)
 }
 
 /// A video format: projection and stereo layout.
@@ -694,6 +699,7 @@ mod tests {
         assert_eq!(resume_point(3580.0, 3600.0), None, "credits");
         assert_eq!(resume_point(110.0, 120.0), None);
         assert_eq!(resume_point(600.0, 0.0), Some(600.0), "unknown length");
+        assert!(near_end(3580.0, 3600.0) && !near_end(600.0, 3600.0) && !near_end(600.0, 0.0));
     }
 
     #[test]
