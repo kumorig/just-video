@@ -59,8 +59,15 @@ impl Font {
     /// Opens face `index` of the font file at `path`.
     pub fn open(path: &str, index: u32) -> io::Result<Self> {
         let data = map_file(path)?;
-        let face = Face::parse(data, index)
+        let mut face = Face::parse(data, index)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        // A variable font (the packaged Noto Sans CJK on some distributions)
+        // opens at its default instance, which for Noto CJK is Thin. Use the
+        // weight of the static Medium faces instead; the value is clamped to
+        // the font's range, so the call can't fail for a font with that axis.
+        if face.is_variable() {
+            face.set_variation(ttf_parser::Tag::from_bytes(b"wght"), 500.0);
+        }
         let units_per_em = face.units_per_em() as f32;
         if units_per_em <= 0.0 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "no em size"));
@@ -424,6 +431,30 @@ mod tests {
         assert!(geometry <= 1, "bitmap box off by {geometry}");
         assert!(mean < 2.5, "mean difference {mean}");
         assert!(worst <= 96, "worst difference {worst}");
+    }
+
+    /// The variable Noto Sans CJK (CFF2) opens at its Thin default; the
+    /// loader must pick a readable weight. fontdue can't parse CFF2, so this
+    /// checks the ink directly: a Medium 日 at 30 px covers 46% of its box,
+    /// a Thin one 18%.
+    #[test]
+    fn variable_cjk_font_rasterizes_at_medium_weight() {
+        let Some(path) = first(&[
+            "/usr/share/fonts/google-noto-sans-cjk-vf-fonts/NotoSansCJK-VF.ttc",
+            "/usr/share/fonts/noto-cjk/NotoSansCJK-VF.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-VF.ttc",
+        ]) else {
+            return;
+        };
+        let font = Font::open(&path, 0).unwrap();
+        for ch in "日本語の動画".chars() {
+            assert_ne!(font.glyph_index(ch), 0, "no glyph for {ch:?}");
+        }
+        let (m, bits) = font.rasterize('日', 30.0);
+        assert_eq!(m.advance_width, 30.0);
+        assert_eq!(bits.len(), m.width * m.height);
+        let ink = bits.iter().map(|&b| b as f64).sum::<f64>() / (255.0 * bits.len() as f64);
+        assert!(ink > 0.3, "ink fraction {ink} looks like the Thin instance");
     }
 
     #[test]

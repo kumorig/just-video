@@ -1441,8 +1441,19 @@ fn main() -> anyhow::Result<()> {
             // The tip line under the list, with a long list to see it clears the rows.
             let mut tipped = browsing.clone();
             tipped.tip = Some(just_video::tips::Tip::HoldEntry.text().into());
-            let rows = tipped.rows.clone();
-            tipped.rows = rows.iter().cycle().take(14).cloned().collect();
+            // More folders after the first one, so the list is long and every
+            // name is distinct.
+            let more = [
+                "Documentaries",
+                "Family",
+                "Music",
+                "Series",
+                "Travel",
+                "Trips 2025",
+            ];
+            tipped
+                .rows
+                .splice(1..1, more.iter().map(|name| Row::new(Icon::Folder, *name)));
             just_video::ui::save_png(
                 &render(&tipped, &mut fonts, Some((1400.0, 960.0)), true),
                 &dir.join("tip-folder.png"),

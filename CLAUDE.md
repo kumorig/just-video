@@ -12,8 +12,9 @@ records each finished item with what was done and why.
   Needs FFmpeg dev headers (`.cargo/config.toml` points `PKG_CONFIG_PATH` at
   `.local-deps/sysroot`). `readahead::tests::pipelining_hides_latency` is
   timing-flaky under load: rerun it alone before suspecting a real failure.
-- UI tests and `ui-preview` need a system font (Noto Sans or DejaVu Sans): on
-  Debian/Ubuntu `sudo apt install fonts-noto-core`.
+- UI tests and `ui-preview` need a system font (Noto Sans or DejaVu Sans) and
+  Noto Sans CJK (static or variable): on Debian/Ubuntu
+  `sudo apt install fonts-noto-core fonts-noto-cjk`.
 - `cargo run -- ui-preview <dir>` renders every browser screen to PNGs; look at
   them after changing the UI. There is no OpenXR runtime on the PC, so the
   frame loop itself only runs on the headset.
