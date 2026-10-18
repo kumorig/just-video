@@ -16,3 +16,5 @@
 - Forward jump near the end stops 5 s short instead of ending the video.
 - A file replaced by a shorter one starts from the beginning.
 - "Playback stopped" dialog on read or decode errors.
+- Lower memory: freed heap returned, 6 decoder buffers.
+- Read-ahead window kept when the demuxer reads back.
