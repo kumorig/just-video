@@ -16,9 +16,10 @@
 //! holds the size and position buttons while the screen and subtitle area
 //! are outlined, with sample text). The screen button: a
 //! click steps through the favourite formats, a long press opens the screen
-//! dialog (every format, stars, curved screen, buffer button). The image
+//! dialog (every format, stars, curved screen). The image
 //! button opens the image dialog (brightness, contrast, saturation,
-//! rotation); a second click closes it.
+//! rotation); a second click closes it. A long press on play/pause shows or
+//! hides the buffer button.
 //! Volume is left to the headset's buttons; the thumbstick click resets the
 //! screen.
 
@@ -99,6 +100,7 @@ pub const SATURATION_STEP: f32 = 0.1;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Hit {
     Previous,
+    /// Click: play or pause; long press: show or hide the buffer button.
     PlayPause,
     Next,
     /// Buffer ahead while paused, on or off.
@@ -132,8 +134,6 @@ pub enum Hit {
     /// A format (index into [`FORMATS`]); long press stars it.
     Pick(usize),
     Curved,
-    /// Show or hide the buffer-ahead button on the bar.
-    BufferButton,
     Brightness(i8),
     Contrast(i8),
     Saturation(i8),
@@ -147,7 +147,10 @@ pub enum Hit {
 impl Hit {
     /// Hits with a long-press action (the rest act on release).
     pub fn has_long_press(self) -> bool {
-        matches!(self, Hit::Captions | Hit::Screen | Hit::Pick(_))
+        matches!(
+            self,
+            Hit::PlayPause | Hit::Captions | Hit::Screen | Hit::Pick(_)
+        )
     }
 }
 
@@ -184,8 +187,6 @@ pub struct State {
     pub has_next: bool,
     /// None when the curve toggle does not apply (VR180/360).
     pub curved: Option<bool>,
-    /// The buffer-ahead button is shown (`reserve` is None when hidden).
-    pub buffer_button: bool,
     pub format: Format,
     pub favourites: Vec<Format>,
     /// Names of the subtitle tracks (empty: none), and the one shown.
@@ -375,7 +376,6 @@ fn dialog_buttons(state: &State) -> Vec<(Hit, Rect, bool)> {
                 (24.0, 420.0, 568.0, 72.0),
                 state.curved.is_some(),
             ));
-            out.push((Hit::BufferButton, (608.0, 420.0, 568.0, 72.0), true));
         }
         Some(Dialog::Image) => {
             for (i, (minus, plus)) in [
@@ -897,15 +897,6 @@ pub fn render_dialog(
                 .to_string(),
                 state.curved == Some(true),
             ),
-            Hit::BufferButton => (
-                (if state.buffer_button {
-                    "Buffer button: shown"
-                } else {
-                    "Buffer button: hidden"
-                })
-                .to_string(),
-                state.buffer_button,
-            ),
             Hit::Brightness(d) | Hit::Contrast(d) | Hit::Saturation(d) => {
                 ((if d < 0 { "−" } else { "+" }).to_string(), false)
             }
@@ -959,7 +950,6 @@ mod tests {
             has_previous: true,
             has_next: false,
             curved: Some(false),
-            buffer_button: true,
             format: FORMATS[0],
             favourites: vec![FORMATS[0], FORMATS[3]],
             subtitle_tracks: Vec::new(),
