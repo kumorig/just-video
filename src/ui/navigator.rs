@@ -108,9 +108,6 @@ enum Item {
     DpadMenus,
     /// SMB connections a playing video is read over: one or two. Two-way.
     VideoConnections,
-    /// Pictures of the videos in folder lists. Two-way, like the header's
-    /// button in a folder.
-    Thumbnails,
     /// Hints about hidden gestures. Two-way.
     Tips,
     /// Makes every tip show again.
@@ -137,7 +134,7 @@ enum Item {
 }
 
 /// The rows of the Settings page, in order.
-const SETTINGS: [Item; 14] = [
+const SETTINGS: [Item; 13] = [
     Item::ShortJump,
     Item::LongJump,
     Item::SeekLanding,
@@ -145,7 +142,6 @@ const SETTINGS: [Item; 14] = [
     Item::Resume,
     Item::AbLoop,
     Item::DpadMenus,
-    Item::Thumbnails,
     Item::BufferSize,
     Item::Curvature,
     Item::BrowserWidth,
@@ -170,7 +166,6 @@ impl Item {
             | Item::AbLoop
             | Item::DpadMenus
             | Item::VideoConnections
-            | Item::Thumbnails
             | Item::Tips
             | Item::ResetTips => "",
             Item::Settings => "Settings",
@@ -697,8 +692,8 @@ impl Navigator {
         }
     }
 
-    /// Thumbnails on or off, from the header's button or the Settings row:
-    /// one saved preference, so both stay in step.
+    /// Thumbnails on or off, from the header's button in a folder of
+    /// videos: a saved preference, on by default.
     fn toggle_thumbnails(&mut self) {
         // Off: pending work stops and the pictures go. On: start afresh.
         self.reset_thumbnails();
@@ -880,12 +875,6 @@ impl Navigator {
                         }
                         .into(),
                         ..Row::new(Icon::Server, "Video connections")
-                    },
-                    Item::Thumbnails => Row {
-                        detail: "Pictures of videos in folder lists; slower browsing on Wi-Fi"
-                            .into(),
-                        right: if prefs.thumbnails { "On" } else { "Off" }.into(),
-                        ..Row::new(Icon::Thumbnails(prefs.thumbnails), "Thumbnails")
                     },
                     Item::Tips => Row {
                         detail: "Short hints about gestures, such as holding a file".into(),
@@ -1848,7 +1837,6 @@ impl Navigator {
                 self.rebuild_rows();
                 self.dirty = true;
             }
-            (Item::Thumbnails, _) => self.toggle_thumbnails(),
             (Item::Tips, _) => self.change_preference(|p| p.tips = !p.tips),
             (Item::ResetTips, _) => {
                 match config::reset_tips() {
@@ -2682,7 +2670,6 @@ mod tests {
                 Icon::Continue,
                 Icon::Loop,
                 Icon::Dpad,
-                Icon::Thumbnails(false),
                 Icon::Buffer,
                 Icon::Curve,
                 Icon::Width,
@@ -2691,8 +2678,8 @@ mod tests {
                 Icon::Tips
             ]
         );
-        let (jump, long_jump, landing, volume, resume, dpad, thumbnails, curvature, width, lanes) =
-            (0, 1, 2, 3, 4, 6, 7, 9, 10, 11);
+        let (jump, long_jump, landing, volume, resume, dpad, curvature, width, lanes) =
+            (0, 1, 2, 3, 4, 6, 8, 9, 10);
         // The A-B loop: off by default, shown on the player bar when on.
         let ab_loop = 5;
         assert_eq!(nav.view().rows[ab_loop].right, "Off");
@@ -2702,7 +2689,7 @@ mod tests {
         nav.click(Hit::Row(ab_loop));
         assert!(!config::preferences().ab_loop);
         // Tips: on by default, switched here; reset says so.
-        let (tips, reset) = (12, 13);
+        let (tips, reset) = (11, 12);
         assert_eq!(nav.view().rows[tips].right, "On");
         nav.click(Hit::Row(tips));
         assert_eq!(nav.view().rows[tips].right, "Off");
@@ -2767,14 +2754,9 @@ mod tests {
         assert_eq!(nav.view().rows[resume].right, "Off");
         nav.click(Hit::Row(dpad));
         assert_eq!(nav.view().rows[dpad].right, "On");
-        // Thumbnails: off by default, the same setting as the folder button.
-        assert_eq!(nav.view().rows[thumbnails].right, "Off");
-        nav.click(Hit::Row(thumbnails));
-        assert_eq!(nav.view().rows[thumbnails].right, "On");
-        assert_eq!(nav.view().rows[thumbnails].icon, Icon::Thumbnails(true));
         let p = config::preferences();
         assert_eq!((p.short_jump, p.long_jump, p.volume_step), (15, 600, 5));
-        assert!(!p.resume && p.dpad_menus && p.thumbnails);
+        assert!(!p.resume && p.dpad_menus);
         assert_eq!(nav.preferences(), p);
         // B goes back to the server list, which marks the way in.
         assert!(nav.back());
@@ -3414,7 +3396,7 @@ mod tests {
         assert!(!tool(&nav), "only folders");
         video_folder(&mut nav, &["x.mp4"]);
         assert!(tool(&nav));
-        assert!(!nav.view().thumbnails, "off by default");
+        assert!(nav.view().thumbnails, "on by default");
         nav.selecting = Some(HashSet::new());
         nav.rebuild_rows();
         assert!(!tool(&nav), "not while selecting");
@@ -3425,8 +3407,8 @@ mod tests {
         let dir = config::temp_config("nav-thumb-format");
         let (library, responses) = Library::detached();
         let mut nav = Navigator::new(library);
+        // Thumbnails are on by default: entering the folder asks for them.
         video_folder(&mut nav, &["clip.mp4", "other.mp4"]);
-        nav.click(Hit::Tool(0));
         let g = nav.thumb_generation;
         for name in ["clip.mp4", "other.mp4"] {
             responses
@@ -3475,6 +3457,8 @@ mod tests {
         let dir = config::temp_config("nav-thumb-toggle");
         let (library, responses) = Library::detached();
         let mut nav = Navigator::new(library);
+        // Start from off (the default is on) to watch the switch on.
+        nav.change_preference(|p| p.thumbnails = false);
         let names: Vec<String> = (0..20).map(|i| format!("clip {i}.mp4")).collect();
         let names: Vec<&str> = names.iter().map(String::as_str).collect();
         video_folder(&mut nav, &names);

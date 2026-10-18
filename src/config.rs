@@ -505,7 +505,7 @@ pub struct Preferences {
     pub resume: bool,
     /// The D-pad moves through menus (focus, A clicks, B goes back).
     pub dpad_menus: bool,
-    /// Thumbnails in video lists.
+    /// Thumbnails in video lists (the button in a folder's header).
     pub thumbnails: bool,
     /// The A-B loop button on the player bar.
     pub ab_loop: bool,
@@ -521,7 +521,7 @@ impl Default for Preferences {
             volume_step: 10,
             resume: true,
             dpad_menus: false,
-            thumbnails: false,
+            thumbnails: true,
             ab_loop: false,
             tips: true,
         }
@@ -798,9 +798,9 @@ mod tests {
         let p = s.player.unwrap();
         assert_eq!((p.volume_step, p.short_jump), (5, 5));
         assert!(p.resume);
-        assert!(!p.thumbnails);
-        let s: Settings = serde_json::from_str(r#"{"player":{"thumbnails":true}}"#).unwrap();
-        assert!(s.player.unwrap().thumbnails);
+        assert!(p.thumbnails);
+        let s: Settings = serde_json::from_str(r#"{"player":{"thumbnails":false}}"#).unwrap();
+        assert!(!s.player.unwrap().thumbnails);
     }
 
     #[test]
