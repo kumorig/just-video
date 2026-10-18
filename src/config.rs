@@ -392,6 +392,68 @@ struct Settings {
     /// SMB connections a playing video is read over (see [`video_connections`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     video_connections: Option<usize>,
+    /// How folders are ordered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sort: Option<SortMode>,
+    /// Start the next video in the folder when one ends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    autoplay_next: Option<bool>,
+}
+
+/// How a folder's files are ordered (folders always come first, by name).
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SortMode {
+    /// A-Z.
+    #[default]
+    Name,
+    /// Largest first.
+    Size,
+    /// Started videos, then unwatched ones, then watched ones.
+    Unwatched,
+}
+
+impl SortMode {
+    pub fn next(self) -> Self {
+        match self {
+            SortMode::Name => SortMode::Size,
+            SortMode::Size => SortMode::Unwatched,
+            SortMode::Unwatched => SortMode::Name,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SortMode::Name => "A-Z",
+            SortMode::Size => "Size",
+            SortMode::Unwatched => "Unwatched",
+        }
+    }
+}
+
+pub fn autoplay_next() -> bool {
+    read_json::<Settings>("settings.json")
+        .ok()
+        .and_then(|s| s.autoplay_next)
+        .unwrap_or(false)
+}
+
+pub fn save_autoplay_next(on: bool) -> anyhow::Result<()> {
+    let mut settings: Settings = read_json("settings.json")?;
+    settings.autoplay_next = Some(on);
+    write_json("settings.json", &settings, false)
+}
+
+pub fn sort_mode() -> SortMode {
+    read_json::<Settings>("settings.json")
+        .ok()
+        .and_then(|s| s.sort)
+        .unwrap_or_default()
+}
+
+pub fn save_sort_mode(mode: SortMode) -> anyhow::Result<()> {
+    let mut settings: Settings = read_json("settings.json")?;
+    settings.sort = Some(mode);
+    write_json("settings.json", &settings, false)
 }
 
 /// Writes `settings.json`, keeping keys this build doesn't know (top level and
@@ -727,6 +789,22 @@ mod tests {
         let p = preferences();
         assert_eq!((p.long_jump, p.volume_step), (600, 20));
         assert_eq!(curvature(), 0.5);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sort_mode_is_saved_and_keeps_other_settings() {
+        let dir = temp_config("sort");
+        assert_eq!(sort_mode(), SortMode::Name);
+        save_curvature(0.5).unwrap();
+        save_sort_mode(SortMode::Unwatched).unwrap();
+        assert_eq!(sort_mode(), SortMode::Unwatched);
+        assert!(!autoplay_next(), "off unless chosen");
+        save_autoplay_next(true).unwrap();
+        assert!(autoplay_next());
+        assert_eq!(sort_mode(), SortMode::Unwatched);
+        assert_eq!(curvature(), 0.5);
+        assert_eq!(SortMode::Name.next().next().next(), SortMode::Name);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

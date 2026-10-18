@@ -24,3 +24,5 @@
 - Thumbnails: JPEG cache kept 24 h, three made at once.
 - Video rows show Resume time or Watched.
 - Watched-state mark on every video row.
+- Folder sort: A-Z, Size, Unwatched.
+- Optional autoplay of the next video.
