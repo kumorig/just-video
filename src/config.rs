@@ -66,17 +66,25 @@ fn write_json<T: Serialize>(name: &str, value: &T, private: bool) -> anyhow::Res
     let dir = dir()?;
     std::fs::create_dir_all(&dir)?;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-    let tmp = dir.join(format!(".{name}.tmp"));
-    let _ = std::fs::remove_file(&tmp);
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(if private { 0o600 } else { 0o644 })
-        .open(&tmp)?;
-    file.write_all(&serde_json::to_vec_pretty(value)?)?;
-    file.sync_all()?;
-    std::fs::rename(&tmp, dir.join(name))?;
-    Ok(())
+    // A name of its own: two writers of one file (a background save and the
+    // UI's) must not delete each other's half-written file or fail.
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".{name}.{}.{n}.tmp", std::process::id()));
+    let write = || -> anyhow::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(if private { 0o600 } else { 0o644 })
+            .open(&tmp)?;
+        file.write_all(&serde_json::to_vec_pretty(value)?)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, dir.join(name))?;
+        Ok(())
+    };
+    write().inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 pub fn servers() -> anyhow::Result<Vec<Server>> {
@@ -291,8 +299,13 @@ fn remap_file_keys<T>(entries: &mut BTreeMap<String, T>, from: &str, to: &str) -
 /// The place worth remembering for a video stopped at `position`: none near
 /// its start (nothing to skip) or its end (watched).
 pub fn resume_point(position: f64, duration: f64) -> Option<f64> {
-    let near_end = duration > 0.0 && (duration - position < 30.0 || position > duration * 0.95);
-    (position >= 10.0 && !near_end).then_some(position)
+    (position >= 10.0 && !near_end(position, duration)).then_some(position)
+}
+
+/// Whether `position` is in the last moments of a video of `duration`
+/// (unknown: 0): it counts as watched.
+pub fn near_end(position: f64, duration: f64) -> bool {
+    duration > 0.0 && (duration - position < 30.0 || position > duration * 0.95)
 }
 
 /// A video format: projection and stereo layout.
@@ -331,6 +344,33 @@ struct Settings {
     /// SMB connections a playing video is read over (see [`video_connections`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     video_connections: Option<usize>,
+}
+
+/// Writes `settings.json`, keeping keys this build doesn't know (top level and
+/// inside `player`) that another version saved, so rolling back to an older
+/// build and forward again doesn't lose settings the older one lacks.
+fn write_settings(settings: &Settings) -> anyhow::Result<()> {
+    let mut new = serde_json::to_value(settings)?;
+    if let Ok(serde_json::Value::Object(old)) = read_json::<serde_json::Value>("settings.json")
+        && let Some(map) = new.as_object_mut()
+    {
+        for (key, value) in old {
+            match (map.get_mut(&key), value) {
+                (None, value) => {
+                    map.insert(key, value);
+                }
+                (Some(serde_json::Value::Object(mine)), serde_json::Value::Object(theirs))
+                    if key == "player" =>
+                {
+                    for (k, v) in theirs {
+                        mine.entry(k).or_insert(v);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    write_json("settings.json", &new, false)
 }
 
 /// Player choices made on the Settings page.
@@ -404,7 +444,7 @@ pub fn update_preferences(change: impl FnOnce(&mut Preferences)) -> anyhow::Resu
     let mut prefs = settings.player.unwrap_or_default();
     change(&mut prefs);
     settings.player = Some(prefs);
-    write_json("settings.json", &settings, false)?;
+    write_settings(&settings)?;
     Ok(prefs)
 }
 
@@ -427,7 +467,7 @@ pub fn video_connections() -> usize {
 pub fn save_video_connections(connections: usize) -> anyhow::Result<()> {
     let mut settings: Settings = read_json("settings.json")?;
     settings.video_connections = Some(connections.clamp(1, 4));
-    write_json("settings.json", &settings, false)
+    write_settings(&settings)
 }
 
 /// Where a jump lands: name and whether it is exact (see [`seek_exact`]).
@@ -446,7 +486,7 @@ pub fn seek_exact() -> bool {
 pub fn save_seek_exact(exact: bool) -> anyhow::Result<()> {
     let mut settings: Settings = read_json("settings.json")?;
     settings.seek_exact = Some(exact);
-    write_json("settings.json", &settings, false)
+    write_settings(&settings)
 }
 
 /// Choices for how much a curved screen bends: name and the fraction of
@@ -468,7 +508,7 @@ pub fn curvature() -> f32 {
 pub fn save_curvature(curvature: f32) -> anyhow::Result<()> {
     let mut settings: Settings = read_json("settings.json")?;
     settings.curvature = Some(curvature);
-    write_json("settings.json", &settings, false)
+    write_settings(&settings)
 }
 
 /// The preset nearest to `curvature` (index into [`CURVATURE_PRESETS`]).
@@ -493,7 +533,7 @@ pub fn browser_width() -> f32 {
 pub fn save_browser_width(width: f32) -> anyhow::Result<()> {
     let mut settings: Settings = read_json("settings.json")?;
     settings.browser_width = Some(width);
-    write_json("settings.json", &settings, false)
+    write_settings(&settings)
 }
 
 /// "75%".
@@ -511,7 +551,7 @@ pub fn buffer_button() -> bool {
 pub fn save_buffer_button(shown: bool) -> anyhow::Result<()> {
     let mut settings: Settings = read_json("settings.json")?;
     settings.buffer_button = Some(shown);
-    write_json("settings.json", &settings, false)
+    write_settings(&settings)
 }
 
 /// Choices for how much to buffer ahead while paused (bytes).
@@ -527,7 +567,7 @@ pub fn reserve_bytes() -> u64 {
 pub fn save_reserve_bytes(bytes: u64) -> anyhow::Result<()> {
     let mut settings: Settings = read_json("settings.json")?;
     settings.reserve_mib = Some(bytes >> 20);
-    write_json("settings.json", &settings, false)
+    write_settings(&settings)
 }
 
 /// Subtitle size and position, the same for every video.
@@ -558,7 +598,7 @@ pub fn caption_settings() -> CaptionSettings {
 pub fn save_caption_settings(captions: CaptionSettings) -> anyhow::Result<()> {
     let mut settings: Settings = read_json("settings.json")?;
     settings.captions = Some(captions);
-    write_json("settings.json", &settings, false)
+    write_settings(&settings)
 }
 
 /// Formats the format button cycles through. Default: flat 2D and VR180 3D.
@@ -584,7 +624,7 @@ pub fn favourite_formats() -> Vec<Format> {
 pub fn save_favourite_formats(formats: &[Format]) -> anyhow::Result<()> {
     let mut settings: Settings = read_json("settings.json")?;
     settings.favourite_formats = Some(formats.to_vec());
-    write_json("settings.json", &settings, false)
+    write_settings(&settings)
 }
 
 #[cfg(test)]
@@ -659,6 +699,7 @@ mod tests {
         assert_eq!(resume_point(3580.0, 3600.0), None, "credits");
         assert_eq!(resume_point(110.0, 120.0), None);
         assert_eq!(resume_point(600.0, 0.0), Some(600.0), "unknown length");
+        assert!(near_end(3580.0, 3600.0) && !near_end(600.0, 3600.0) && !near_end(600.0, 0.0));
     }
 
     #[test]
@@ -703,6 +744,41 @@ mod tests {
         assert!(remove_server("PC").unwrap());
         assert!(servers().unwrap().is_empty());
         assert_eq!(password(&server.url).unwrap(), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn saving_keeps_settings_from_other_versions() {
+        let dir = temp_config("unknown-keys");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"future":{"a":1},"player":{"short_jump":7,"future_pref":true}}"#,
+        )
+        .unwrap();
+        update_preferences(|p| p.long_jump = 90).unwrap();
+        save_curvature(0.5).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(v["future"]["a"], 1);
+        assert_eq!(v["player"]["future_pref"], true);
+        assert_eq!(v["player"]["short_jump"], 7);
+        assert_eq!(v["player"]["long_jump"], 90);
+        assert_eq!(v["curvature"], 0.5);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn saving_leaves_only_the_file() {
+        let dir = temp_config("write-clean");
+        for n in 0..3 {
+            update_preferences(|p| p.long_jump = 30 + n).unwrap();
+        }
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["settings.json"]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

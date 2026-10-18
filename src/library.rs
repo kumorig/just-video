@@ -384,7 +384,9 @@ fn open_video(
         eprintln!("Library: the previous video's decoder is still closing");
     }
     let decoder = media.into_decoder(hw, true, "").map_err(err)?;
-    let resume = config::resume_position(&key);
+    // A file replaced by a shorter one must not resume past its end.
+    let resume = config::resume_position(&key)
+        .filter(|&at| !config::near_end(at, decoder.info().duration_seconds));
     Ok(Box::new(Opened {
         decoder,
         layout,

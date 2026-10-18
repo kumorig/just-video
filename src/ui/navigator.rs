@@ -1533,6 +1533,14 @@ impl Navigator {
         self.rebuild_rows();
     }
 
+    /// As [`Self::playback_ended`], for decoding that stopped early (the
+    /// connection dropped, the file is damaged): tells the viewer why instead
+    /// of just leaving the video.
+    pub fn playback_failed(&mut self, error: String) {
+        self.playback_ended();
+        self.dialog("Playback stopped", vec![error]);
+    }
+
     /// The video that played may have had its format changed: mark it as saved.
     fn reload_played_layout(&mut self) {
         if let (
@@ -2068,6 +2076,14 @@ impl Navigator {
                 } else {
                     user
                 };
+                if user.contains(':') {
+                    f.error = Some(
+                        "A user name can't contain a colon. Type the password in the Password field."
+                            .into(),
+                    );
+                    f.focus(1, None);
+                    return;
+                }
                 let url = match format!("smb://{user}@{host}").parse::<SmbUrl>() {
                     Ok(url) if url.share.is_empty() => url,
                     Ok(_) => {
@@ -2755,6 +2771,22 @@ mod tests {
     }
 
     #[test]
+    fn a_password_typed_into_the_user_field_is_explained_for_the_headset() {
+        let (library, _responses) = Library::detached();
+        let mut nav = Navigator::new(library);
+        nav.start_server_form(None);
+        let form = nav.view.form.as_mut().expect("add form");
+        form.fields[0].value = "nas".into();
+        form.fields[1].value = "bob:secret".into();
+        nav.submit_form();
+        let form = nav.view().form.as_ref().expect("still open");
+        assert_eq!(form.busy, None, "nothing is sent");
+        let error = form.error.as_deref().expect("explained");
+        assert!(error.contains("Password field"), "{error}");
+        assert!(!error.contains("JUST_VIDEO"), "{error}");
+    }
+
+    #[test]
     fn videos_are_marked_by_format() {
         let mut nav = Navigator::new(Library::start(None));
         let server = Server {
@@ -2855,6 +2887,12 @@ mod tests {
         nav.playback_ended();
         assert!(nav.view().rows[4].outlined, "the video just played");
         assert_eq!(nav.view().rows.iter().filter(|r| r.outlined).count(), 1);
+        assert!(!nav.dialog_open());
+        // Decoding that stopped on an error says so.
+        nav.playback_failed("The server stopped sending data".into());
+        let dialog = nav.view().dialog.as_ref().expect("explained");
+        assert_eq!(dialog.title, "Playback stopped");
+        assert!(dialog.body[0].contains("stopped sending"));
     }
 
     fn video_folder(nav: &mut Navigator, names: &[&str]) {

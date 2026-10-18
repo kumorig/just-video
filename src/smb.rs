@@ -54,9 +54,12 @@ impl FromStr for SmbUrl {
             Some((domain, user)) => (Some(domain.to_string()), user.to_string()),
             None => (None, "guest".to_string()),
         };
-        // `host`, `host:port`, `[v6]` or `[v6]:port`.
+        // `host`, `host:port`, `[v6]` or `[v6]:port`; a bare `fe80::1` (several
+        // colons, no brackets) is an address with no port, kept bracketed.
+        let bare_v6 = !hostport.contains(']') && hostport.matches(':').count() > 1;
         let port_split = match hostport.rfind(']') {
             Some(close) => hostport[close..].rfind(':').map(|i| close + i),
+            None if bare_v6 => None,
             None => hostport.rfind(':'),
         };
         let (host, port) = match port_split {
@@ -64,6 +67,7 @@ impl FromStr for SmbUrl {
                 hostport[..i].to_string(),
                 Some(hostport[i + 1..].parse().context("Invalid SMB port")?),
             ),
+            None if bare_v6 => (format!("[{hostport}]"), None),
             None => (hostport.to_string(), None),
         };
         ensure!(!host.is_empty(), "SMB URL needs a host");
@@ -817,6 +821,9 @@ mod tests {
     fn share_only_and_guest() {
         let url: SmbUrl = "smb://[fe80::1]:445/videos/".parse().unwrap();
         assert_eq!(url.host, "[fe80::1]");
+        let bare: SmbUrl = "smb://u@fe80::1/videos".parse().unwrap();
+        assert_eq!((bare.host.as_str(), bare.port), ("[fe80::1]", None));
+        assert_eq!(bare.share, "videos");
         let url: SmbUrl = "smb://192.168.1.5/videos/".parse().unwrap();
         assert_eq!(url.user, "guest");
         assert_eq!(url.port, None);

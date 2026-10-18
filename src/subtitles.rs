@@ -174,9 +174,20 @@ pub fn parse_srt(text: &str) -> Vec<Cue> {
         .trim_start_matches('\u{feff}')
         .replace("\r\n", "\n")
         .replace('\r', "\n");
+    // Blocks end at a blank line; many files have spaces or tabs on it.
+    let mut blocks: Vec<Vec<&str>> = vec![Vec::new()];
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            if !blocks.last().is_some_and(Vec::is_empty) {
+                blocks.push(Vec::new());
+            }
+        } else if let Some(block) = blocks.last_mut() {
+            block.push(line);
+        }
+    }
     let mut cues = Vec::new();
-    for block in text.split("\n\n") {
-        let mut lines = block.lines().skip_while(|l| l.trim().is_empty());
+    for block in blocks {
+        let mut lines = block.into_iter();
         let mut first = lines.next();
         // The counter line is optional in practice.
         if first.is_some_and(|l| !l.contains("-->")) {
@@ -206,7 +217,7 @@ pub fn clean_markup(text: &str) -> String {
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            '{' if text.contains('}') => {
+            '{' if chars.clone().any(|c| c == '}') => {
                 for c in chars.by_ref() {
                     if c == '}' {
                         break;
@@ -441,6 +452,14 @@ mod tests {
     }
 
     #[test]
+    fn blank_looking_separators_still_split_cues() {
+        let srt = "1\n00:00:01,000 --> 00:00:02,000\nfirst\n \n2\n00:00:03,000 --> 00:00:04,000\nsecond\n\t\n\n3\n00:00:05,000 --> 00:00:06,000\nthird";
+        let cues = parse_srt(srt);
+        let texts: Vec<&str> = cues.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, ["first", "second", "third"]);
+    }
+
+    #[test]
     fn skips_damaged_blocks() {
         let cues = parse_srt("1\nnot a time\nhi\n\n2\n00:00:01,000 --> 00:00:02,000\nok\n");
         assert_eq!(cues.len(), 1);
@@ -454,6 +473,9 @@ mod tests {
             "Top line\nSecond word"
         );
         assert_eq!(clean_markup("a < b and c > d"), "a < b and c > d");
+        // A `{` with no `}` after it is text, not a block that eats the line.
+        assert_eq!(clean_markup("a { b"), "a { b");
+        assert_eq!(clean_markup(r"{\i1}a { b"), "a { b");
     }
 
     #[test]
