@@ -529,6 +529,36 @@ impl<S: BlockSource> ReadAheadReader<S> {
         self.stats
     }
 
+    /// Asks again for every block in the window whose request has already
+    /// failed (finished blocks are kept as they are). Returns how many were
+    /// asked for again.
+    fn respawn_failed(&mut self) -> usize {
+        use futures_util::FutureExt;
+        let finished: Vec<u64> = self
+            .blocks
+            .iter()
+            .filter(|(_, b)| matches!(b, Block::Pending(h) if h.is_finished()))
+            .map(|(&i, _)| i)
+            .collect();
+        let mut again = 0;
+        for i in finished {
+            let Some(Block::Pending(handle)) = self.blocks.get_mut(&i) else {
+                continue;
+            };
+            match handle.now_or_never() {
+                Some(Ok(Ok(data))) => {
+                    self.blocks.insert(i, Block::Ready(data));
+                }
+                Some(_) => {
+                    self.spawn(i);
+                    again += 1;
+                }
+                None => {}
+            }
+        }
+        again
+    }
+
     fn spawn(&mut self, index: u64) {
         let size = self.options.block_size as u64;
         let offset = index * size;
@@ -722,7 +752,15 @@ impl<S: BlockSource> Read for ReadAheadReader<S> {
                     }
                     retries += 1;
                     eprintln!("Read-ahead: retrying read at {} ({error})", self.pos);
-                    std::thread::sleep(Duration::from_millis(200 * retries as u64));
+                    // A connection that gives up fails everything queued on it
+                    // at once (a dropped link, every connection): ask again
+                    // for all of those now, not one block per read, and for
+                    // the first retry without waiting. A lone failure, and
+                    // later retries, still back off.
+                    let batch = self.respawn_failed();
+                    if retries > 1 || batch == 0 {
+                        std::thread::sleep(Duration::from_millis(200 * retries as u64));
+                    }
                     self.spawn(index);
                 }
             }
@@ -1239,5 +1277,60 @@ mod tests {
         let elapsed = started.elapsed();
         assert!(elapsed < Duration::from_millis(250), "took {elapsed:?}");
         assert_eq!(r.stats().requests, 64);
+    }
+
+    /// The first request for every block fails after a while (a link that
+    /// went silent: every connection gives up on all it was asked at once),
+    /// the next requests answer quickly.
+    struct Blackout {
+        data: Vec<u8>,
+        asked: std::sync::Mutex<std::collections::HashSet<u64>>,
+    }
+
+    impl BlockSource for Blackout {
+        fn fetch(
+            self: Arc<Self>,
+            offset: u64,
+            len: usize,
+        ) -> BoxFuture<'static, io::Result<Vec<u8>>> {
+            Box::pin(async move {
+                if self.asked.lock().unwrap().insert(offset) {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    return Err(io::Error::other("timed out"));
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok(self.data[offset as usize..offset as usize + len].to_vec())
+            })
+        }
+    }
+
+    #[test]
+    fn a_blackout_of_every_connection_costs_one_round_trip_not_one_per_block() {
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_time()
+                .build()
+                .unwrap(),
+        );
+        const BLOCK: usize = 1000;
+        let data: Vec<u8> = (0..16 * BLOCK).map(|i| (i % 251) as u8).collect();
+        let source = Blackout {
+            data: data.clone(),
+            asked: Default::default(),
+        };
+        let options = ReadAhead {
+            block_size: BLOCK,
+            blocks_ahead: 16,
+            reserve_bytes: 0,
+        };
+        let mut r = ReadAheadReader::new(runtime, source, data.len() as u64, options);
+        let started = Instant::now();
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        let took = started.elapsed();
+        assert_eq!(got, data);
+        // Each block alone would cost a pause and a round trip (over 3 s).
+        assert!(took < Duration::from_millis(1000), "took {took:?}");
     }
 }
