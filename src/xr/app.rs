@@ -1697,7 +1697,6 @@ pub fn run(
                     has_previous: navigator.as_ref().is_some_and(|n| n.has_adjacent(-1)),
                     has_next: navigator.as_ref().is_some_and(|n| n.has_adjacent(1)),
                     curved: curved_applies.then_some(placement.curved),
-                    buffer_button,
                     format: (playback.layout.projection, playback.layout.stereo),
                     favourites: favourites.clone(),
                     subtitle_tracks: playback.subtitle_labels(),
@@ -2020,12 +2019,6 @@ pub fn run(
                     }
                     Some(controls::Hit::Pick(i)) => set_format(playback, controls::FORMATS[i]),
                     Some(controls::Hit::Curved) => placement.curved = !placement.curved,
-                    Some(controls::Hit::BufferButton) => {
-                        buffer_button = !buffer_button;
-                        if let Err(e) = crate::config::save_buffer_button(buffer_button) {
-                            eprintln!("Can't save the buffer button setting: {e:#}");
-                        }
-                    }
                     Some(controls::Hit::Brightness(d)) => {
                         playback.image.brightness = (playback.image.brightness
                             + controls::BRIGHTNESS_STEP * d as f32)
@@ -2057,6 +2050,12 @@ pub fn run(
                 }
                 // A long press opens a button's dialog, or closes it again.
                 match long_pressed {
+                    Some(controls::Hit::PlayPause) => {
+                        buffer_button = !buffer_button;
+                        if let Err(e) = crate::config::save_buffer_button(buffer_button) {
+                            eprintln!("Can't save the buffer button setting: {e:#}");
+                        }
+                    }
                     Some(controls::Hit::Captions) if dialog == Some(controls::Dialog::Tracks) => {
                         dialog = None;
                     }
@@ -2996,7 +2995,6 @@ mod tests {
             has_previous: true,
             has_next: true,
             curved: Some(false),
-            buffer_button: true,
             format: controls::FORMATS[0],
             favourites: vec![controls::FORMATS[0]],
             subtitle_tracks: vec!["English".into()],
