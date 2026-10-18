@@ -26,3 +26,4 @@
 - Watched-state mark on every video row.
 - Folder sort: A-Z, Size, Unwatched.
 - Optional autoplay of the next video.
+- Optional A-B loop button.

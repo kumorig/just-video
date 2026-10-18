@@ -101,6 +101,8 @@ enum Item {
     VolumeStep,
     /// Continue videos where they were left. Two-way.
     Resume,
+    /// The A-B loop button on the player bar. Two-way.
+    AbLoop,
     /// The D-pad moves through menus. Two-way.
     DpadMenus,
     /// SMB connections a playing video is read over: one or two. Two-way.
@@ -130,12 +132,13 @@ enum Item {
 }
 
 /// The rows of the Settings page, in order.
-const SETTINGS: [Item; 11] = [
+const SETTINGS: [Item; 12] = [
     Item::ShortJump,
     Item::LongJump,
     Item::SeekLanding,
     Item::VolumeStep,
     Item::Resume,
+    Item::AbLoop,
     Item::DpadMenus,
     Item::Thumbnails,
     Item::BufferSize,
@@ -157,6 +160,7 @@ impl Item {
             | Item::LongJump
             | Item::VolumeStep
             | Item::Resume
+            | Item::AbLoop
             | Item::DpadMenus
             | Item::VideoConnections
             | Item::Thumbnails => "",
@@ -843,6 +847,11 @@ impl Navigator {
                         detail: "Start videos from where they were stopped".into(),
                         right: if prefs.resume { "On" } else { "Off" }.into(),
                         ..Row::new(Icon::Continue, "Continue where I left off")
+                    },
+                    Item::AbLoop => Row {
+                        detail: "A button on the player bar to repeat a section".into(),
+                        right: if prefs.ab_loop { "On" } else { "Off" }.into(),
+                        ..Row::new(Icon::Loop, "A-B loop")
                     },
                     Item::DpadMenus => Row {
                         detail: "Move through menus with the D-pad; A chooses, B goes back".into(),
@@ -1769,6 +1778,7 @@ impl Navigator {
             }
             (Item::Settings, _) => self.navigate(Location::Settings),
             (Item::Resume, _) => self.change_preference(|p| p.resume = !p.resume),
+            (Item::AbLoop, _) => self.change_preference(|p| p.ab_loop = !p.ab_loop),
             (Item::DpadMenus, _) => self.change_preference(|p| p.dpad_menus = !p.dpad_menus),
             (Item::VideoConnections, _) => {
                 let next = if config::video_connections() > 1 {
@@ -2603,6 +2613,7 @@ mod tests {
                 Icon::Jump,
                 Icon::Volume,
                 Icon::Continue,
+                Icon::Loop,
                 Icon::Dpad,
                 Icon::Thumbnails(false),
                 Icon::Buffer,
@@ -2612,7 +2623,15 @@ mod tests {
             ]
         );
         let (jump, long_jump, landing, volume, resume, dpad, thumbnails, curvature, width, lanes) =
-            (0, 1, 2, 3, 4, 5, 6, 8, 9, 10);
+            (0, 1, 2, 3, 4, 6, 7, 9, 10, 11);
+        // The A-B loop: off by default, shown on the player bar when on.
+        let ab_loop = 5;
+        assert_eq!(nav.view().rows[ab_loop].right, "Off");
+        nav.click(Hit::Row(ab_loop));
+        assert_eq!(nav.view().rows[ab_loop].right, "On");
+        assert!(config::preferences().ab_loop, "saved");
+        nav.click(Hit::Row(ab_loop));
+        assert!(!config::preferences().ab_loop);
         // Video connections: two-way, saved outside the player preferences.
         assert_eq!(nav.view().rows[lanes].right, "One");
         nav.click(Hit::Row(lanes));

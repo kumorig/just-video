@@ -23,6 +23,7 @@
 //! screen.
 
 use super::canvas::{Canvas, Fonts, Rgb};
+use crate::ab_loop::AbLoop;
 use crate::config::ImageAdjust;
 use crate::vr::{Projection, Stereo};
 
@@ -110,6 +111,8 @@ pub enum Hit {
     Screen,
     /// Opens the image dialog (or closes it).
     Image,
+    /// A-B loop: set A, set B, clear.
+    Loop,
     // In the dialogs:
     AudioTrack(usize),
     /// A subtitle track, or None for off.
@@ -197,6 +200,10 @@ pub struct State {
     pub dialog: Option<Dialog>,
     /// Editing subtitle size and position: the bar holds only those buttons.
     pub caption_edit: bool,
+    /// The A-B loop (marks on the seek bar, button state).
+    pub ab_loop: AbLoop,
+    /// The A-B loop setting: off hides the button and the marks.
+    pub ab_loop_enabled: bool,
 }
 
 type Rect = (f32, f32, f32, f32);
@@ -221,6 +228,8 @@ const NEXT: Rect = (248.0, 16.0, 96.0, 92.0);
 const RESERVE: Rect = (136.0, 116.0, 96.0, 36.0);
 /// What the reserve is doing, beside its button.
 const RESERVE_LABEL: Rect = (248.0, 116.0, 440.0, 36.0);
+/// Between the buffering text and the setting buttons.
+const LOOP: Rect = (640.0, 16.0, 96.0, 92.0);
 const CAPTIONS: Rect = (818.0, 16.0, 96.0, 92.0);
 const SCREEN: Rect = (948.0, 16.0, 96.0, 92.0);
 const IMAGE: Rect = (1078.0, 16.0, 96.0, 92.0);
@@ -259,6 +268,11 @@ pub fn hit(state: &State, x: f32, y: f32) -> Hit {
         (PLAY, Hit::PlayPause, true),
         (NEXT, Hit::Next, state.has_next),
         (RESERVE, Hit::Reserve, state.reserve.is_some()),
+        (
+            LOOP,
+            Hit::Loop,
+            state.ab_loop_enabled && state.duration > 0.0,
+        ),
         (CAPTIONS, Hit::Captions, can_caption),
         (SCREEN, Hit::Screen, true),
         (IMAGE, Hit::Image, true),
@@ -687,6 +701,13 @@ pub fn render(state: &State, fonts: &mut Fonts, hover: Hit, pressing: Option<Pre
         label_under(&mut c, fonts, CAPTIONS, &caption_label);
     }
 
+    if state.ab_loop_enabled {
+        let looping = state.ab_loop.a().is_some();
+        button(&mut c, LOOP, hover == Hit::Loop, looping, press(Hit::Loop));
+        centered(&mut c, fonts, "A-B", LOOP, 34.0, TEXT);
+        label_under(&mut c, fonts, LOOP, state.ab_loop.label());
+    }
+
     let screen_fill = if hover == Hit::Screen { HOVER } else { BUTTON };
     button(
         &mut c,
@@ -758,6 +779,12 @@ pub fn render(state: &State, fonts: &mut Fonts, hover: Hit, pressing: Option<Pre
         }
     }
     c.rect(sx, track_y - 6.0, sw * fraction, 12.0, 6.0, ACCENT);
+    if state.ab_loop_enabled && state.duration > 0.0 {
+        for mark in [state.ab_loop.a(), state.ab_loop.b()].into_iter().flatten() {
+            let x = sx + sw * (mark / state.duration).clamp(0.0, 1.0) as f32;
+            c.rect(x - 3.0, track_y - 20.0, 6.0, 40.0, 3.0, SUBTLE);
+        }
+    }
     if let Hit::Seek(f) = hover {
         c.rect(sx + sw * f - 2.0, track_y - 22.0, 4.0, 44.0, 2.0, SUBTLE);
         let label = format_time(f as f64 * state.duration);
@@ -943,6 +970,8 @@ mod tests {
             image: ImageAdjust::default(),
             dialog: None,
             caption_edit: false,
+            ab_loop: AbLoop::default(),
+            ab_loop_enabled: true,
         }
     }
 
@@ -976,6 +1005,48 @@ mod tests {
         };
         let (x, y) = center(CAPTIONS);
         assert_eq!(hit(&with_subs, x, y), Hit::Captions);
+    }
+
+    #[test]
+    fn the_loop_button_sits_clear_of_its_neighbours() {
+        let (x, y) = center(LOOP);
+        assert_eq!(hit(&state(), x, y), Hit::Loop);
+        let unknown_length = State {
+            duration: 0.0,
+            ..state()
+        };
+        assert_eq!(hit(&unknown_length, x, y), Hit::Nothing);
+        // With the A-B loop setting off its button isn't there.
+        let off = State {
+            ab_loop_enabled: false,
+            ..state()
+        };
+        assert_eq!(hit(&off, x, y), Hit::Nothing);
+        // Between the buffering text and the CC button, on the buttons' row.
+        let (rx, _, rw, _) = RESERVE_LABEL;
+        assert!(LOOP.0 >= rx + rw - 48.0 && LOOP.0 + LOOP.2 + 16.0 <= CAPTIONS.0);
+        assert_eq!((LOOP.1, LOOP.3), (CAPTIONS.1, CAPTIONS.3));
+        // Its marks show on the seek bar, and the bar still renders.
+        let mut fonts = Fonts::load().expect("fonts");
+        let mut looped = AbLoop::default();
+        looped.press(10.0);
+        looped.press(60.0);
+        let canvas = render(
+            &State {
+                ab_loop: looped,
+                ..state()
+            },
+            &mut fonts,
+            Hit::Nothing,
+            None,
+        );
+        let track_y = SEEK.1 + SEEK.3 / 2.0;
+        let mark_x = SEEK.0 + SEEK.2 * (10.0 / 120.0);
+        let i = ((track_y as u32 - 18) * canvas.width + mark_x as u32) * 4;
+        assert_eq!(
+            canvas.pixels[i as usize], SUBTLE[0],
+            "A is marked above the track"
+        );
     }
 
     #[test]

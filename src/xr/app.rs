@@ -1014,6 +1014,7 @@ pub fn run(
     let mut caption_at: Option<(xr::Posef, Shape)> = None;
     // Editing subtitle size and position (from the track dialog).
     let mut caption_edit = false;
+    let mut ab_loop = crate::ab_loop::AbLoop::default();
     let mut cursor = renderer.create_quad(&ctx, CURSOR_PX, CURSOR_PX)?;
     renderer.upload_quad(&mut cursor, &cursor_image())?;
     // The browser's handle, and a brighter one while pointed at or held.
@@ -1172,6 +1173,9 @@ pub fn run(
         }
         if let Some(nav) = &navigator {
             prefs = nav.preferences();
+            if !prefs.ab_loop {
+                ab_loop.clear();
+            }
         }
         let ray = buttons.rays[active_hand]
             .as_ref()
@@ -1320,6 +1324,7 @@ pub fn run(
                     renderer.set_adjust(&playback.image);
                     dialog = None;
                     caption_edit = false;
+                    ab_loop.clear();
                     // Ahead at the default size and viewpoint: the last
                     // video's zoom, drag and inside-the-sphere offset
                     // don't carry over.
@@ -1655,6 +1660,9 @@ pub fn run(
                     resume_saved_at = Instant::now();
                     save_resume(playing_key.as_ref(), playback, None);
                 }
+                if let Some(back) = ab_loop.jump(playback.position()) {
+                    playback.seek(back);
+                }
                 let curved_applies = playback.layout.projection == Projection::Flat;
                 let screen = screen_size(
                     renderer.video_size(),
@@ -1700,6 +1708,8 @@ pub fn run(
                     image: playback.image,
                     dialog,
                     caption_edit,
+                    ab_loop,
+                    ab_loop_enabled: prefs.ab_loop,
                 };
                 // The pointer on the dialog (above the bar) or on the bar.
                 let dialog_at = controls_panel_at
@@ -1955,6 +1965,10 @@ pub fn run(
                 match clicked {
                     Some(controls::Hit::PlayPause) => playback.toggle_pause(now),
                     Some(controls::Hit::Reserve) => playback.toggle_reserve(now),
+                    Some(controls::Hit::Loop) if prefs.ab_loop => {
+                        ab_loop.press(playback.position())
+                    }
+                    Some(controls::Hit::Loop) => {}
                     Some(controls::Hit::Seek(f)) => playback.seek(f as f64 * playback.duration),
                     Some(controls::Hit::Previous) => switch_video = Some(-1),
                     Some(controls::Hit::Next) => switch_video = Some(1),
@@ -2993,6 +3007,8 @@ mod tests {
             image: Default::default(),
             dialog: None,
             caption_edit: false,
+            ab_loop: Default::default(),
+            ab_loop_enabled: true,
         };
         let bar = controls::render(&state, &mut fonts, controls::Hit::Nothing, None);
         let caption =

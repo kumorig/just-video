@@ -90,6 +90,8 @@ pub enum Icon {
     Volume,
     /// Continuing a video: a play triangle after a bar.
     Continue,
+    /// Repeating a section: two bars joined by a line.
+    Loop,
     /// List thumbnails, on (true) or off: a picture in a frame.
     Thumbnails(bool),
     /// Close the app.
@@ -771,6 +773,12 @@ fn draw_icon_scaled(canvas: &mut Canvas, icon: &Icon, cx: f32, cy: f32, scale: f
             }
             canvas.rect(cx + 2.0, cy - 8.0, 3.0, 16.0, 1.5, ACCENT);
             canvas.rect(cx + 10.0, cy - 14.0, 3.0, 28.0, 1.5, ACCENT);
+        }
+        Icon::Loop => {
+            // Two bars (A and B) with the section between them.
+            canvas.rect(cx - 22.0, cy - 14.0, 5.0, 28.0, 2.0, ACCENT);
+            canvas.rect(cx + 17.0, cy - 14.0, 5.0, 28.0, 2.0, ACCENT);
+            canvas.rect(cx - 17.0, cy - 2.5, 34.0, 5.0, 2.0, ACCENT);
         }
         Icon::Continue => {
             // A bar, then a play triangle.
