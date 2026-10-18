@@ -227,9 +227,13 @@ pub fn assess(platform: Platform, video: Option<&VideoInfo>) -> Assessment {
             // A SteamOS update may bring hardware decoding for the format;
             // nothing will make the picture smaller.
             let later = v.bit_depth > 8 || !matches!(v.codec.as_str(), "h264" | "hevc" | "vp9");
-            let mut detail = format!("{} would stutter horrendously.", short(v));
+            let mut detail = format!(
+                "{why_hw}. The CPU manages about {:.0}% of real time for {}, so playback would stutter.",
+                s * 100.0,
+                short(v)
+            );
             if later && platform == Platform::SteamFrame {
-                detail.push_str(" It might be available later with an update of SteamOS.");
+                detail.push_str(" Hardware decoding for it may come with a later SteamOS update.");
             }
             Assessment {
                 platform,
@@ -306,7 +310,7 @@ mod tests {
         assert!(a.title.contains("8K 60 fps 10-bit HEVC"), "{}", a.title);
         assert_eq!(
             detail,
-            "8K 10-bit video would stutter horrendously. It might be available later with an update of SteamOS."
+            "No hardware 10-bit decoding yet. The CPU manages about 75% of real time for 8K 10-bit video, so playback would stutter. Hardware decoding for it may come with a later SteamOS update."
         );
         // 1.5e9 / (8192*4096*59.94) ≈ 0.746 (measured: 0.8×)
         assert!((a.software_speed.unwrap() - 0.746).abs() < 0.01);
@@ -324,11 +328,8 @@ mod tests {
         // AV1 8K60: 0.8e9 / 2.0e9 → unplayable.
         let av1 = frame(&video("av1", 7680, 3840, 10, 60.0));
         assert_eq!(av1.verdict, Verdict::Unplayable);
-        assert!(
-            av1.detail
-                .unwrap()
-                .starts_with("8K 10-bit video would stutter")
-        );
+        let detail = av1.detail.unwrap();
+        assert!(detail.starts_with("No hardware AV1 decoding. The CPU manages about 45% of real time for 8K 10-bit video"), "{detail}");
     }
 
     #[test]

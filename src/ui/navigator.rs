@@ -1628,22 +1628,16 @@ impl Navigator {
         if n == 0 {
             return;
         }
-        let mut body = vec![format!(
+        // The count is the warning; a list of names would not fit and
+        // nobody reads it.
+        let body = vec![format!(
             "{} deleted from the server for good.",
-            if n == 1 { "It will be" } else { "They will be" }
-        )];
-        if n > 1 {
-            let mut list = names
-                .iter()
-                .take(6)
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(", ");
-            if n > 6 {
-                list += &format!(" and {} more", n - 6);
+            if n == 1 {
+                "It will be".to_string()
+            } else {
+                format!("All {n} will be")
             }
-            body.push(list);
-        }
+        )];
         let title = if n == 1 {
             format!("Delete {}?", names[0])
         } else {

@@ -1622,7 +1622,7 @@ fn main() -> anyhow::Result<()> {
             dialog.dialog = Some(Dialog {
                 title: "Won't play smoothly (8K 60 fps 10-bit HEVC)".into(),
                 body: vec![
-                    "8K 10-bit video would stutter horrendously. It might be available later with an update of SteamOS.".into(),
+                    "No hardware 10-bit decoding yet. The CPU manages about 75% of real time for 8K 10-bit video, so playback would stutter. Hardware decoding for it may come with a later SteamOS update.".into(),
                 ],
                 buttons: vec!["OK".into()],
                 danger: false,
