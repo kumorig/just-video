@@ -945,7 +945,25 @@ pub fn render(
     pointer: Option<(f32, f32)>,
     draw_cursor: bool,
 ) -> Canvas {
-    let mut canvas = Canvas::new(WIDTH, HEIGHT);
+    render_into(
+        Canvas::new(WIDTH, HEIGHT),
+        view,
+        fonts,
+        pointer,
+        draw_cursor,
+    )
+}
+
+/// [`render`] over a canvas from an earlier render (any content), which saves
+/// allocating and faulting in 6 MB for every repaint.
+pub fn render_into(
+    mut canvas: Canvas,
+    view: &View,
+    fonts: &mut Fonts,
+    pointer: Option<(f32, f32)>,
+    draw_cursor: bool,
+) -> Canvas {
+    debug_assert_eq!((canvas.width, canvas.height), (WIDTH, HEIGHT));
     canvas.clear(BG);
     let w = WIDTH as f32;
     let crumbs = crumb_layout(view, fonts);
@@ -1296,6 +1314,57 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    /// `cargo test --release -- --ignored --nocapture render_time`: how long
+    /// one repaint of a folder of videos with thumbnails takes.
+    #[test]
+    #[ignore]
+    fn render_time() {
+        let thumb = Arc::new(Thumb {
+            width: 220,
+            height: 124,
+            rgba: vec![90; 220 * 124 * 4],
+        });
+        let mut view = View {
+            crumbs: vec!["Just Video".into(), "PC".into(), "media".into()],
+            rows: (0..30)
+                .map(|i| {
+                    let mut row =
+                        Row::new(Icon::Video(None), format!("Some video file name {i}.mp4"));
+                    row.detail = "VR180 3D · 6144x3072 HEVC · 12 GB".into();
+                    row.right = "1:23:45".into();
+                    row.actions = vec![Action::Settings, Action::Remove];
+                    row.thumbnail = Some(thumb.clone());
+                    row
+                })
+                .collect(),
+            thumbnails: true,
+            ..Default::default()
+        };
+        let mut fonts = Fonts::load().expect("fonts");
+        // As the app does: each repaint reuses the last canvas.
+        let mut canvas = render(&view, &mut fonts, Some((400.0, 300.0)), false);
+        let started = std::time::Instant::now();
+        let n = 50;
+        for i in 0..n {
+            view.scroll = i as f32 * 0.1;
+            canvas = render_into(canvas, &view, &mut fonts, Some((400.0, 300.0)), false);
+        }
+        println!(
+            "browser repaint: {:.2} ms",
+            started.elapsed().as_secs_f64() * 1e3 / n as f64
+        );
+        let started = std::time::Instant::now();
+        for _ in 0..n {
+            let mut c = Canvas::new(WIDTH, HEIGHT);
+            c.clear(BG);
+            std::hint::black_box(&c);
+        }
+        println!(
+            "  of which a new cleared canvas: {:.2} ms",
+            started.elapsed().as_secs_f64() * 1e3 / n as f64
+        );
     }
 
     #[test]
