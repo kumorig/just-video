@@ -18,3 +18,4 @@
 - "Playback stopped" dialog on read or decode errors.
 - Lower memory: freed heap returned, 6 decoder buffers.
 - Read-ahead window kept when the demuxer reads back.
+- Faster recovery after a connection drop: failed blocks re-requested at once.
