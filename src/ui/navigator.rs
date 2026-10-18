@@ -21,8 +21,9 @@ use crate::local;
 use crate::media::Thumb;
 use crate::playability::{Assessment, Verdict};
 use crate::smb::SmbUrl;
+use crate::tips::{self, Tip};
 use crate::vr::Layout;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -110,6 +111,10 @@ enum Item {
     /// Pictures of the videos in folder lists. Two-way, like the header's
     /// button in a folder.
     Thumbnails,
+    /// Hints about hidden gestures. Two-way.
+    Tips,
+    /// Makes every tip show again.
+    ResetTips,
     Share(String),
     Dir(String),
     Video {
@@ -132,7 +137,7 @@ enum Item {
 }
 
 /// The rows of the Settings page, in order.
-const SETTINGS: [Item; 12] = [
+const SETTINGS: [Item; 14] = [
     Item::ShortJump,
     Item::LongJump,
     Item::SeekLanding,
@@ -145,6 +150,8 @@ const SETTINGS: [Item; 12] = [
     Item::Curvature,
     Item::BrowserWidth,
     Item::VideoConnections,
+    Item::Tips,
+    Item::ResetTips,
 ];
 
 impl Item {
@@ -163,7 +170,9 @@ impl Item {
             | Item::AbLoop
             | Item::DpadMenus
             | Item::VideoConnections
-            | Item::Thumbnails => "",
+            | Item::Thumbnails
+            | Item::Tips
+            | Item::ResetTips => "",
             Item::Settings => "Settings",
             Item::Share(n)
             | Item::Dir(n)
@@ -294,6 +303,8 @@ pub struct Navigator {
     browser_width: f32,
     seek_exact: bool,
     prefs: config::Preferences,
+    /// Tips already learned or dismissed (see [`crate::tips`]).
+    tips_done: BTreeSet<String>,
     /// Where the playing video is, for fetching its subtitle files.
     playing_source: Option<(Server, String)>,
     /// The subtitle fetch awaited (request id, track) and its answer.
@@ -343,6 +354,7 @@ impl Navigator {
             browser_width: config::browser_width(),
             seek_exact: config::seek_exact(),
             prefs: config::preferences(),
+            tips_done: config::tips_done(),
             playing_source: None,
             subtitle_request: None,
             subtitle_result: None,
@@ -875,6 +887,15 @@ impl Navigator {
                         right: if prefs.thumbnails { "On" } else { "Off" }.into(),
                         ..Row::new(Icon::Thumbnails(prefs.thumbnails), "Thumbnails")
                     },
+                    Item::Tips => Row {
+                        detail: "Short hints about gestures, such as holding a file".into(),
+                        right: if prefs.tips { "On" } else { "Off" }.into(),
+                        ..Row::new(Icon::Tips, "Tips")
+                    },
+                    Item::ResetTips => Row {
+                        detail: "Show the tips again that were learned or dismissed".into(),
+                        ..Row::new(Icon::Tips, "Reset tips")
+                    },
                     Item::Share(name) => Row::new(Icon::Share, name),
                     Item::Dir(name) => Row::new(Icon::Folder, name),
                     Item::Video {
@@ -1010,8 +1031,40 @@ impl Navigator {
             }),
             _ => None,
         };
+        self.view.tip = self.current_tip().map(|t| t.text().to_string());
         self.view.clamp_scroll();
         self.dirty = true;
+    }
+
+    /// What a tip could teach here, if anything: not while selecting or
+    /// moving (the hold is learned), and only where holding does something.
+    fn tip_screen(&self) -> Option<tips::Screen> {
+        if self.selecting.is_some() || self.moving.is_some() {
+            return None;
+        }
+        match &self.location {
+            Location::Servers => self
+                .items
+                .iter()
+                .any(|i| matches!(i, Item::Server(s) if !local::is_local(s)))
+                .then_some(tips::Screen::Servers),
+            Location::Folder { .. } => (self.editing() && self.items.iter().any(Item::is_entry))
+                .then_some(tips::Screen::Folder),
+            _ => None,
+        }
+    }
+
+    fn current_tip(&self) -> Option<Tip> {
+        tips::pick(self.tip_screen()?, self.prefs.tips, &self.tips_done)
+    }
+
+    /// The user did what the tip teaches, or dismissed it.
+    fn tip_done(&mut self, tip: Tip) {
+        if self.tips_done.insert(tip.id().to_string())
+            && let Err(e) = config::mark_tip_done(tip.id())
+        {
+            eprintln!("Can't save the tip: {e:#}");
+        }
     }
 
     fn dialog(&mut self, title: impl Into<String>, body: Vec<String>) {
@@ -1316,6 +1369,12 @@ impl Navigator {
             Hit::RowAction(i, Action::Settings) => self.start_edit_server(i),
             Hit::RowAction(i, Action::Remove) => self.confirm_remove_server(i),
             Hit::Row(i) => self.select(i),
+            Hit::TipDismiss => {
+                if let Some(tip) = self.current_tip() {
+                    self.tip_done(tip);
+                }
+                self.rebuild_rows();
+            }
             Hit::ScrollBar | Hit::Nothing => {}
         }
     }
@@ -1611,12 +1670,15 @@ impl Navigator {
             Some(Item::Server(s)) if local::is_local(s) => return,
             Some(Item::Server(_)) => {
                 self.selecting = Some(HashSet::from([index]));
+                self.tip_done(Tip::HoldServer);
             }
             Some(item) if item.is_entry() => {
                 self.selecting
                     .get_or_insert_with(HashSet::new)
                     .insert(index);
-                if !self.editing() {
+                if self.editing() {
+                    self.tip_done(Tip::HoldEntry);
+                } else {
                     self.view.notice = Some(READ_ONLY_NOTICE.into());
                 }
             }
@@ -1793,6 +1855,17 @@ impl Navigator {
                 self.dirty = true;
             }
             (Item::Thumbnails, _) => self.toggle_thumbnails(),
+            (Item::Tips, _) => self.change_preference(|p| p.tips = !p.tips),
+            (Item::ResetTips, _) => {
+                match config::reset_tips() {
+                    Ok(()) => {
+                        self.tips_done.clear();
+                        self.view.notice = Some("Tips will show again".into());
+                    }
+                    Err(e) => eprintln!("Can't reset the tips: {e:#}"),
+                }
+                self.rebuild_rows();
+            }
             (Item::ShortJump, _) => {
                 self.preset_dialog(
                     "Jump",
@@ -2619,7 +2692,9 @@ mod tests {
                 Icon::Buffer,
                 Icon::Curve,
                 Icon::Width,
-                Icon::Server
+                Icon::Server,
+                Icon::Tips,
+                Icon::Tips
             ]
         );
         let (jump, long_jump, landing, volume, resume, dpad, thumbnails, curvature, width, lanes) =
@@ -2632,6 +2707,19 @@ mod tests {
         assert!(config::preferences().ab_loop, "saved");
         nav.click(Hit::Row(ab_loop));
         assert!(!config::preferences().ab_loop);
+        // Tips: on by default, switched here; reset says so.
+        let (tips, reset) = (12, 13);
+        assert_eq!(nav.view().rows[tips].right, "On");
+        nav.click(Hit::Row(tips));
+        assert_eq!(nav.view().rows[tips].right, "Off");
+        assert!(!config::preferences().tips, "saved");
+        nav.click(Hit::Row(tips));
+        config::mark_tip_done("hold_server").unwrap();
+        nav.tips_done.insert("hold_server".into());
+        assert!(nav.view().notice.is_none());
+        nav.click(Hit::Row(reset));
+        assert_eq!(nav.view().notice.as_deref(), Some("Tips will show again"));
+        assert!(config::tips_done().is_empty() && nav.tips_done.is_empty());
         // Video connections: two-way, saved outside the player preferences.
         assert_eq!(nav.view().rows[lanes].right, "One");
         nav.click(Hit::Row(lanes));
@@ -2712,6 +2800,74 @@ mod tests {
         nav.click(Hit::Tool(0));
         assert!(nav.take_exit());
         assert!(!nav.take_exit(), "reported once");
+    }
+
+    fn saved_server() -> Server {
+        Server {
+            name: "NAS".into(),
+            url: "smb://u@nas".into(),
+            writable: true,
+        }
+    }
+
+    #[test]
+    fn the_server_tip_shows_until_a_server_is_held_or_dismissed() {
+        let dir = config::temp_config("nav-tip-server");
+        let mut nav = Navigator::new(Library::start(None));
+        assert!(
+            nav.view().tip.is_none(),
+            "only the headset: nothing to hold"
+        );
+        nav.items.insert(1, Item::Server(saved_server()));
+        nav.rebuild_rows();
+        assert_eq!(
+            nav.view().tip.as_deref(),
+            Some("Hold a server to edit or delete it")
+        );
+        nav.long_press(1);
+        assert!(nav.view().tip.is_none(), "not while holding");
+        assert!(config::tips_done().contains("hold_server"), "learned");
+        nav.back();
+        assert!(nav.view().tip.is_none(), "and not after");
+
+        // Dismissed instead.
+        config::reset_tips().unwrap();
+        nav.tips_done.clear();
+        nav.rebuild_rows();
+        assert!(nav.view().tip.is_some());
+        nav.click(Hit::TipDismiss);
+        assert!(nav.view().tip.is_none());
+        assert!(config::tips_done().contains("hold_server"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_folder_tip_needs_a_writable_server_and_goes_when_off() {
+        let dir = config::temp_config("nav-tip-folder");
+        let mut nav = Navigator::new(Library::start(None));
+        let read_only = Server {
+            writable: false,
+            ..saved_server()
+        };
+        nav.show_entries_for_test(read_only, &["a", "b"]);
+        assert!(nav.view().tip.is_none(), "holding changes nothing here");
+        nav.show_entries_for_test(saved_server(), &[]);
+        assert!(nav.view().tip.is_none(), "nothing to hold");
+        nav.show_entries_for_test(saved_server(), &["a", "b"]);
+        assert_eq!(
+            nav.view().tip.as_deref(),
+            Some("Hold a file or folder to rename, move or delete it")
+        );
+        nav.change_preference(|p| p.tips = false);
+        assert!(nav.view().tip.is_none(), "tips off");
+        nav.change_preference(|p| p.tips = true);
+        assert!(nav.view().tip.is_some());
+        nav.long_press(0);
+        assert!(nav.view().tip.is_none());
+        assert!(config::tips_done().contains("hold_entry"));
+        nav.back();
+        assert!(nav.view().tip.is_none(), "learned for good");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

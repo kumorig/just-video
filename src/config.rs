@@ -6,7 +6,7 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::Write,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::PathBuf,
@@ -39,10 +39,18 @@ pub(crate) fn temp_config(name: &str) -> PathBuf {
 }
 
 pub fn dir() -> anyhow::Result<PathBuf> {
+    // A test that never chose a directory still gets one of its own (per
+    // thread), never the real one.
     #[cfg(test)]
-    if let Some(dir) = TEST_DIR.with(|d| d.borrow().clone()) {
-        return Ok(dir);
-    }
+    return Ok(TEST_DIR.with(|d| d.borrow().clone()).unwrap_or_else(|| {
+        temp_config(&format!("default-{:?}", std::thread::current().id()).replace(['(', ')'], ""))
+    }));
+    #[cfg(not(test))]
+    dir_from_env()
+}
+
+#[cfg(not(test))]
+fn dir_from_env() -> anyhow::Result<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
@@ -398,6 +406,9 @@ struct Settings {
     /// Start the next video in the folder when one ends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     autoplay_next: Option<bool>,
+    /// Ids of the tips already learned or dismissed (see [`crate::tips`]).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    tips_done: BTreeSet<String>,
 }
 
 /// How a folder's files are ordered (folders always come first, by name).
@@ -501,6 +512,8 @@ pub struct Preferences {
     pub thumbnails: bool,
     /// The A-B loop button on the player bar.
     pub ab_loop: bool,
+    /// Short tips about hidden gestures in the browser.
+    pub tips: bool,
 }
 
 impl Default for Preferences {
@@ -513,6 +526,7 @@ impl Default for Preferences {
             dpad_menus: false,
             thumbnails: false,
             ab_loop: false,
+            tips: true,
         }
     }
 }
@@ -559,6 +573,29 @@ pub fn update_preferences(change: impl FnOnce(&mut Preferences)) -> anyhow::Resu
     settings.player = Some(prefs);
     write_settings(&settings)?;
     Ok(prefs)
+}
+
+/// Ids of the tips already learned or dismissed.
+pub fn tips_done() -> BTreeSet<String> {
+    read_json::<Settings>("settings.json")
+        .map(|s| s.tips_done)
+        .unwrap_or_default()
+}
+
+/// Remembers a tip as done.
+pub fn mark_tip_done(id: &str) -> anyhow::Result<()> {
+    let mut settings: Settings = read_json("settings.json")?;
+    if settings.tips_done.insert(id.to_string()) {
+        write_json("settings.json", &settings, false)?;
+    }
+    Ok(())
+}
+
+/// Forgets every learned and dismissed tip, so they all show again.
+pub fn reset_tips() -> anyhow::Result<()> {
+    let mut settings: Settings = read_json("settings.json")?;
+    settings.tips_done.clear();
+    write_json("settings.json", &settings, false)
 }
 
 /// Choices for how many SMB connections a playing video is read over.
@@ -822,6 +859,27 @@ mod tests {
         update_preferences(|p| p.ab_loop = true).unwrap();
         assert!(preferences().ab_loop);
         assert_eq!(preferences().short_jump, 10);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn tips_default_on_and_round_trip() {
+        let dir = temp_config("tips");
+        assert!(preferences().tips);
+        assert!(tips_done().is_empty());
+        let old: Settings = serde_json::from_str(r#"{"player":{"short_jump":7}}"#).unwrap();
+        assert!(old.player.unwrap().tips, "older saves have tips on");
+        mark_tip_done("hold_server").unwrap();
+        mark_tip_done("hold_server").unwrap();
+        update_preferences(|p| p.tips = false).unwrap();
+        assert_eq!(
+            tips_done().iter().map(String::as_str).collect::<Vec<_>>(),
+            ["hold_server"]
+        );
+        assert!(!preferences().tips);
+        reset_tips().unwrap();
+        assert!(tips_done().is_empty());
+        assert!(!preferences().tips, "reset leaves the on/off choice");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

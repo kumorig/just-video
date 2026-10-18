@@ -184,6 +184,18 @@ pub fn refind(view: &View, fonts: &mut Fonts, old: &Focus) -> Option<Focus> {
 /// Focus after a D-pad press (unchanged at an edge).
 pub fn step(view: &View, fonts: &mut Fonts, from: Focus, dir: Dir) -> Focus {
     let fixed = browser::fixed_targets(view, fonts);
+    let tip = fixed.iter().find(|(h, _)| *h == Hit::TipDismiss).copied();
+    if from.hit == Hit::TipDismiss {
+        // The tip line sits under the list: up goes back to its last row in view.
+        let shown = (view.scroll + view.visible_rows()).floor() as usize;
+        let last = shown
+            .saturating_sub(1)
+            .min(view.rows.len().saturating_sub(1));
+        return match dir {
+            Dir::Up if list_shown(view) => row_focus(view, last, 0).unwrap_or(from),
+            _ => from,
+        };
+    }
     if let Some(i) = row_of(from.hit).filter(|_| list_shown(view)) {
         let across = browser::row_targets(view, i);
         let column = across.iter().position(|(h, _)| *h == from.hit).unwrap_or(0);
@@ -196,6 +208,8 @@ pub fn step(view: &View, fonts: &mut Fonts, from: Focus, dir: Dir) -> Focus {
                 nearest(&fixed, above, Dir::Up).or(fixed.last().copied().map(make))
             }
             Dir::Up => row_focus(view, i - 1, column),
+            // Past the last row: the tip line's button, when there is one.
+            Dir::Down if i + 1 >= view.rows.len() => tip.map(make),
             Dir::Down => row_focus(view, i + 1, column),
         };
         return next.unwrap_or(from);
@@ -322,6 +336,25 @@ mod tests {
         assert!(matches!(left.hit, Hit::Crumb(_)), "{left:?}");
         round_trips(&v, &mut fonts, &left);
         assert_eq!(step(&v, &mut fonts, top, Dir::Down).hit, Hit::Row(0));
+    }
+
+    #[test]
+    fn dpad_reaches_the_tip_below_the_list_and_back() {
+        let mut fonts = Fonts::load().expect("fonts");
+        let mut v = view(3);
+        v.tip = Some("Hold a thing".into());
+        let first = initial(&v, &mut fonts).unwrap();
+        let last = step(&v, &mut fonts, first, Dir::Down);
+        let last = step(&v, &mut fonts, last, Dir::Down);
+        assert_eq!(last.hit, Hit::Row(2));
+        let tip = step(&v, &mut fonts, last, Dir::Down);
+        assert_eq!(tip.hit, Hit::TipDismiss);
+        round_trips(&v, &mut fonts, &tip);
+        assert_eq!(step(&v, &mut fonts, tip, Dir::Down), tip, "edge");
+        assert_eq!(step(&v, &mut fonts, tip, Dir::Up).hit, Hit::Row(2));
+        // No tip, or covered by a notice: the last row is the end.
+        v.notice = Some("Opening".into());
+        assert_eq!(step(&v, &mut fonts, last, Dir::Down), last);
     }
 
     #[test]

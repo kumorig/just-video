@@ -1438,6 +1438,27 @@ fn main() -> anyhow::Result<()> {
                 &render(&browsing, &mut fonts, Some((700.0, 400.0)), true),
                 &dir.join("browsing.png"),
             )?;
+            // The tip line under the list, with a long list to see it clears the rows.
+            let mut tipped = browsing.clone();
+            tipped.tip = Some(just_video::tips::Tip::HoldEntry.text().into());
+            let rows = tipped.rows.clone();
+            tipped.rows = rows.iter().cycle().take(14).cloned().collect();
+            just_video::ui::save_png(
+                &render(&tipped, &mut fonts, Some((1400.0, 960.0)), true),
+                &dir.join("tip-folder.png"),
+            )?;
+            tipped.notice = Some("Opening a_180_sbs.mp4…".into());
+            just_video::ui::save_png(
+                &render(&tipped, &mut fonts, None, false),
+                &dir.join("tip-under-notice.png"),
+            )?;
+            let mut tipped_servers = servers.clone();
+            tipped_servers.rows[0].actions.clear();
+            tipped_servers.tip = Some(just_video::tips::Tip::HoldServer.text().into());
+            just_video::ui::save_png(
+                &render(&tipped_servers, &mut fonts, None, false),
+                &dir.join("tip-servers.png"),
+            )?;
             // Choosing where to move to, deep in a share: the crumbs fold.
             let mut moving = browsing.clone();
             moving.crumbs = crumbs(&[
@@ -1564,12 +1585,27 @@ fn main() -> anyhow::Result<()> {
                         right: "100%".into(),
                         ..Row::new(Icon::Width, "Browser width")
                     },
+                    Row {
+                        detail: "Short hints about gestures, such as holding a file".into(),
+                        right: "On".into(),
+                        ..Row::new(Icon::Tips, "Tips")
+                    },
+                    Row {
+                        detail: "Show the tips again that were learned or dismissed".into(),
+                        ..Row::new(Icon::Tips, "Reset tips")
+                    },
                 ],
                 ..Default::default()
             };
             just_video::ui::save_png(
                 &render(&settings, &mut fonts, Some((700.0, 310.0)), true),
                 &dir.join("settings.png"),
+            )?;
+            let mut settings_end = settings.clone();
+            settings_end.scroll = settings_end.max_scroll();
+            just_video::ui::save_png(
+                &render(&settings_end, &mut fonts, None, false),
+                &dir.join("settings-end.png"),
             )?;
             let mut dialog = folder.clone();
             dialog.dialog = Some(Dialog {

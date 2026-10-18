@@ -27,3 +27,4 @@
 - Folder sort: A-Z, Size, Unwatched.
 - Optional autoplay of the next video.
 - Optional A-B loop button.
+- Tips for hold-to-edit, with Tips and Reset tips in Settings.
