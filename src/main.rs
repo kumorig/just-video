@@ -1635,7 +1635,7 @@ fn main() -> anyhow::Result<()> {
             let mut presets = servers.clone();
             presets.dialog = Some(Dialog {
                 title: "Buffer ahead while paused".into(),
-                body: vec!["How much the player's buffer button fetches while paused.".into()],
+                body: vec!["How much a long press on play fetches while paused.".into()],
                 buttons: ["512 MB", "1 GB", "2 GB", "4 GB"]
                     .map(String::from)
                     .to_vec(),
@@ -1755,7 +1755,7 @@ fn main() -> anyhow::Result<()> {
                         held: 0,
                         goal: 1 << 30,
                     },
-                    controls::Hit::Reserve,
+                    controls::Hit::PlayPause,
                 ),
             ] {
                 let bar = controls::State {

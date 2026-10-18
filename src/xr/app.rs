@@ -1048,7 +1048,6 @@ pub fn run(
     let mut bar_place: Option<Placement> = None;
     let mut bar_press: Option<Press> = None;
     // Whether the bar offers buffering ahead.
-    let mut buffer_button = crate::config::buffer_button();
     // Jump lengths, volume step and continuing: as on the Settings page.
     let mut prefs = navigator
         .as_ref()
@@ -1686,14 +1685,11 @@ pub fn run(
                     position: playback.position().floor(),
                     duration: playback.duration,
                     buffered: playback.buffered(),
-                    reserve: playback
-                        .reserve_status()
-                        .filter(|_| buffer_button)
-                        .map(|r| controls::Reserve {
-                            on: r.on,
-                            held: r.held,
-                            goal: r.goal,
-                        }),
+                    reserve: playback.reserve_status().map(|r| controls::Reserve {
+                        on: r.on,
+                        held: r.held,
+                        goal: r.goal,
+                    }),
                     has_previous: navigator.as_ref().is_some_and(|n| n.has_adjacent(-1)),
                     has_next: navigator.as_ref().is_some_and(|n| n.has_adjacent(1)),
                     curved: curved_applies.then_some(placement.curved),
@@ -1963,7 +1959,6 @@ pub fn run(
                 let mut captions_changed = false;
                 match clicked {
                     Some(controls::Hit::PlayPause) => playback.toggle_pause(now),
-                    Some(controls::Hit::Reserve) => playback.toggle_reserve(now),
                     Some(controls::Hit::Loop) if prefs.ab_loop => {
                         ab_loop.press(playback.position())
                     }
@@ -2050,12 +2045,8 @@ pub fn run(
                 }
                 // A long press opens a button's dialog, or closes it again.
                 match long_pressed {
-                    Some(controls::Hit::PlayPause) => {
-                        buffer_button = !buffer_button;
-                        if let Err(e) = crate::config::save_buffer_button(buffer_button) {
-                            eprintln!("Can't save the buffer button setting: {e:#}");
-                        }
-                    }
+                    // Buffer ahead while paused (does nothing for a local file).
+                    Some(controls::Hit::PlayPause) => playback.toggle_reserve(now),
                     Some(controls::Hit::Captions) if dialog == Some(controls::Dialog::Tracks) => {
                         dialog = None;
                     }

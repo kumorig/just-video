@@ -1825,7 +1825,7 @@ impl Navigator {
             (Item::BufferSize, _) => {
                 self.view.dialog = Some(Dialog {
                     title: "Buffer ahead while paused".into(),
-                    body: vec!["How much the player's buffer button fetches while paused.".into()],
+                    body: vec!["How much a long press on play fetches while paused.".into()],
                     buttons: config::RESERVE_PRESETS
                         .iter()
                         .map(|&b| crate::ui::controls::format_size(b))
