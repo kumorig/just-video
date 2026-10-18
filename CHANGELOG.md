@@ -2,6 +2,7 @@
 
 ## 0.1.0 (2026-10-18)
 
+- The "won't play smoothly" verdict says why and how far the CPU falls short; the delete confirmation gives a count instead of listing names.
 - Buffering ahead is a long press on play/pause; the small buffer button and its visibility setting are gone.
 - CJK names render with the variable Noto Sans CJK font too (Fedora), at Medium weight.
 - Changelog started.
