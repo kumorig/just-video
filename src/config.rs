@@ -58,7 +58,7 @@ fn dir_from_env() -> anyhow::Result<PathBuf> {
     Ok(base.join("just-video"))
 }
 
-fn read_json<T: for<'de> Deserialize<'de> + Default>(name: &str) -> anyhow::Result<T> {
+pub(crate) fn read_json<T: for<'de> Deserialize<'de> + Default>(name: &str) -> anyhow::Result<T> {
     let path = dir()?.join(name);
     match std::fs::read(&path) {
         Ok(bytes) => {
@@ -70,7 +70,7 @@ fn read_json<T: for<'de> Deserialize<'de> + Default>(name: &str) -> anyhow::Resu
 }
 
 /// Writes atomically; `private` files are created with mode 0600.
-fn write_json<T: Serialize>(name: &str, value: &T, private: bool) -> anyhow::Result<()> {
+pub(crate) fn write_json<T: Serialize>(name: &str, value: &T, private: bool) -> anyhow::Result<()> {
     let dir = dir()?;
     std::fs::create_dir_all(&dir)?;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
