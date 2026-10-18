@@ -381,9 +381,6 @@ struct Settings {
     /// Most the reader buffers ahead while paused, in MiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reserve_mib: Option<u64>,
-    /// Whether the control bar shows the buffer-ahead button.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    buffer_button: Option<bool>,
     /// How much a curved screen bends: 1 wraps around the viewer, less is gentler.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     curvature: Option<f32>,
@@ -689,19 +686,6 @@ pub fn save_browser_width(width: f32) -> anyhow::Result<()> {
 /// "75%".
 pub fn percent(fraction: f32) -> String {
     format!("{}%", (fraction * 100.0).round())
-}
-
-pub fn buffer_button() -> bool {
-    read_json::<Settings>("settings.json")
-        .ok()
-        .and_then(|s| s.buffer_button)
-        .unwrap_or(true)
-}
-
-pub fn save_buffer_button(shown: bool) -> anyhow::Result<()> {
-    let mut settings: Settings = read_json("settings.json")?;
-    settings.buffer_button = Some(shown);
-    write_settings(&settings)
 }
 
 /// Choices for how much to buffer ahead while paused (bytes).

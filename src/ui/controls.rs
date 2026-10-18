@@ -2,14 +2,15 @@
 //!
 //! ```text
 //! [⏮][▶][⏭]                               [CC]    [▭]     [☀]
-//!    [⤓] 412 MB of 1 GB                   English 180° 3D  Image
+//!    ⤓ Buffering… 40%                     English 180° 3D  Image
 //! 12:34 / 1:32:10  ━━━━━━━━━━●──────────────────────────────────
 //! ```
 //!
-//! The small button under play buffers ahead: a click pauses the video and
+//! A long press on play/pause buffers ahead: it pauses the video and
 //! fetches up to a gigabyte on from here (only while paused, so that
 //! playback never competes with it for the network); play, or another
-//! click, stops it. The seek bar shows the stretch held.
+//! long press, stops it. The seek bar shows the stretch held, and a line
+//! under play with a label counts it.
 //!
 //! CC: a click turns subtitles on/off, a long press opens the audio and
 //! subtitle dialog (tracks, and a way into subtitle editing: the bar then
@@ -18,8 +19,7 @@
 //! click steps through the favourite formats, a long press opens the screen
 //! dialog (every format, stars, curved screen). The image
 //! button opens the image dialog (brightness, contrast, saturation,
-//! rotation); a second click closes it. A long press on play/pause shows or
-//! hides the buffer button.
+//! rotation); a second click closes it.
 //! Volume is left to the headset's buttons; the thumbstick click resets the
 //! screen.
 
@@ -100,11 +100,10 @@ pub const SATURATION_STEP: f32 = 0.1;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Hit {
     Previous,
-    /// Click: play or pause; long press: show or hide the buffer button.
+    /// Click: play or pause; long press: buffer ahead while paused, on or
+    /// off (network files only).
     PlayPause,
     Next,
-    /// Buffer ahead while paused, on or off.
-    Reserve,
     /// Fraction of the duration.
     Seek(f32),
     /// CC: click toggles subtitles, long press opens the track dialog.
@@ -225,9 +224,9 @@ pub const PROGRESS_H: f32 = 3.0;
 const PREVIOUS: Rect = (24.0, 16.0, 96.0, 92.0);
 const PLAY: Rect = (136.0, 16.0, 96.0, 92.0);
 const NEXT: Rect = (248.0, 16.0, 96.0, 92.0);
-/// Under play: half a button, for buffering ahead.
+/// Under play: the buffer-ahead icon and its progress line while it runs.
 const RESERVE: Rect = (136.0, 116.0, 96.0, 36.0);
-/// What the reserve is doing, beside its button.
+/// What the reserve is doing, beside the icon.
 const RESERVE_LABEL: Rect = (248.0, 116.0, 440.0, 36.0);
 /// Between the buffering text and the setting buttons.
 const LOOP: Rect = (640.0, 16.0, 96.0, 92.0);
@@ -268,7 +267,6 @@ pub fn hit(state: &State, x: f32, y: f32) -> Hit {
         (PREVIOUS, Hit::Previous, state.has_previous),
         (PLAY, Hit::PlayPause, true),
         (NEXT, Hit::Next, state.has_next),
-        (RESERVE, Hit::Reserve, state.reserve.is_some()),
         (
             LOOP,
             Hit::Loop,
@@ -629,42 +627,32 @@ pub fn render(state: &State, fonts: &mut Fonts, hover: Hit, pressing: Option<Pre
         }
     }
 
-    // Buffering ahead: lit while on, with a line along its foot that grows
-    // as the reserve fills.
+    // Buffering ahead (a long press on play): while on, the icon under play
+    // with a line that grows as the reserve fills, and a count beside it.
+    // Off, pointing at play says how to start it.
     if let Some(reserve) = state.reserve {
-        let hovered = hover == Hit::Reserve;
         let (x, y, w, h) = RESERVE;
-        let color = if reserve.on {
-            ACCENT
-        } else if hovered {
-            HOVER
-        } else {
-            BUTTON
-        };
-        if press(Hit::Reserve).is_some() {
-            c.rect(x + 2.0, y + 2.0, w - 4.0, h - 4.0, 10.0, color);
-        } else {
-            c.rect(x, y, w, h, 12.0, color);
-        }
-        reserve_icon(&mut c, x + w / 2.0, y + h / 2.0 - 2.0, TEXT);
-        if reserve.on {
-            let done = (reserve.held as f32 / reserve.goal.max(1) as f32).clamp(0.0, 1.0);
-            let (lx, lw) = (x + 12.0, w - 24.0);
-            c.rect(lx, y + h - 7.0, lw, 3.0, 1.5, HOVER);
-            c.rect(lx, y + h - 7.0, (lw * done).max(3.0), 3.0, 1.5, TEXT);
-        }
         // A share of the goal, not sizes: how far along it is at a glance.
         let percent = (reserve.held as f64 / reserve.goal.max(1) as f64 * 100.0)
             .clamp(0.0, 100.0)
             .floor();
-        let label = match (reserve.on, hovered) {
-            (true, _) if reserve.held >= reserve.goal => "100% buffered".to_string(),
-            (true, _) => format!("Buffering… {percent:.0}%"),
-            (false, true) => "Buffer ahead while paused".to_string(),
-            (false, false) => String::new(),
+        let (label, lx) = match (reserve.on, hover == Hit::PlayPause) {
+            (true, _) if reserve.held >= reserve.goal => {
+                ("100% buffered".to_string(), RESERVE_LABEL.0)
+            }
+            (true, _) => (format!("Buffering… {percent:.0}%"), RESERVE_LABEL.0),
+            (false, true) => ("Hold to buffer ahead while paused".to_string(), x),
+            (false, false) => (String::new(), x),
         };
+        if reserve.on {
+            reserve_icon(&mut c, x + w / 2.0, y + h / 2.0 - 2.0, ACCENT);
+            let done = (reserve.held as f32 / reserve.goal.max(1) as f32).clamp(0.0, 1.0);
+            let (lx, lw) = (x + 12.0, w - 24.0);
+            c.rect(lx, y + h - 7.0, lw, 3.0, 1.5, HOVER);
+            c.rect(lx, y + h - 7.0, (lw * done).max(3.0), 3.0, 1.5, ACCENT);
+        }
         if !label.is_empty() {
-            let (lx, ly, lw, lh) = RESERVE_LABEL;
+            let (_, ly, lw, lh) = RESERVE_LABEL;
             fonts.draw(
                 &mut c,
                 &label,
@@ -672,7 +660,7 @@ pub fn render(state: &State, fonts: &mut Fonts, hover: Hit, pressing: Option<Pre
                 ly + lh / 2.0 + 22.0 * 0.36,
                 22.0,
                 SUBTLE,
-                lw,
+                lw + RESERVE_LABEL.0 - lx,
             );
         }
     }
@@ -1039,8 +1027,11 @@ mod tests {
         );
     }
 
+    /// Buffering ahead is a long press on play, with nothing to click under
+    /// it; the progress shown there draws for network files only.
     #[test]
-    fn reserve_button_only_for_network_files() {
+    fn buffering_ahead_is_a_long_press_on_play() {
+        assert!(Hit::PlayPause.has_long_press());
         let (x, y) = center(RESERVE);
         assert_eq!(hit(&state(), x, y), Hit::Nothing);
         let network = State {
@@ -1051,12 +1042,33 @@ mod tests {
             }),
             ..state()
         };
-        assert_eq!(hit(&network, x, y), Hit::Reserve);
-        // It sits between the play button and the seek row.
+        assert_eq!(hit(&network, x, y), Hit::Nothing);
+        // The progress sits between the play button and the seek row.
         assert!(RESERVE.1 >= PLAY.1 + PLAY.3 && RESERVE.1 + RESERVE.3 < SEEK.1 - 10.0);
         let mut fonts = Fonts::load().expect("fonts");
-        let canvas = render(&network, &mut fonts, Hit::Reserve, None);
-        assert_eq!(canvas.pixels.len(), (WIDTH * HEIGHT * 4) as usize);
+        let plain = render(&state(), &mut fonts, Hit::PlayPause, None);
+        let buffering = render(&network, &mut fonts, Hit::Nothing, None);
+        let off = State {
+            reserve: Some(Reserve {
+                on: false,
+                held: 0,
+                goal: 1 << 30,
+            }),
+            ..state()
+        };
+        let hint = render(&off, &mut fonts, Hit::PlayPause, None);
+        let under_play = |c: &Canvas| {
+            let (x, y, w, h) = RESERVE_LABEL;
+            let (x0, y0) = (RESERVE.0 as usize, y as usize);
+            let (x1, y1) = ((x + w) as usize, (y + h) as usize);
+            (y0..y1)
+                .flat_map(|py| (x0..x1).map(move |px| (px, py)))
+                .map(|(px, py)| c.pixels[(py * WIDTH as usize + px) * 4] as u32)
+                .sum::<u32>()
+        };
+        // A local file shows nothing there; the other two draw something.
+        assert!(under_play(&buffering) > under_play(&plain));
+        assert!(under_play(&hint) > under_play(&plain));
     }
 
     #[test]

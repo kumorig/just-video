@@ -2,7 +2,7 @@
 
 ## 0.1.0 (2026-10-18)
 
-- A long press on play/pause shows or hides the buffer button; the toggle left the screen dialog.
+- Buffering ahead is a long press on play/pause; the small buffer button and its visibility setting are gone.
 - CJK names render with the variable Noto Sans CJK font too (Fedora), at Medium weight.
 - Changelog started.
 - Fix crash when changing screen curvature (too many composition layers).
