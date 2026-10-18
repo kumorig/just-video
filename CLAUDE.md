@@ -94,3 +94,10 @@ crashes its firmware, so 10-bit video decodes on the CPU.
   passwords or local paths into code, tests, docs or commit messages. Use
   generic names (`a_180_sbs.mp4`, `smb://alice@192.168.1.10`). Grep the staged
   diff before committing.
+
+## Changelog
+
+- Every commit that changes behaviour adds one very brief bullet to
+  `CHANGELOG.md`. Sections hold only `## <version> (<date>)` and bullets.
+- Bullets go in today's section. The first change on a new day opens a new
+  section: bump the minor version in `Cargo.toml` (patch for fix-only days).
