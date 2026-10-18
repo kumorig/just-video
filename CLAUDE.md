@@ -31,7 +31,8 @@ records each finished item with what was done and why.
   commits on main. Work on a `pr/<topic>` branch, push it, open a PR with
   `gh pr create`, then merge with
   `gh pr merge <n> --merge --subject 'Merge PR #<n>: <title>'`
-  and `git pull` main. One PR per change, for traceability.
+  (`--squash` and `--rebase` are allowed too) and `git pull` main. One PR
+  per change, for traceability.
 
 ## Deploy and SSH
 
