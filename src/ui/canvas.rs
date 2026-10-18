@@ -276,6 +276,10 @@ const FONT_CANDIDATES: &[&[&str]] = &[
         "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/google-noto-sans-cjk-fonts/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        // The variable build (Fedora): one file holding every weight.
+        "/usr/share/fonts/google-noto-sans-cjk-vf-fonts/NotoSansCJK-VF.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-VF.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-VF.ttc",
     ],
 ];
 
@@ -464,5 +468,32 @@ mod tests {
                 "rect({x}, {y}, {w}, {h}, r {radius}) differs"
             );
         }
+    }
+
+    /// Japanese, Chinese and Korean names must come out as their own glyphs,
+    /// not the "missing" box: the Noto Sans CJK fallback has to be found and
+    /// usable (needs that font installed, static or variable).
+    #[test]
+    fn cjk_text_uses_real_glyphs() {
+        let mut fonts = Fonts::load().unwrap();
+        let mut bitmaps = Vec::new();
+        for ch in "日本語の動画ファイル한국어中文字幕".chars() {
+            let font = fonts.font_for(ch);
+            assert_ne!(
+                fonts.fonts[font].glyph_index(ch),
+                0,
+                "no font has a glyph for {ch:?}"
+            );
+            let (_, bits) = fonts.glyph(ch, 24.0).clone();
+            assert!(!bits.is_empty(), "{ch:?} rasterized to nothing");
+            bitmaps.push(bits);
+        }
+        // Different characters draw differently (a box glyph wouldn't).
+        bitmaps.sort();
+        bitmaps.dedup();
+        assert!(
+            bitmaps.len() > 10,
+            "most CJK characters drew the same shape"
+        );
     }
 }

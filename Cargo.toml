@@ -31,7 +31,7 @@ libc = "0.2"
 libloading = "0.9"
 openxr = "0.21"
 png = "0.18"
-ttf-parser = { version = "0.25", default-features = false, features = ["std"] }
+ttf-parser = { version = "0.25", default-features = false, features = ["std", "variable-fonts"] }
 ctrlc = "3"
 rpassword = "7"
 serde = { version = "1", features = ["derive"] }

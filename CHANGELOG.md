@@ -2,6 +2,7 @@
 
 ## 0.1.0 (2026-10-18)
 
+- CJK names render with the variable Noto Sans CJK font too (Fedora), at Medium weight.
 - Changelog started.
 - Fix crash when changing screen curvature (too many composition layers).
 - Browser starts farther away; thumbstick moves it nearer or farther.
