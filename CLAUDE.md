@@ -32,8 +32,10 @@ records each finished item with what was done and why.
 - `bash scripts/frame-ssh.sh '<command>'` runs a command on the headset as
   `steamos` with the dev key (no sudo). The address defaults to `frame.local`;
   set `FRAME_HOST=<ip>` for the direct link if that doesn't resolve.
-- The app logs to `~/Applications/JustVideo/just-video.log` (previous run in
-  `.log.1`) when started from Steam.
+- The app logs to `~/.local/state/just-video/log.txt` (previous run in
+  `log.previous.txt`; it contains binary bytes, so `grep -a`). The launcher's
+  `~/Applications/JustVideo/just-video.log` only catches what is printed
+  before that file is opened.
 - Don't leave extra binaries (`.prev`, `.test`) on the headset.
 
 ## Testing on the headset

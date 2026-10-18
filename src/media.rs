@@ -469,6 +469,21 @@ unsafe extern "C" {
 }
 
 const AVERROR_EOF: c_int = -0x20464F45; // FFERRTAG('E','O','F',' ')
+const AVERROR_ETIMEDOUT: c_int = -110; // AVERROR(ETIMEDOUT)
+
+/// The hardware decoder gave no picture within its bounded wait (see
+/// `HARDWARE_STALL_US` in media.c): its session stopped answering, as after
+/// the headset's standby.
+#[derive(Debug)]
+pub struct DecoderStalled;
+
+impl std::fmt::Display for DecoderStalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("The hardware decoder stopped answering")
+    }
+}
+
+impl std::error::Error for DecoderStalled {}
 const AVERROR_PATCHWELCOME: c_int = -0x45574150; // FFERRTAG('P','A','W','E')
 
 /// How the planes of a decoded frame are arranged.
@@ -711,6 +726,7 @@ impl VideoDecoder {
             })),
             AVERROR_EOF => Ok(None),
             AVERROR_PATCHWELCOME => bail!("Decoder produced an unsupported pixel format"),
+            AVERROR_ETIMEDOUT => Err(DecoderStalled.into()),
             code => bail!("Decoding failed (FFmpeg error {code})"),
         }
     }

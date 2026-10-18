@@ -639,15 +639,13 @@ pub fn render(state: &State, fonts: &mut Fonts, hover: Hit, pressing: Option<Pre
             c.rect(lx, y + h - 7.0, lw, 3.0, 1.5, HOVER);
             c.rect(lx, y + h - 7.0, (lw * done).max(3.0), 3.0, 1.5, TEXT);
         }
+        // A share of the goal, not sizes: how far along it is at a glance.
+        let percent = (reserve.held as f64 / reserve.goal.max(1) as f64 * 100.0)
+            .clamp(0.0, 100.0)
+            .floor();
         let label = match (reserve.on, hovered) {
-            (true, _) if reserve.held >= reserve.goal => {
-                format!("{} buffered", format_size(reserve.goal))
-            }
-            (true, _) => format!(
-                "Buffering… {} of {}",
-                format_size(reserve.held),
-                format_size(reserve.goal)
-            ),
+            (true, _) if reserve.held >= reserve.goal => "100% buffered".to_string(),
+            (true, _) => format!("Buffering… {percent:.0}%"),
             (false, true) => "Buffer ahead while paused".to_string(),
             (false, false) => String::new(),
         };

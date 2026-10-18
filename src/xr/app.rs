@@ -128,21 +128,23 @@ impl Panel {
     }
 }
 
-/// The browser starts 2.2 m ahead: far enough that pointing needs only
-/// small hand movements, and scaled to look as big as 1.6 × 1.0 m at 1.5 m.
-const BROWSER_DISTANCE: f32 = 2.2;
-const BROWSER_SIZE: [f32; 2] = [2.347, 1.467];
+/// The browser starts 2.8 m ahead: far enough that pointing needs only
+/// small hand movements and the eyes rest (2.2 m felt too close), and
+/// scaled to look as big as 1.6 × 1.0 m at 1.5 m.
+const BROWSER_DISTANCE: f32 = 2.8;
+const BROWSER_SIZE: [f32; 2] = [2.347 * 2.8 / 2.2, 1.467 * 2.8 / 2.2];
 
-/// The curvature preview: a 16:9 screen this far ahead, this much wider
-/// than the browser looks, so its bent edges show around the panel.
-const CURVE_PREVIEW_DISTANCE: f32 = 3.0;
+/// The curvature preview: a 16:9 screen this much farther than the
+/// browser, this much wider than it looks, so its bent edges show around
+/// the panel.
+const CURVE_PREVIEW_BEHIND: f32 = 1.0;
 const CURVE_PREVIEW_SCALE: f32 = 1.4;
 
 /// Where the browser starts: a little below eye level.
 fn browser_placement(pivot: [f32; 3]) -> Placement {
     Placement {
         yaw: 0.0,
-        pitch: (-0.147f32).atan2(BROWSER_DISTANCE),
+        pitch: -(0.147f32 / 2.2).atan(),
         distance: BROWSER_DISTANCE,
         curved: false,
         curve: 1.0,
@@ -152,11 +154,12 @@ fn browser_placement(pivot: [f32; 3]) -> Placement {
     }
 }
 
-/// The browser panel where it has been dragged, facing its pivot and
-/// keeping its apparent size at any distance; `width` is the chosen
-/// multiple of its usual size.
+/// The browser panel where it has been dragged, facing its pivot. Its size
+/// in metres stays (so pushing it away with the stick visibly shrinks it;
+/// scaled to look the same at any distance, the push looked like nothing);
+/// `width` is the chosen multiple of its usual size.
 fn browser_panel(place: &Placement, width: f32) -> Panel {
-    let s = place.distance / BROWSER_DISTANCE * width;
+    let s = width;
     Panel {
         center: place.center(),
         yaw: place.yaw,
@@ -607,6 +610,119 @@ fn quat_mul(a: xr::Quaternionf, b: xr::Quaternionf) -> xr::Quaternionf {
 /// A line of the outline: its pose and size (metres).
 type Line = (xr::Posef, [f32; 2]);
 
+/// The top and bottom edges of a curved screen: one flat quad each, lying
+/// in the edge's plane and textured with the arc. (A chain of short quads
+/// along the arc needs more layers than a runtime must take: the Frame's
+/// SteamVR allows 16 in all, and the app left the frame loop over it.)
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ArcEdges {
+    /// Top and bottom quads: X along the screen's right (mirrored for the
+    /// bottom one, so one picture serves both), Y towards the viewer.
+    poses: [xr::Posef; 2],
+    /// Across and deep, in metres.
+    size: [f32; 2],
+    radius: f32,
+    /// Half the angle the screen spans.
+    half: f32,
+    thickness: f32,
+}
+
+impl ArcEdges {
+    /// What the picture depends on (not where the quads are).
+    fn key(&self) -> [u32; 5] {
+        [
+            self.size[0].to_bits(),
+            self.size[1].to_bits(),
+            self.radius.to_bits(),
+            self.half.to_bits(),
+            self.thickness.to_bits(),
+        ]
+    }
+}
+
+/// Pixels for the arc quads (premultiplied, like `solid_image`).
+const ARC_PX: [u32; 2] = [1024, 256];
+
+/// The arc as seen from above: the circle's axis is `radius` behind the
+/// picture's near edge (plus the line's half width), the screen's centre
+/// at the bottom middle.
+fn arc_image(arc: &ArcEdges, alpha: f32) -> Vec<u8> {
+    let [pw, ph] = ARC_PX;
+    let (hx, hn) = (arc.size[0] / 2.0, arc.size[1] / 2.0);
+    let (r, t) = (arc.radius, arc.thickness);
+    // Rows run from the near edge (towards the viewer) to the far one.
+    let near = -r * arc.half.cos() + t;
+    let px_m = (arc.size[0] / pw as f32).max(arc.size[1] / ph as f32);
+    let mut pixels = vec![0u8; (pw * ph * 4) as usize];
+    for j in 0..ph {
+        let n = near - (j as f32 + 0.5) / ph as f32 * 2.0 * hn;
+        for i in 0..pw {
+            let x = -hx + (i as f32 + 0.5) / pw as f32 * 2.0 * hx;
+            let d = (x * x + n * n).sqrt() - r;
+            if d.abs() > t {
+                continue;
+            }
+            let along = ((t / 2.0 - d.abs()) / px_m + 0.5).clamp(0.0, 1.0);
+            let angle = x.atan2(-n);
+            let within = ((arc.half - angle.abs()) * r / px_m + 0.5).clamp(0.0, 1.0);
+            let a = (alpha * along * within * 255.0) as u8;
+            let k = ((j * pw + i) * 4) as usize;
+            pixels[k..k + 4].copy_from_slice(&[a, a, a, a]);
+        }
+    }
+    pixels
+}
+
+/// The outline of a screen: straight lines and, for a curved screen, its
+/// two arcs.
+#[derive(Default)]
+struct Outline {
+    lines: Vec<Line>,
+    arcs: Option<ArcEdges>,
+}
+
+/// The rotation taking the axes to the unit vectors `x`, `y`, `z` (a
+/// right-handed frame).
+fn quat_from_basis(x: [f32; 3], y: [f32; 3], z: [f32; 3]) -> xr::Quaternionf {
+    let (m00, m01, m02) = (x[0], y[0], z[0]);
+    let (m10, m11, m12) = (x[1], y[1], z[1]);
+    let (m20, m21, m22) = (x[2], y[2], z[2]);
+    let trace = m00 + m11 + m22;
+    if trace > 0.0 {
+        let s = (trace + 1.0).sqrt() * 2.0;
+        xr::Quaternionf {
+            w: 0.25 * s,
+            x: (m21 - m12) / s,
+            y: (m02 - m20) / s,
+            z: (m10 - m01) / s,
+        }
+    } else if m00 > m11 && m00 > m22 {
+        let s = (1.0 + m00 - m11 - m22).sqrt() * 2.0;
+        xr::Quaternionf {
+            w: (m21 - m12) / s,
+            x: 0.25 * s,
+            y: (m01 + m10) / s,
+            z: (m02 + m20) / s,
+        }
+    } else if m11 > m22 {
+        let s = (1.0 + m11 - m00 - m22).sqrt() * 2.0;
+        xr::Quaternionf {
+            w: (m02 - m20) / s,
+            x: (m01 + m10) / s,
+            y: 0.25 * s,
+            z: (m12 + m21) / s,
+        }
+    } else {
+        let s = (1.0 + m22 - m00 - m11).sqrt() * 2.0;
+        xr::Quaternionf {
+            w: (m10 - m01) / s,
+            x: (m02 + m20) / s,
+            y: (m12 + m21) / s,
+            z: 0.25 * s,
+        }
+    }
+}
+
 /// Lines `t` thick along the edges of a flat panel.
 fn panel_outline(panel: &Panel, t: f32) -> Vec<Line> {
     let [right, up, _] = panel.basis();
@@ -630,8 +746,9 @@ fn panel_outline(panel: &Panel, t: f32) -> Vec<Line> {
     ]
 }
 
-/// Lines along the edges of the flat screen (curved: along its arcs).
-fn screen_outline(placement: &Placement, screen: [f32; 2], t: f32) -> Vec<Line> {
+/// Lines along the edges of the flat screen (curved: its sides, and its
+/// top and bottom arcs).
+fn screen_outline(placement: &Placement, screen: [f32; 2], t: f32) -> Outline {
     let base = Panel {
         center: [0.0; 3],
         yaw: placement.yaw,
@@ -645,7 +762,10 @@ fn screen_outline(placement: &Placement, screen: [f32; 2], t: f32) -> Vec<Line> 
             center: placement.center(),
             ..base
         };
-        return panel_outline(&panel, t);
+        return Outline {
+            lines: panel_outline(&panel, t),
+            arcs: None,
+        };
     }
     // The cylinder's axis: through the pivot, or behind it for a gentle curve.
     let r = placement.curve_radius();
@@ -677,18 +797,40 @@ fn screen_outline(placement: &Placement, screen: [f32; 2], t: f32) -> Vec<Line> 
     };
     let [w, h] = screen;
     let half = w / 2.0 / r;
-    let mut lines = vec![(at(-half, 0.0), [t, h + t]), (at(half, 0.0), [t, h + t])];
-    const SEGMENTS: usize = 24;
-    let step = 2.0 * half / SEGMENTS as f32;
-    for i in 0..SEGMENTS {
-        let angle = -half + (i as f32 + 0.5) * step;
-        // A little longer than the chord, so the segments join up.
-        let len = 2.0 * r * (step / 2.0).sin() + t / 2.0;
-        for y in [h / 2.0, -h / 2.0] {
-            lines.push((at(angle, y), [len, t]));
+    let lines = vec![(at(-half, 0.0), [t, h + t]), (at(half, 0.0), [t, h + t])];
+    // The arcs' quads lie flat at the top and bottom, spanning the arc's
+    // chord and depth (from the axis side) with the line's width around.
+    let hx = r * half.min(std::f32::consts::FRAC_PI_2).sin() + t;
+    let (far, near) = (-r, -r * half.cos());
+    let hn = (near - far) / 2.0 + t;
+    let center_n = (near + far) / 2.0;
+    let neg = |v: [f32; 3]| scale(v, -1.0);
+    let poses = [h / 2.0, -h / 2.0].map(|y| {
+        let p = add(axis, add(scale(normal, center_n), scale(up, y)));
+        let (x_axis, z_axis) = if y > 0.0 {
+            (right, neg(up))
+        } else {
+            (neg(right), up)
+        };
+        xr::Posef {
+            orientation: quat_from_basis(x_axis, normal, z_axis),
+            position: xr::Vector3f {
+                x: p[0],
+                y: p[1],
+                z: p[2],
+            },
         }
+    });
+    Outline {
+        lines,
+        arcs: Some(ArcEdges {
+            poses,
+            size: [2.0 * hx, 2.0 * hn],
+            radius: r,
+            half,
+            thickness: t,
+        }),
     }
-    lines
 }
 
 /// Where `ray` meets the video (flat or curved screen, or a point 5 m out
@@ -856,6 +998,11 @@ pub fn run(
     renderer.upload_quad(&mut progress_line, &solid_image([0x4f, 0x8c, 0xff], 1.0))?;
     let mut progress_at: Option<(xr::Posef, [f32; 2])>;
     let mut outlines: Vec<(bool, Line)> = Vec::new();
+    // A curved screen's arcs, drawn afresh when their shape changes.
+    let mut arcs: Option<ArcEdges>;
+    let mut arc_target = renderer.create_quad(&ctx, ARC_PX[0], ARC_PX[1])?;
+    let mut arc_drawn: Option<[u32; 5]> = None;
+    let mut layers_warned = false;
     let mut dialog_target =
         renderer.create_quad(&ctx, controls::DIALOG_WIDTH, controls::DIALOG_HEIGHT)?;
     // The caption on screen, and where it goes this frame.
@@ -944,6 +1091,7 @@ pub fn run(
         ms
     };
     let mut period = 0i64;
+    let mut last_frame: Option<i64> = None;
 
     'main: loop {
         heartbeat.store(loop_started.elapsed().as_millis() as i64, Ordering::Relaxed);
@@ -997,7 +1145,13 @@ pub fn run(
         period = state.predicted_display_period.as_nanos();
         stats.rendered_xr_frames += 1;
         let now = state.predicted_display_time.as_nanos();
-        let dt = state.predicted_display_period.as_nanos() as f32 / 1e9;
+        // Movement per frame follows the time that really passed (a frame
+        // the app missed is two periods), not the display's period alone.
+        let dt = match last_frame {
+            Some(last) if now > last => ((now - last) as f32 / 1e9).min(0.1),
+            _ => state.predicted_display_period.as_nanos() as f32 / 1e9,
+        };
+        last_frame = Some(now);
         set_phase(2);
         let mut buttons = input
             .poll(&ctx, &space, state.predicted_display_time)
@@ -1204,8 +1358,8 @@ pub fn run(
                                     .clamp(-super::player::MAX_PITCH, super::player::MAX_PITCH);
                                 if buttons.scroll != 0.0 {
                                     browser_place.distance = (browser_place.distance
-                                        + buttons.scroll * 1.5 * dt)
-                                        .clamp(1.0, 6.0);
+                                        + buttons.scroll * 2.0 * dt)
+                                        .clamp(1.5, 6.0);
                                 }
                             }
                             moving = p.dragging;
@@ -1225,25 +1379,26 @@ pub fn run(
                 placement.curve = nav.curvature();
                 browser_width = nav.browser_width();
                 outlines.clear();
+                arcs = None;
                 match nav.preview(hit) {
                     Some(crate::ui::navigator::Preview::BrowserWidth(w)) => browser_width = w,
                     Some(crate::ui::navigator::Preview::Curvature(c)) => {
+                        let distance = browser_place.distance + CURVE_PREVIEW_BEHIND;
                         let sample = Placement {
-                            distance: CURVE_PREVIEW_DISTANCE,
+                            distance,
                             curved: true,
                             curve: c,
                             zoom: 1.0,
                             offset: 0.0,
                             ..browser_place
                         };
-                        let w = CURVE_PREVIEW_SCALE * BROWSER_SIZE[0] * CURVE_PREVIEW_DISTANCE
-                            / BROWSER_DISTANCE;
+                        // Looks 1.4x as wide as the browser does from here.
+                        let w = CURVE_PREVIEW_SCALE * BROWSER_SIZE[0] * browser_width * distance
+                            / browser_place.distance;
                         let screen = [w, w * 9.0 / 16.0];
-                        outlines.extend(
-                            screen_outline(&sample, screen, 0.004 * CURVE_PREVIEW_DISTANCE)
-                                .into_iter()
-                                .map(|l| (false, l)),
-                        );
+                        let outline = screen_outline(&sample, screen, 0.004 * distance);
+                        outlines.extend(outline.lines.into_iter().map(|l| (false, l)));
+                        arcs = outline.arcs;
                     }
                     None => {}
                 }
@@ -2026,15 +2181,14 @@ pub fn run(
                     }
                 });
                 outlines.clear();
+                arcs = None;
                 if caption_edit {
                     // Thick enough to see at any distance.
                     let t = 0.004 * if flat { placement.distance } else { 2.0 };
                     if flat {
-                        outlines.extend(
-                            screen_outline(&placement, screen, t)
-                                .into_iter()
-                                .map(|l| (false, l)),
-                        );
+                        let outline = screen_outline(&placement, screen, t);
+                        outlines.extend(outline.lines.into_iter().map(|l| (false, l)));
+                        arcs = outline.arcs;
                     }
                     outlines.extend(
                         panel_outline(&caption_area, t)
@@ -2120,6 +2274,12 @@ pub fn run(
             }
         }
 
+        if let Some(arc) = &arcs
+            && arc_drawn != Some(arc.key())
+        {
+            renderer.upload_quad(&mut arc_target, &arc_image(arc, 0.7))?;
+            arc_drawn = Some(arc.key());
+        }
         // Overlay layers to show this frame, back to front.
         let mut overlays: Vec<Overlay> = Vec::new();
         // Whether this frame's eye images have a transparent surround.
@@ -2134,6 +2294,11 @@ pub fn run(
                     // The curvature preview's outline, behind the panel.
                     for (_, (pose, size)) in &outlines {
                         overlays.push(Overlay::quad(&screen_line, *pose, *size, true));
+                    }
+                    if let Some(arc) = &arcs {
+                        for pose in arc.poses {
+                            overlays.push(Overlay::quad(&arc_target, pose, arc.size, true));
+                        }
                     }
                     overlays.push(Overlay::quad(
                         target,
@@ -2157,6 +2322,11 @@ pub fn run(
                         &screen_line
                     };
                     overlays.push(Overlay::quad(target, *pose, *size, true));
+                }
+                if let Some(arc) = &arcs {
+                    for pose in arc.poses {
+                        overlays.push(Overlay::quad(&arc_target, pose, arc.size, true));
+                    }
                 }
                 if let Some((pose, shape)) = caption_at.filter(|_| captions_target.ready) {
                     overlays.push(Overlay {
@@ -2275,6 +2445,22 @@ pub fn run(
         } else {
             projection
         };
+        // The runtime takes only so many layers: should they ever not fit,
+        // the backmost (outlines) go, not the panels.
+        let room = ctx
+            .max_layers
+            .saturating_sub(usize::from(!projection_views.is_empty()));
+        if overlays.len() > room {
+            if !layers_warned {
+                eprintln!(
+                    "OpenXR: {} overlay layers, the runtime takes {}; dropping the backmost",
+                    overlays.len(),
+                    ctx.max_layers
+                );
+                layers_warned = true;
+            }
+            overlays.drain(..overlays.len() - room);
+        }
         let built: Vec<Built> = overlays
             .iter()
             .map(|o| match o.shape {
@@ -2390,7 +2576,10 @@ mod tests {
 
     /// +Z (a quad's normal) turned by `q`.
     fn rotate_z(q: xr::Quaternionf) -> [f32; 3] {
-        let v = [0.0f32, 0.0, 1.0];
+        rotate(q, [0.0, 0.0, 1.0])
+    }
+
+    fn rotate(q: xr::Quaternionf, v: [f32; 3]) -> [f32; 3] {
         let t = [
             2.0 * (q.y * v[2] - q.z * v[1]),
             2.0 * (q.z * v[0] - q.x * v[2]),
@@ -2415,8 +2604,9 @@ mod tests {
             offset: 0.0,
             pivot: [0.0; 3],
         };
-        let lines = screen_outline(&placement, [4.0, 2.25], 0.01);
-        for (pose, _) in &lines {
+        let outline = screen_outline(&placement, [4.0, 2.25], 0.01);
+        assert_eq!(outline.lines.len(), 2, "the two sides");
+        for (pose, _) in &outline.lines {
             let p = [pose.position.x, pose.position.y, pose.position.z];
             let horizontal = (p[0] * p[0] + p[2] * p[2]).sqrt();
             assert!((horizontal - 3.0).abs() < 1e-3, "on the arc: {p:?}");
@@ -2424,6 +2614,28 @@ mod tests {
             let n = rotate_z(pose.orientation);
             let towards = [-p[0] / horizontal, 0.0, -p[2] / horizontal];
             assert!(dot(n, towards) > 0.999, "{n:?} vs {towards:?}");
+        }
+        // The arcs lie flat at the top and bottom, facing the viewer's
+        // level, their picture's Y towards the viewer; its far edge (less
+        // the line's width) is the screen's centre line, the arc's centre.
+        let arc = outline.arcs.expect("arcs");
+        assert!((arc.radius - 3.0).abs() < 1e-5);
+        assert!((arc.half - 2.0 / 3.0).abs() < 1e-5);
+        let normal = [0.4f32.sin(), 0.0, 0.4f32.cos()];
+        for (pose, y) in arc.poses.iter().zip([2.25 / 2.0, -2.25 / 2.0]) {
+            assert!((pose.position.y - y).abs() < 1e-5, "{pose:?}");
+            let z = rotate_z(pose.orientation);
+            assert!((z[1] + y.signum()).abs() < 1e-5, "{z:?} at {y}");
+            let towards = rotate(pose.orientation, [0.0, 1.0, 0.0]);
+            assert!(dot(towards, normal) > 0.999, "{towards:?}");
+            // The far edge, in the middle: the screen's centre at that height.
+            let far = rotate(pose.orientation, [0.0, -arc.size[1] / 2.0 + 0.01, 0.0]);
+            let p = add([pose.position.x, pose.position.y, pose.position.z], far);
+            let center = add(placement.center(), [0.0, y, 0.0]);
+            assert!(
+                dot(add(p, scale(center, -1.0)), [1.0, 1.0, 1.0]).abs() < 1e-3,
+                "{p:?} vs {center:?}"
+            );
         }
         // A gentler curve: a 6 m cylinder whose axis is 3 m behind the
         // viewer, the screen's centre still 3 m ahead.
@@ -2434,9 +2646,9 @@ mod tests {
         let r = gentle.rotation();
         let forward = [-r[2][0], -r[2][1], -r[2][2]];
         let axis = scale(forward, -3.0);
-        let lines = screen_outline(&gentle, [4.0, 2.25], 0.01);
+        let outline = screen_outline(&gentle, [4.0, 2.25], 0.01);
         let (mut nearest, mut farthest) = (f32::MAX, 0.0f32);
-        for (pose, _) in &lines {
+        for (pose, _) in &outline.lines {
             let p = [pose.position.x, pose.position.y, pose.position.z];
             let off = [p[0] - axis[0], 0.0, p[2] - axis[2]];
             assert!(
@@ -2462,6 +2674,76 @@ mod tests {
             farthest <= 3.0 + 1e-3 && nearest < 2.9,
             "{nearest}..{farthest}"
         );
+    }
+
+    #[test]
+    fn basis_rotation_matches_the_panel_orientation() {
+        for (yaw, tilt) in [(0.0, 0.0), (0.7, 0.2), (-2.5, -0.6), (3.0, 1.2)] {
+            let panel = Panel {
+                center: [0.0; 3],
+                yaw,
+                tilt,
+                size: [1.0, 1.0],
+                pixels: [1, 1],
+            };
+            let [right, up, normal] = panel.basis();
+            let q = quat_from_basis(right, up, normal);
+            for (axis, want) in [
+                ([1.0, 0.0, 0.0], right),
+                ([0.0, 1.0, 0.0], up),
+                ([0.0, 0.0, 1.0], normal),
+            ] {
+                let got = rotate(q, axis);
+                let same = rotate(panel.orientation(), axis);
+                assert!(
+                    dot(got, want) > 0.9999,
+                    "{got:?} vs {want:?} at {yaw},{tilt}"
+                );
+                assert!(
+                    dot(got, same) > 0.9999,
+                    "{got:?} vs {same:?} at {yaw},{tilt}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn arc_picture_follows_the_circle() {
+        let (r, half, t) = (3.0f32, 0.9f32, 0.02f32);
+        let hx = r * half.sin() + t;
+        let hn = r * (1.0 - half.cos()) / 2.0 + t;
+        let arc = ArcEdges {
+            poses: [xr::Posef::IDENTITY; 2],
+            size: [2.0 * hx, 2.0 * hn],
+            radius: r,
+            half,
+            thickness: t,
+        };
+        let pixels = arc_image(&arc, 1.0);
+        let [pw, ph] = ARC_PX;
+        let mut lit = 0;
+        for j in 0..ph {
+            for i in 0..pw {
+                let a = pixels[((j * pw + i) * 4 + 3) as usize];
+                if a == 0 {
+                    continue;
+                }
+                lit += 1;
+                // Every lit pixel is on the circle, within the span.
+                let x = -hx + (i as f32 + 0.5) / pw as f32 * 2.0 * hx;
+                let n = -r * half.cos() + t - (j as f32 + 0.5) / ph as f32 * 2.0 * hn;
+                let d = (x * x + n * n).sqrt() - r;
+                assert!(d.abs() <= t, "({i},{j}) off the circle by {d}");
+                assert!(x.atan2(-n).abs() <= half + 0.01, "({i},{j}) past the end");
+            }
+        }
+        // The arc's centre is lit, at the far edge of the middle column.
+        let column = pw / 2;
+        let far = (0..ph)
+            .rev()
+            .find(|&j| pixels[((j * pw + column) * 4 + 3) as usize] > 0);
+        assert!(far.is_some_and(|j| j > ph * 9 / 10), "{far:?}");
+        assert!(lit > 2000, "{lit}");
     }
 
     #[test]
@@ -2839,10 +3121,10 @@ mod tests {
     fn browser_handle_hangs_below_the_panel() {
         let mut place = browser_placement([0.0, 1.6, 0.0]);
         place.yaw = 0.5;
-        place.distance = 3.3;
+        place.distance = BROWSER_DISTANCE * 1.5;
         let panel = browser_panel(&place, 1.0);
-        // Apparent size is kept: 1.5x the distance, 1.5x the size.
-        assert!((panel.size[0] - BROWSER_SIZE[0] * 1.5).abs() < 1e-3);
+        // Pushed away it keeps its size in metres, so it looks smaller.
+        assert!((panel.size[0] - BROWSER_SIZE[0]).abs() < 1e-3);
         let handle = handle_panel(&panel, false);
         let [_, up, normal] = panel.basis();
         let d = [0, 1, 2].map(|i| handle.center[i] - panel.center[i]);

@@ -25,6 +25,8 @@ pub struct XrContext {
     pub frame_stream: xr::FrameStream<xr::Vulkan>,
     /// XR_KHR_composition_layer_cylinder: overlays can bend with a curved screen.
     pub cylinder_layers: bool,
+    /// Composition layers a frame may submit (16 on the Frame).
+    pub max_layers: usize,
 }
 
 impl XrContext {
@@ -93,7 +95,10 @@ impl XrContext {
         let system = xr
             .system(xr::FormFactor::HEAD_MOUNTED_DISPLAY)
             .context("No headset available to OpenXR (is it awake and tracking?)")?;
-        let system_name = xr.system_properties(system)?.system_name;
+        let properties = xr.system_properties(system)?;
+        let system_name = properties.system_name;
+        let max_layers = properties.graphics_properties.max_layer_count as usize;
+        eprintln!("OpenXR: up to {max_layers} composition layers");
         let views = xr.enumerate_view_configuration_views(system, VIEW_TYPE)?;
         ensure!(views.len() == 2, "Expected a stereo view configuration");
         // The runtime's first choice (OPAQUE on the Frame). Its ALPHA_BLEND
@@ -192,6 +197,7 @@ impl XrContext {
             frame_waiter,
             frame_stream,
             cylinder_layers,
+            max_layers,
         })
     }
 

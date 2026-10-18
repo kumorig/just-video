@@ -32,9 +32,15 @@ impl Canvas {
             return;
         }
         let i = ((y as u32 * self.width + x as u32) * 4) as usize;
-        let a = alpha.min(1.0);
+        if alpha >= 1.0 {
+            self.pixels[i..i + 4].copy_from_slice(&[color[0], color[1], color[2], 255]);
+            return;
+        }
+        // Integer blend: the browser redraws every frame while scrolling.
+        let a = (alpha * 256.0) as u32;
         for (dst, src) in self.pixels[i..i + 3].iter_mut().zip(color) {
-            *dst = (*dst as f32 + (src as f32 - *dst as f32) * a).round() as u8;
+            let d = *dst as u32;
+            *dst = ((d * (256 - a) + src as u32 * a + 128) >> 8) as u8;
         }
         self.pixels[i + 3] = 255;
     }
@@ -44,8 +50,20 @@ impl Canvas {
         let r = radius.min(w / 2.0).min(h / 2.0).max(0.0);
         let (x0, y0) = (x.floor() as i32, y.floor() as i32);
         let (x1, y1) = ((x + w).ceil() as i32, (y + h).ceil() as i32);
+        // Only the edge and the corners need the distance; the inside is a
+        // plain fill (most of a row's background, every frame it scrolls).
+        let (ix0, ix1) = ((x + 1.0).ceil() as i32, (x + w - 1.0).floor() as i32);
+        let (iy0, iy1) = ((y + 1.0).ceil() as i32, (y + h - 1.0).floor() as i32);
+        let (cx0, cx1) = ((x + r).ceil() as i32, (x + w - r).floor() as i32);
+        let (cy0, cy1) = ((y + r).ceil() as i32, (y + h - r).floor() as i32);
         for py in y0..y1 {
+            let middle_row = py >= cy0 && py < cy1;
             for px in x0..x1 {
+                let inside = px >= ix0 && px < ix1 && py >= iy0 && py < iy1;
+                if inside && (middle_row || (px >= cx0 && px < cx1)) {
+                    self.blend(px, py, color, 1.0);
+                    continue;
+                }
                 let (cx, cy) = (px as f32 + 0.5, py as f32 + 0.5);
                 // Signed distance to the rounded rectangle.
                 let qx = (cx - (x + w / 2.0)).abs() - (w / 2.0 - r);
@@ -275,7 +293,7 @@ impl Fonts {
         }
         let mut pen = x;
         for c in shown.chars() {
-            let (metrics, coverage) = self.glyph(c, size).clone();
+            let (metrics, coverage) = self.glyph(c, size);
             let gx = pen.round() as i32 + metrics.xmin;
             let gy = (y.round() as i32) - metrics.height as i32 - metrics.ymin;
             for row in 0..metrics.height {

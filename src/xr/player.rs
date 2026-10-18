@@ -496,6 +496,13 @@ fn spawn_decoder(
                 }
                 landing = Some((start, None));
             }
+            // The last picture's time, and when the decoder was last
+            // restarted there: a hardware session that stops answering
+            // (seen after the headset's standby) is flushed and seeked back
+            // to where playback was, once per stretch of playing, instead
+            // of ending the video.
+            let mut last_pts = start;
+            let mut restarted_at: Option<f64> = None;
             'decode: loop {
                 // Before seeks: the seek that follows a switch restarts the new track.
                 while let Ok(track) = audio_changes.try_recv() {
@@ -528,6 +535,20 @@ fn spawn_decoder(
                 let message = match decoder.next_frame() {
                     Ok(Some(frame)) => Decoded::Frame(generation, frame),
                     Ok(None) => Decoded::End(generation),
+                    Err(e)
+                        if e.downcast_ref::<crate::media::DecoderStalled>().is_some()
+                            && restarted_at.is_none_or(|t| last_pts > t + 10.0) =>
+                    {
+                        eprintln!("{e:#}; restarting it at {last_pts:.1}s");
+                        restarted_at = Some(last_pts);
+                        match decoder.seek(last_pts) {
+                            Ok(()) => {
+                                landing = Some((last_pts, None));
+                                continue 'decode;
+                            }
+                            Err(e) => Decoded::Failed(generation, format!("{e:#}")),
+                        }
+                    }
                     Err(e) => Decoded::Failed(generation, format!("{e:#}")),
                 };
                 // Seeking lands on a keyframe before the target. Show from
@@ -574,6 +595,11 @@ fn spawn_decoder(
                     && frame.pts().is_some_and(|t| t < start)
                 {
                     continue;
+                }
+                if let Decoded::Frame(_, frame) = &message
+                    && let Some(t) = frame.pts()
+                {
+                    last_pts = t;
                 }
                 let finished = !matches!(message, Decoded::Frame(..));
                 let mut message = Some(message);

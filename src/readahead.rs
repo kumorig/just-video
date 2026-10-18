@@ -241,6 +241,21 @@ impl Reserve {
         Some(block)
     }
 
+    /// Takes a lent block back, while it fits (the window's own fetches
+    /// never come here, so playing with the reserve off holds nothing).
+    fn give_back(&self, index: u64, data: Vec<u8>) {
+        let mut inner = self.inner.lock().expect("reserve");
+        if self.closed.load(Ordering::SeqCst)
+            || inner.bytes + data.len() as u64 > self.cap
+            || inner.blocks.contains_key(&index)
+        {
+            return;
+        }
+        inner.bytes += data.len() as u64;
+        inner.blocks.insert(index, data);
+        self.publish(&inner);
+    }
+
     fn is_pending(&self, index: u64) -> bool {
         self.inner.lock().expect("reserve").pending.contains(&index)
     }
@@ -382,6 +397,9 @@ pub struct ReadAheadReader<S: BlockSource> {
     window: u64,
     /// The block the last read was in.
     last_block: Option<u64>,
+    /// Blocks in `blocks` that came from the reserve: dropped from the
+    /// window, they go back there (see [`Reserve::give_back`]).
+    borrowed: BTreeSet<u64>,
     stats: ReadStats,
     watch: BufferWatch,
     reserve: Arc<Reserve>,
@@ -446,6 +464,7 @@ impl<S: BlockSource> ReadAheadReader<S> {
             in_flight: Arc::new(AtomicUsize::new(0)),
             window: JUMP_BLOCKS,
             last_block: None,
+            borrowed: BTreeSet::new(),
             stats: ReadStats::default(),
             watch,
             reserve,
@@ -571,8 +590,14 @@ impl<S: BlockSource> ReadAheadReader<S> {
             .filter(|&i| i < keep_from || i >= keep_until)
             .collect();
         for index in stale {
-            if let Some(Block::Pending(handle)) = self.blocks.remove(&index) {
-                self.detached.push(handle);
+            match self.blocks.remove(&index) {
+                Some(Block::Pending(handle)) => self.detached.push(handle),
+                // A block the reserve lent is its to keep (the demuxer
+                // may come back for it, with the network gone).
+                Some(Block::Ready(data)) if self.borrowed.remove(&index) => {
+                    self.reserve.give_back(index, data);
+                }
+                _ => {}
             }
             self.stats.discarded_blocks += 1;
         }
@@ -585,6 +610,7 @@ impl<S: BlockSource> ReadAheadReader<S> {
             }
             if let Some(data) = self.reserve.take(index) {
                 self.blocks.insert(index, Block::Ready(data));
+                self.borrowed.insert(index);
                 continue;
             }
             if self.reserve.is_pending(index) {
@@ -622,6 +648,7 @@ impl<S: BlockSource> ReadAheadReader<S> {
         loop {
             if let Some(data) = self.reserve.take(index) {
                 self.blocks.insert(index, Block::Ready(data));
+                self.borrowed.insert(index);
                 return Ok(());
             }
             if !self.reserve.is_pending(index) {
@@ -805,6 +832,8 @@ mod tests {
         completed: Arc<AtomicUsize>,
         /// When set, every offset not listed takes 500x the latency.
         fast_only: Option<Vec<u64>>,
+        /// The network is gone: every read fails at once.
+        down: Arc<AtomicBool>,
     }
 
     impl BlockSource for Slow {
@@ -818,6 +847,9 @@ mod tests {
                     .fast_only
                     .as_ref()
                     .is_some_and(|f| !f.contains(&offset));
+                if self.down.load(Ordering::SeqCst) {
+                    return Err(io::Error::other("The connection dropped."));
+                }
                 tokio::time::sleep(self.latency * if slow { 500 } else { 1 }).await;
                 self.completed.fetch_add(1, Ordering::SeqCst);
                 let start = offset as usize;
@@ -840,6 +872,7 @@ mod tests {
             latency: Duration::from_millis(latency_ms),
             completed: Arc::new(AtomicUsize::new(0)),
             fast_only: None,
+            down: Arc::new(AtomicBool::new(false)),
         };
         (
             ReadAheadReader::new(runtime, source, len as u64, options),
@@ -1122,12 +1155,18 @@ mod tests {
         assert_eq!(out, data[1000..20_000]);
         // (The window looks a few blocks past the reserve's end.)
         assert!(r.stats().requests <= before + 3, "{:?}", r.stats());
-        assert!(reserve.ranges().is_empty(), "{:?}", reserve.ranges());
+        // What the window dropped behind went back to the reserve; nothing
+        // ahead is left.
+        assert!(
+            reserve.ranges().iter().all(|&(_, b)| b <= 20_000),
+            "{:?}",
+            reserve.ranges()
+        );
         // Past it, the window fetches as usual.
         r.read_exact(&mut buf).unwrap();
         assert!(r.stats().requests > before);
         let state = r.watch().lock().unwrap().clone();
-        assert!(state.reserved.is_empty());
+        assert!(state.reserved.iter().all(|&(_, b)| b <= 20_000));
         assert_eq!(state.position, 21_000);
     }
 
@@ -1201,6 +1240,7 @@ mod tests {
             latency: Duration::from_millis(1),
             completed: Arc::new(AtomicUsize::new(0)),
             fast_only: Some(vec![0, 50_000]),
+            down: Arc::new(AtomicBool::new(false)),
         };
         let mut r = ReadAheadReader::new(runtime, source, 200_000, options);
         let reserve = r.reserve();
@@ -1223,6 +1263,44 @@ mod tests {
             "{:?} (gap at {first_gap})",
             reserve.ranges()
         );
+    }
+
+    /// Buffered up, then carried off the network: everything held plays,
+    /// through the demuxer's small backward seeks too.
+    #[test]
+    fn reserve_plays_on_without_the_network() {
+        let options = ReadAhead {
+            block_size: 1000,
+            blocks_ahead: 4,
+            reserve_bytes: 40_000,
+        };
+        let (mut r, data) = reader(100_000, 1, options);
+        let down = r.source.down.clone();
+        let reserve = r.reserve();
+        let mut buf = [0u8; 1000];
+        r.read_exact(&mut buf).unwrap();
+        reserve.set_active(true);
+        assert!(
+            wait_until(|| reserve.ranges().last().is_some_and(|&(_, b)| b >= 40_000)),
+            "{:?}",
+            reserve.ranges()
+        );
+        // The window's reads in flight land too.
+        std::thread::sleep(Duration::from_millis(50));
+        down.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(50));
+        reserve.set_active(false);
+        // Read on like a demuxer: a few blocks, then a little back.
+        let mut pos = 1000u64;
+        let mut out = vec![0u8; 2500];
+        while pos + 2500 <= 38_000 {
+            r.read_exact(&mut out)
+                .unwrap_or_else(|e| panic!("offline at {pos}: {e}"));
+            assert_eq!(out, data[pos as usize..pos as usize + 2500]);
+            pos += 2500;
+            pos -= 700;
+            r.seek(SeekFrom::Start(pos)).unwrap();
+        }
     }
 
     #[test]
