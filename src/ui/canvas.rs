@@ -1,5 +1,6 @@
 //! A small RGBA (sRGB-encoded) software canvas with text, for the headset UI.
 
+use super::glyphs;
 use std::collections::HashMap;
 
 pub type Rgb = [u8; 3];
@@ -189,8 +190,8 @@ impl Canvas {
 /// Noto Sans from the system, with Noto Sans CJK as fallback for Japanese,
 /// Chinese and Korean names. Glyphs are rasterized once per size.
 pub struct Fonts {
-    fonts: Vec<fontdue::Font>,
-    cache: HashMap<(usize, char, u32), (fontdue::Metrics, Vec<u8>)>,
+    fonts: Vec<glyphs::Font>,
+    cache: HashMap<(usize, char, u32), (glyphs::Metrics, Vec<u8>)>,
 }
 
 const FONT_CANDIDATES: &[&[&str]] = &[
@@ -217,16 +218,8 @@ impl Fonts {
         let mut fonts = Vec::new();
         for candidates in FONT_CANDIDATES {
             for path in *candidates {
-                let Ok(bytes) = std::fs::read(path) else {
-                    continue;
-                };
                 // Collection index 0 of Noto Sans CJK is the Japanese variant.
-                let settings = fontdue::FontSettings {
-                    collection_index: 0,
-                    scale: 48.0,
-                    ..Default::default()
-                };
-                if let Ok(font) = fontdue::Font::from_bytes(bytes, settings) {
+                if let Ok(font) = glyphs::Font::open(path, 0) {
                     fonts.push(font);
                     break;
                 }
@@ -245,11 +238,11 @@ impl Fonts {
     fn font_for(&self, ch: char) -> usize {
         self.fonts
             .iter()
-            .position(|f| f.lookup_glyph_index(ch) != 0)
+            .position(|f| f.glyph_index(ch) != 0)
             .unwrap_or(0)
     }
 
-    fn glyph(&mut self, ch: char, size: f32) -> &(fontdue::Metrics, Vec<u8>) {
+    fn glyph(&mut self, ch: char, size: f32) -> &(glyphs::Metrics, Vec<u8>) {
         let font = self.font_for(ch);
         let key = (font, ch, size.to_bits());
         self.cache

@@ -19,3 +19,4 @@
 - Lower memory: freed heap returned, 6 decoder buffers.
 - Read-ahead window kept when the demuxer reads back.
 - Faster recovery after a connection drop: failed blocks re-requested at once.
+- Much lower UI memory: glyphs drawn on demand from mapped font files.

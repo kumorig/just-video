@@ -6,6 +6,7 @@ pub mod captions;
 pub mod controls;
 pub mod focus;
 pub mod form;
+pub mod glyphs;
 pub mod navigator;
 pub mod steam_art;
 
