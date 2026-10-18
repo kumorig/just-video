@@ -40,3 +40,4 @@
 - [x] The buffer label shows a share rather than sizes: "Buffering… 40%" and "100% buffered" (of the rest of the file, up to the chosen size).
 - [x] The buffer button is shown or hidden with a long press on play/pause instead of a "Buffer button" toggle in the screen dialog, which now holds only the formats and the curved screen. The setting is still saved in settings.json.
 - [x] Buffering ahead is a long press on play/pause; the small button under play and the "Buffer button" visibility setting are gone. While it runs, the icon and a progress line sit under play with the count beside them; pointing at play while it is off says "Hold to buffer ahead while paused".
+- [x] Thumbnails on by default. The "Thumbnails" row left Settings; the picture button in a folder's header still switches them off and on, saved as before.

@@ -1576,12 +1576,6 @@ fn main() -> anyhow::Result<()> {
                         ..Row::new(Icon::Dpad, "D-pad in menus")
                     },
                     Row {
-                        detail: "Pictures of videos in folder lists; slower browsing on Wi-Fi"
-                            .into(),
-                        right: "Off".into(),
-                        ..Row::new(Icon::Thumbnails(false), "Thumbnails")
-                    },
-                    Row {
                         detail: "Fetched while paused, to play on without the network".into(),
                         right: "1 GB".into(),
                         ..Row::new(Icon::Buffer, "Buffer ahead")
