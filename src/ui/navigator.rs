@@ -11,8 +11,9 @@
 //! but offers no Delete, Move or Rename, and a notice says where to allow them.
 
 use super::browser::{Action, Dialog, Hit, Icon, Row, Tool, View, format_size};
+use super::controls::format_time;
 use super::form::{self, Field, Form, Key};
-use crate::config::{self, Server};
+use crate::config::{self, Place, Server};
 use crate::library::{
     Library, Listing, MoveSelection, Opened, Path, Request, Response, ThumbVideo, file_key,
 };
@@ -34,6 +35,15 @@ const READ_ONLY_NOTICE: &str =
 pub fn is_video(name: &str) -> bool {
     name.rsplit_once('.')
         .is_some_and(|(_, ext)| VIDEO_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+}
+
+/// A row's detail line with where the viewer left off: "Resume 12:34 · title".
+fn with_progress(detail: &str, place: Option<Place>) -> String {
+    match place {
+        Some(Place::Resume(seconds, _)) => format!("Resume {} · {detail}", format_time(seconds)),
+        Some(Place::Watched) => format!("Watched · {detail}"),
+        None => detail.to_string(),
+    }
 }
 
 /// Names from the top down to a place: server URL, share, folders.
@@ -109,8 +119,8 @@ enum Item {
         /// How it will be shown (once probed).
         layout: Option<Layout>,
         broken: Option<String>,
-        /// Where it was left (seconds) and its length, if remembered.
-        resume: Option<(f64, Option<f64>)>,
+        /// How far it was played, if remembered.
+        resume: Option<Place>,
     },
     /// A file that isn't a video: shown dimmed, can be renamed or deleted.
     File {
@@ -866,16 +876,21 @@ impl Navigator {
                         detail: match (assessment, broken) {
                             (_, Some(_)) => "Can't read this file".into(),
                             (Some(a), None) => {
-                                match layout.as_ref().and_then(Layout::short_label) {
+                                let detail = match layout.as_ref().and_then(Layout::short_label) {
                                     Some(format) => format!("{format}  ·  {}", a.summary),
                                     None => a.summary.clone(),
-                                }
+                                };
+                                with_progress(&detail, *resume)
                             }
-                            (None, None) => "Checking…".into(),
+                            (None, None) => with_progress("Checking…", *resume),
                         },
                         right: format_size(*size),
-                        progress: resume
-                            .and_then(|(at, duration)| duration.map(|d| (at / d) as f32)),
+                        progress: match resume {
+                            Some(Place::Resume(at, Some(length))) if *length > 0.0 => {
+                                Some((at / length) as f32)
+                            }
+                            _ => None,
+                        },
                         thumbnail: self.thumbs.get(name).cloned(),
                         ..Row::new(Icon::Video(None), name)
                     },
@@ -1369,7 +1384,7 @@ impl Navigator {
         else {
             return;
         };
-        let all = config::resume_positions();
+        let all = config::places();
         for item in &mut self.items {
             if let Item::Video { name, resume, .. } = item {
                 let mut file = path.clone();
@@ -1381,9 +1396,29 @@ impl Navigator {
         }
     }
 
-    /// After playing `key`: where it was left (None: watched or forgotten),
+    /// What is shown for the video with this file key in the open folder.
+    pub fn place_of_key(&self, key: &str) -> Option<Place> {
+        let Location::Folder {
+            server,
+            share,
+            path,
+        } = &self.location
+        else {
+            return None;
+        };
+        self.items.iter().find_map(|item| match item {
+            Item::Video { name, resume, .. } => {
+                let mut file = path.clone();
+                file.push(name.clone());
+                (crate::library::file_key(server, share, &file) == key).then_some(*resume)?
+            }
+            _ => None,
+        })
+    }
+
+    /// After playing `key`: how far it got (None: forgotten),
     /// for the row's marker. The file itself is written in the background.
-    pub fn note_resume(&mut self, key: &str, point: Option<(f64, Option<f64>)>) {
+    pub fn note_resume(&mut self, key: &str, point: Option<Place>) {
         let Location::Folder {
             server,
             share,
@@ -2645,7 +2680,7 @@ mod tests {
             assessment: None,
             layout: None,
             broken: None,
-            resume: Some((600.0, Some(2400.0))),
+            resume: Some(Place::Resume(600.0, Some(2400.0))),
         });
         nav.rebuild_rows();
         assert_eq!(nav.view().rows[1].progress, Some(0.25));
@@ -2659,8 +2694,44 @@ mod tests {
         assert!(nav.view().heading.is_none());
 
         let key = crate::library::file_key(&server, "s", &vec!["clip.mp4".to_string()]);
-        nav.note_resume(&key, Some((1200.0, Some(2400.0))));
+        nav.note_resume(&key, Some(Place::Resume(1200.0, Some(2400.0))));
         assert_eq!(nav.view().rows[1].progress, Some(0.5));
+    }
+
+    #[test]
+    fn progress_shows_in_the_detail_line() {
+        assert_eq!(with_progress("8K HEVC", None), "8K HEVC");
+        assert_eq!(
+            with_progress("8K HEVC", Some(Place::Resume(754.0, None))),
+            "Resume 12:34 · 8K HEVC"
+        );
+        assert_eq!(
+            with_progress("Plays well", Some(Place::Watched)),
+            "Watched · Plays well"
+        );
+        let mut nav = Navigator::new(Library::start(None));
+        let server = Server {
+            name: "NAS".into(),
+            url: "smb://u@nas".into(),
+            writable: false,
+        };
+        nav.show_entries_for_test(server.clone(), &[]);
+        nav.items.push(Item::Video {
+            name: "a.mp4".into(),
+            size: 1,
+            modified: 0,
+            assessment: None,
+            layout: None,
+            broken: None,
+            resume: Some(Place::Watched),
+        });
+        nav.rebuild_rows();
+        assert_eq!(nav.view().rows[0].detail, "Watched · Checking…");
+        assert_eq!(
+            nav.view().rows[0].progress,
+            None,
+            "no line for a watched video"
+        );
     }
 
     #[test]
@@ -2679,7 +2750,7 @@ mod tests {
             assessment: None,
             layout: None,
             broken: None,
-            resume: Some((1200.0, Some(2400.0))),
+            resume: Some(Place::Resume(1200.0, Some(2400.0))),
         });
         nav.rebuild_rows();
         assert!(nav.view().notice.is_none());

@@ -22,3 +22,4 @@
 - Much lower UI memory: glyphs drawn on demand from mapped font files.
 - Faster browser repaint (about 1 ms on the headset).
 - Thumbnails: JPEG cache kept 24 h, three made at once.
+- Video rows show Resume time or Watched.

@@ -194,6 +194,28 @@ struct Resume {
     /// The video's length, for showing how much was watched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     duration: Option<f64>,
+    /// Played to the end (`seconds` is then unused).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    watched: bool,
+}
+
+/// What is remembered about a video's progress.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Place {
+    /// Left part way: at this many seconds, in a video of this length if known.
+    Resume(f64, Option<f64>),
+    /// Played to (near) the end.
+    Watched,
+}
+
+impl Resume {
+    fn place(&self) -> Place {
+        if self.watched {
+            Place::Watched
+        } else {
+            Place::Resume(self.seconds, self.duration)
+        }
+    }
 }
 
 /// Videos whose place is remembered; older ones are forgotten.
@@ -204,38 +226,52 @@ static RESUME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Where to continue a file from, if it was left part way.
 pub fn resume_position(key: &str) -> Option<f64> {
-    let all: BTreeMap<String, Resume> = read_json("resume.json").ok()?;
-    all.get(key).map(|r| r.seconds)
+    match places().get(key) {
+        Some(Place::Resume(seconds, _)) => Some(*seconds),
+        _ => None,
+    }
 }
 
-/// Every remembered place: file key to (seconds, video length if known).
-pub fn resume_positions() -> BTreeMap<String, (f64, Option<f64>)> {
+/// Progress of every remembered video, by file key (one read of a small file,
+/// for marking a whole folder).
+pub fn places() -> BTreeMap<String, Place> {
     read_json::<BTreeMap<String, Resume>>("resume.json")
-        .map(|all| {
-            all.into_iter()
-                .map(|(k, r)| (k, (r.seconds, r.duration)))
-                .collect()
-        })
+        .map(|all| all.into_iter().map(|(k, r)| (k, r.place())).collect())
         .unwrap_or_default()
 }
 
-/// Remembers (or with `None`, forgets) where a file was left, with the
-/// video's length when known (so the browser can show how much was watched).
-pub fn save_resume_position(key: &str, point: Option<(f64, Option<f64>)>) -> anyhow::Result<()> {
+/// Remembers (or with `None`, forgets) a video's progress.
+pub fn save_resume_position(key: &str, place: Option<Place>) -> anyhow::Result<()> {
+    update_place(key, |_| place)
+}
+
+/// Records a video stopped at `position`: where to continue, or watched.
+pub fn save_stop(key: &str, position: f64, duration: f64) -> anyhow::Result<()> {
+    update_place(key, |previous| stop_place(position, duration, previous))
+}
+
+/// Forgets or sets the progress of `key`, from what is saved now.
+fn update_place(key: &str, f: impl FnOnce(Option<Place>) -> Option<Place>) -> anyhow::Result<()> {
     let _guard = RESUME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut all: BTreeMap<String, Resume> = read_json("resume.json")?;
-    match point {
-        Some((seconds, duration)) => {
+    let previous = all.get(key).map(Resume::place);
+    match f(previous) {
+        Some(Place::Watched) if previous == Some(Place::Watched) => return Ok(()),
+        Some(place) => {
             let saved = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs());
-            let duration = duration.filter(|d| *d > 0.0);
+            let (seconds, duration, watched) = match place {
+                Place::Resume(seconds, duration) => (seconds, duration.filter(|d| *d > 0.0), false),
+                Place::Watched => (0.0, None, true),
+            };
             all.insert(
                 key.to_string(),
                 Resume {
                     seconds,
                     saved,
                     duration,
+                    watched,
                 },
             );
             while all.len() > MAX_RESUMES {
@@ -253,8 +289,20 @@ pub fn save_resume_position(key: &str, point: Option<(f64, Option<f64>)>) -> any
     write_json("resume.json", &all, false)
 }
 
+/// What to remember for a video stopped at `position`. A watched video that is
+/// only opened briefly stays watched.
+pub fn stop_place(position: f64, duration: f64, previous: Option<Place>) -> Option<Place> {
+    if let Some(seconds) = resume_point(position, duration) {
+        return Some(Place::Resume(seconds, Some(duration).filter(|d| *d > 0.0)));
+    }
+    if position >= 10.0 {
+        return Some(Place::Watched); // past the point worth resuming: near the end
+    }
+    (previous == Some(Place::Watched)).then_some(Place::Watched)
+}
+
 pub fn move_resume_position(from: &str, to: &str) -> anyhow::Result<()> {
-    if let Some(point) = resume_positions().remove(from) {
+    if let Some(point) = places().remove(from) {
         save_resume_position(from, None)?;
         save_resume_position(to, Some(point))?;
     }
@@ -693,6 +741,28 @@ mod tests {
     }
 
     #[test]
+    fn stopping_near_the_end_marks_watched() {
+        let (d, none) = (3600.0, None);
+        let part = |s| Some(Place::Resume(s, Some(d)));
+        assert_eq!(stop_place(5.0, d, none), None);
+        assert_eq!(stop_place(754.0, d, none), part(754.0));
+        assert_eq!(stop_place(3590.0, d, none), Some(Place::Watched));
+        assert_eq!(stop_place(3500.0, d, none), Some(Place::Watched)); // past 95%
+        assert_eq!(
+            stop_place(600.0, 0.0, none),
+            Some(Place::Resume(600.0, None))
+        );
+        // A watched video peeked at for a moment stays watched; a resume point is dropped.
+        assert_eq!(
+            stop_place(2.0, d, Some(Place::Watched)),
+            Some(Place::Watched)
+        );
+        assert_eq!(stop_place(2.0, d, part(900.0)), None);
+        // Watching it again part way replaces the mark.
+        assert_eq!(stop_place(600.0, d, Some(Place::Watched)), part(600.0));
+    }
+
+    #[test]
     fn resume_skips_start_and_end() {
         assert_eq!(resume_point(5.0, 3600.0), None);
         assert_eq!(resume_point(600.0, 3600.0), Some(600.0));
@@ -734,12 +804,23 @@ mod tests {
             Some(l)
         );
         assert_eq!(resume_position(key), None);
-        save_resume_position(key, Some((754.0, Some(5400.0)))).unwrap();
+        save_resume_position(key, Some(Place::Resume(754.0, Some(5400.0)))).unwrap();
         move_resume_position(key, "smb://alice@192.168.1.10/media/VR/renamed.mp4").unwrap();
         assert_eq!(resume_position(key), None);
         assert_eq!(
             resume_position("smb://alice@192.168.1.10/media/VR/renamed.mp4"),
             Some(754.0)
+        );
+        let done = "smb://alice@192.168.1.10/media/VR/done.mp4";
+        save_stop(done, 3590.0, 3600.0).unwrap();
+        assert_eq!(places().get(done), Some(&Place::Watched));
+        assert_eq!(resume_position(done), None);
+        save_stop(done, 3.0, 3600.0).unwrap();
+        assert_eq!(places().get(done), Some(&Place::Watched));
+        save_stop(done, 900.0, 3600.0).unwrap();
+        assert_eq!(
+            places().get(done),
+            Some(&Place::Resume(900.0, Some(3600.0)))
         );
         assert!(remove_server("PC").unwrap());
         assert!(servers().unwrap().is_empty());
