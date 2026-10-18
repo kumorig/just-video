@@ -201,6 +201,46 @@ impl Canvas {
         );
     }
 
+    /// A ring: the band between `radius - thickness` and `radius`, with the
+    /// same half-pixel anti-aliasing as [`Canvas::circle`].
+    pub fn ring(&mut self, cx: f32, cy: f32, radius: f32, thickness: f32, color: Rgb) {
+        let inner = radius - thickness;
+        self.shape(cx, cy, radius, color, |dist, _| {
+            let outer = (0.5 - (dist - radius)).clamp(0.0, 1.0);
+            let hole = (0.5 - (dist - inner)).clamp(0.0, 1.0);
+            outer - hole
+        });
+    }
+
+    /// The left half of a disc, cut straight through its centre.
+    pub fn half_disc(&mut self, cx: f32, cy: f32, radius: f32, color: Rgb) {
+        self.shape(cx, cy, radius, color, |dist, dx| {
+            let disc = (0.5 - (dist - radius)).clamp(0.0, 1.0);
+            disc * (0.5 - dx).clamp(0.0, 1.0)
+        });
+    }
+
+    /// Blends `color` over the pixels around a centre, at the coverage
+    /// `cover(distance from the centre, x offset from it)` gives.
+    fn shape(
+        &mut self,
+        cx: f32,
+        cy: f32,
+        radius: f32,
+        color: Rgb,
+        cover: impl Fn(f32, f32) -> f32,
+    ) {
+        let reach = radius.ceil() as i32 + 1;
+        let (x0, y0) = (cx.floor() as i32 - reach, cy.floor() as i32 - reach);
+        for py in y0..y0 + 2 * reach + 2 {
+            for px in x0..x0 + 2 * reach + 2 {
+                let (dx, dy) = (px as f32 + 0.5 - cx, py as f32 + 0.5 - cy);
+                let alpha = cover((dx * dx + dy * dy).sqrt(), dx);
+                self.blend(px, py, color, alpha);
+            }
+        }
+    }
+
     /// Copies another canvas to (x, y) (no scaling).
     pub fn blit(&mut self, src: &Canvas, x: i32, y: i32) {
         for sy in 0..src.height as i32 {

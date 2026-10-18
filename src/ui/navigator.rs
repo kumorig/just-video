@@ -10,7 +10,7 @@
 //! settings. Without it, holding an entry still selects it (for Start over)
 //! but offers no Delete, Move or Rename, and a notice says where to allow them.
 
-use super::browser::{Action, Dialog, Hit, Icon, Row, Tool, View, format_size};
+use super::browser::{Action, Dialog, Hit, Icon, Row, Tool, View, Watch, format_size};
 use super::controls::format_time;
 use super::form::{self, Field, Form, Key};
 use crate::config::{self, Place, Server};
@@ -885,6 +885,12 @@ impl Navigator {
                             (None, None) => with_progress("Checking…", *resume),
                         },
                         right: format_size(*size),
+                        watch: match (broken, resume) {
+                            (Some(_), _) => None,
+                            (None, None) => Some(Watch::Unwatched),
+                            (None, Some(Place::Resume(..))) => Some(Watch::Partial),
+                            (None, Some(Place::Watched)) => Some(Watch::Watched),
+                        },
                         progress: match resume {
                             Some(Place::Resume(at, Some(length))) if *length > 0.0 => {
                                 Some((at / length) as f32)
@@ -2696,6 +2702,45 @@ mod tests {
         let key = crate::library::file_key(&server, "s", &vec!["clip.mp4".to_string()]);
         nav.note_resume(&key, Some(Place::Resume(1200.0, Some(2400.0))));
         assert_eq!(nav.view().rows[1].progress, Some(0.5));
+    }
+
+    #[test]
+    fn rows_carry_a_watched_mark_for_every_readable_video() {
+        let mut nav = Navigator::new(Library::start(None));
+        let server = Server {
+            name: "NAS".into(),
+            url: "smb://u@nas".into(),
+            writable: false,
+        };
+        nav.show_entries_for_test(server, &["dir"]);
+        let video = |name: &str, broken: Option<&str>, resume| Item::Video {
+            name: name.into(),
+            size: 1,
+            modified: 0,
+            assessment: None,
+            layout: None,
+            broken: broken.map(Into::into),
+            resume,
+        };
+        nav.items.extend([
+            video("new.mp4", None, None),
+            video("half.mp4", None, Some(Place::Resume(60.0, Some(600.0)))),
+            video("done.mp4", None, Some(Place::Watched)),
+            video("bad.mp4", Some("bad"), None),
+        ]);
+        nav.rebuild_rows();
+        let marks: Vec<_> = nav.view().rows.iter().map(|r| r.watch).collect();
+        assert_eq!(
+            marks,
+            [
+                None,
+                Some(Watch::Unwatched),
+                Some(Watch::Partial),
+                Some(Watch::Watched),
+                None
+            ],
+            "folder, new, half, done, unreadable"
+        );
     }
 
     #[test]

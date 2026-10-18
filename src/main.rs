@@ -1187,7 +1187,7 @@ fn main() -> anyhow::Result<()> {
             }))?;
         }
         Command::UiPreview { dir } => {
-            use just_video::ui::browser::{Dialog, Icon, Row, Tool, View, render};
+            use just_video::ui::browser::{Dialog, Icon, Row, Tool, View, Watch, render};
             use just_video::ui::form::{Field, Form};
             let mut fonts = just_video::ui::canvas::Fonts::load()?;
             std::fs::create_dir_all(&dir)?;
@@ -1329,6 +1329,18 @@ fn main() -> anyhow::Result<()> {
                 ],
                 ..Default::default()
             };
+            // The watched marks: a filled circle, a half-filled ring (left part
+            // way: its progress line too) and an empty ring.
+            let mut videos = videos;
+            for (i, row) in videos.rows.iter_mut().enumerate() {
+                row.watch = Some([Watch::Unwatched, Watch::Partial, Watch::Watched][i % 3]);
+                if row.watch == Some(Watch::Partial) {
+                    row.progress = Some(0.35);
+                    row.detail = format!("Resume 21:04 · {}", row.detail);
+                } else if row.watch == Some(Watch::Watched) {
+                    row.detail = format!("Watched · {}", row.detail);
+                }
+            }
             just_video::ui::save_png(
                 &render(&videos, &mut fonts, Some((700.0, 310.0)), true),
                 &dir.join("videos.png"),
