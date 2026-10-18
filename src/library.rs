@@ -1049,6 +1049,8 @@ struct ThumbPending {
     video: ThumbVideo,
     /// Looked up in the disk cache already.
     checked: bool,
+    /// A maker thread is working on it.
+    busy: bool,
 }
 
 impl ThumbQueue {
@@ -1106,6 +1108,7 @@ impl ThumbQueue {
             None => self.pending.push(ThumbPending {
                 video,
                 checked: false,
+                busy: false,
             }),
         }
     }
@@ -1120,6 +1123,7 @@ impl ThumbQueue {
     /// in the disk cache (`unchecked`) or all.
     fn soonest(&self, unchecked: bool) -> Option<usize> {
         (0..self.pending.len())
+            .filter(|&i| !self.pending[i].busy)
             .filter(|&i| !unchecked || !self.pending[i].checked)
             .min_by_key(|&i| self.rank(&self.pending[i].video))
     }
@@ -1156,19 +1160,27 @@ const THUMB_IN_FLIGHT: usize = 3;
 /// How far into the video the picture is taken.
 const THUMB_AT: f64 = 0.10;
 
+/// One thumbnail to make, with the folder it belongs to.
+struct ThumbJob {
+    video: ThumbVideo,
+    key: String,
+    server: Server,
+    share: String,
+    folder: Path,
+    generation: u64,
+}
+
 /// Makes one thumbnail. `Ok(None)` when it stopped, for playback or because
 /// the folder was left; the job is then queued again.
 fn make_thumbnail(
-    video: &ThumbVideo,
-    queue: &ThumbQueue,
+    job: &ThumbJob,
     sessions: &Sessions,
     opening: &Arc<AtomicU64>,
     current: &Arc<AtomicU64>,
 ) -> Result<Option<crate::media::Thumb>, String> {
-    let (Some(server), Some((_, share, folder))) = (&queue.server, &queue.folder) else {
-        return Ok(None);
-    };
-    let generation = queue.generation;
+    let video = &job.video;
+    let (server, share, folder) = (&job.server, &job.share, &job.folder);
+    let generation = job.generation;
     let mut path = folder.clone();
     path.push(video.name.clone());
     let stop = || video_busy(opening) || current.load(Ordering::Relaxed) != generation;
@@ -1237,9 +1249,19 @@ fn make_thumbnail(
     result
 }
 
+/// Thumbnails made at once (each is mostly waiting for the network).
+const THUMB_WORKERS: usize = 3;
+
+/// What a maker thread reports back.
+struct ThumbDone {
+    job: ThumbJob,
+    result: Result<Option<crate::media::Thumb>, String>,
+    started: std::time::Instant,
+}
+
 /// The thumbnail worker: serves disk cache hits as soon as they are asked
-/// for (a small local read), and makes the others one at a time, only while
-/// no probe is pending and no video is opening or playing.
+/// for (a small local read), and has maker threads make the others, only
+/// while no probe is pending and no video is opening or playing.
 fn thumbnail_worker(
     requests: mpsc::Receiver<Request>,
     sessions: Sessions,
@@ -1253,10 +1275,46 @@ fn thumbnail_worker(
     if let Some(cache) = &cache {
         cache.prune_old();
     }
+    let workers = std::env::var("JUST_VIDEO_THUMB_WORKERS")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(THUMB_WORKERS)
+        .max(1);
+    let (jobs_tx, jobs_rx) = mpsc::channel::<ThumbJob>();
+    let jobs_rx = Arc::new(Mutex::new(jobs_rx));
+    let (done_tx, done_rx) = mpsc::channel::<ThumbDone>();
+    for n in 0..workers {
+        let (jobs, done) = (jobs_rx.clone(), done_tx.clone());
+        let (sessions, opening, current) = (sessions.clone(), opening.clone(), current.clone());
+        std::thread::Builder::new()
+            .name(format!("thumbnail-{n}"))
+            .spawn(move || {
+                lower_priority();
+                loop {
+                    let Ok(job) = jobs.lock().expect("thumbnail jobs").recv() else {
+                        return;
+                    };
+                    let started = std::time::Instant::now();
+                    let result = make_thumbnail(&job, &sessions, &opening, &current);
+                    if done
+                        .send(ThumbDone {
+                            job,
+                            result,
+                            started,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            })
+            .expect("spawn thumbnail maker");
+    }
+    let mut in_flight = 0usize;
     let mut queue = ThumbQueue::default();
-    let send = |queue: &ThumbQueue, name: String, image: crate::media::Thumb| {
+    let send = |generation: u64, name: String, image: crate::media::Thumb| {
         out.send(Response::Thumbnail {
-            generation: queue.generation,
+            generation,
             name,
             image: Arc::new(image),
         })
@@ -1273,6 +1331,57 @@ fn thumbnail_worker(
         }
         if queue.generation != current.load(Ordering::Relaxed) {
             queue.clear();
+        }
+        // Finished makes.
+        while let Ok(ThumbDone {
+            job,
+            result,
+            started,
+        }) = done_rx.try_recv()
+        {
+            in_flight -= 1;
+            let name = job.video.name.clone();
+            // The queue moved on to another folder meanwhile: drop it.
+            let position = (job.generation == queue.generation)
+                .then(|| queue.pending.iter().position(|p| p.video.name == name))
+                .flatten();
+            let Some(position) = position else {
+                continue;
+            };
+            match result {
+                Ok(Some(image)) => {
+                    queue.finish(position);
+                    if let Some(cache) = &mut cache {
+                        cache.store(&job.key, &image);
+                    }
+                    if current.load(Ordering::Relaxed) == job.generation
+                        && !send(job.generation, name.clone(), image)
+                    {
+                        return;
+                    }
+                    eprintln!(
+                        "Thumbnails: {name} in {:.0} ms",
+                        started.elapsed().as_secs_f64() * 1e3
+                    );
+                }
+                // Stopped for a video (or the folder was left): the job stays
+                // queued, and runs again once it is quiet (a left folder's
+                // queue is dropped at the top of the loop).
+                Ok(None) => {
+                    queue.pending[position].busy = false;
+                    let stale = queue.generation != current.load(Ordering::Relaxed);
+                    if stale {
+                        eprintln!("Thumbnails: {name} stopped, folder left");
+                    } else {
+                        eprintln!("Thumbnails: {name} paused for playback");
+                    }
+                }
+                Err(e) => {
+                    // A bad file keeps its icon; never retried in this folder.
+                    eprintln!("Thumbnails: {name} failed: {e}");
+                    queue.finish(position);
+                }
+            }
         }
         let key_of = |queue: &ThumbQueue, video: &ThumbVideo| {
             let (Some(server), Some((_, share, folder))) = (&queue.server, &queue.folder) else {
@@ -1292,8 +1401,9 @@ fn thumbnail_worker(
             let key = key_of(&queue, &queue.pending[position].video);
             match cache.as_ref().and_then(|c| c.load(&key)) {
                 Some(image) => {
+                    let generation = queue.generation;
                     let video = queue.finish(position);
-                    if !send(&queue, video.name, image) {
+                    if !send(generation, video.name, image) {
                         return;
                     }
                 }
@@ -1302,59 +1412,43 @@ fn thumbnail_worker(
             continue;
         }
         let waiting = queued.load(Ordering::SeqCst) > 0 || video_busy(&opening);
-        let Some(position) = queue.soonest(false).filter(|_| !waiting) else {
+        let next = queue
+            .soonest(false)
+            .filter(|_| !waiting && in_flight < workers);
+        let Some(position) = next else {
             // Nothing to make (or not now): wait for a request, or look again.
-            let request = if queue.pending.is_empty() {
-                requests.recv().map_err(|_| ())
-            } else {
-                match requests.recv_timeout(std::time::Duration::from_millis(100)) {
-                    Ok(request) => Ok(request),
-                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => Err(()),
+            if queue.pending.is_empty() && in_flight == 0 {
+                match requests.recv() {
+                    Ok(request) => queue.apply(request, current.load(Ordering::Relaxed)),
+                    Err(_) => return,
                 }
-            };
-            match request {
-                Ok(request) => queue.apply(request, current.load(Ordering::Relaxed)),
-                Err(()) => return,
+            } else {
+                let wait = if in_flight > 0 { 10 } else { 100 };
+                match requests.recv_timeout(std::time::Duration::from_millis(wait)) {
+                    Ok(request) => queue.apply(request, current.load(Ordering::Relaxed)),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                }
             }
             continue;
         };
-        let key = key_of(&queue, &queue.pending[position].video);
+        let (Some(server), Some((_, share, folder))) = (&queue.server, &queue.folder) else {
+            queue.pending[position].checked = true;
+            continue;
+        };
         let video = queue.pending[position].video.clone();
-        let started = std::time::Instant::now();
-        match make_thumbnail(&video, &queue, &sessions, &opening, &current) {
-            Ok(Some(image)) => {
-                queue.finish(position);
-                if let Some(cache) = &mut cache {
-                    cache.store(&key, &image);
-                }
-                if current.load(Ordering::Relaxed) == queue.generation
-                    && !send(&queue, video.name.clone(), image)
-                {
-                    return;
-                }
-                eprintln!(
-                    "Thumbnails: {} in {:.0} ms",
-                    video.name,
-                    started.elapsed().as_secs_f64() * 1e3
-                );
-            }
-            // Stopped for a video (or the folder was left): the job stays
-            // queued, and runs again once it is quiet (a left folder's queue
-            // is dropped at the top of the loop).
-            Ok(None) => {
-                let stale = queue.generation != current.load(Ordering::Relaxed);
-                if stale {
-                    eprintln!("Thumbnails: {} stopped, folder left", video.name);
-                } else {
-                    eprintln!("Thumbnails: {} paused for playback", video.name);
-                }
-            }
-            Err(e) => {
-                // A bad file keeps its icon; never retried in this folder.
-                eprintln!("Thumbnails: {} failed: {e}", video.name);
-                queue.finish(position);
-            }
+        let job = ThumbJob {
+            key: key_of(&queue, &video),
+            video,
+            server: server.clone(),
+            share: share.clone(),
+            folder: folder.clone(),
+            generation: queue.generation,
+        };
+        queue.pending[position].busy = true;
+        in_flight += 1;
+        if jobs_tx.send(job).is_err() {
+            return;
         }
     }
 }
