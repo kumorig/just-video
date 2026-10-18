@@ -24,6 +24,15 @@ records each finished item with what was done and why.
 - After changing a patch, rebuild the media libs; the FFmpeg source is
   patched only when first unpacked.
 
+## Branches and pull requests
+
+- Main takes merged pull requests only: a GitHub ruleset refuses direct
+  pushes, force pushes and deletion, and a local pre-commit hook refuses
+  commits on main. Work on a `pr/<topic>` branch, push it, open a PR with
+  `gh pr create`, then merge with
+  `gh pr merge <n> --merge --subject 'Merge PR #<n>: <title>'`
+  and `git pull` main. One PR per change, for traceability.
+
 ## Deploy and SSH
 
 - `bash scripts/install-frame.sh` copies the binary, launcher and Steam art to
