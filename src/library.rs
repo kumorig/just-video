@@ -8,8 +8,9 @@
 
 use crate::config::{self, LayoutOverride, Server};
 use crate::local;
-use crate::media::{Media, VideoDecoder};
+use crate::media::{Media, VideoDecoder, VideoInfo};
 use crate::playability::{self, Assessment, Platform};
+use crate::probe_cache::ProbeCache;
 use crate::readahead::ReadAhead;
 use crate::smb::{Entry, SmbSession, SmbUrl};
 use crate::thumb_cache::{self, THUMB_H, THUMB_W, ThumbCache};
@@ -89,6 +90,10 @@ pub enum Request {
         server: Server,
         share: String,
         path: Path,
+        /// From the folder listing: with the path, what the probe cache
+        /// knows the file by (a file that changed is read again).
+        size: u64,
+        modified: u64,
     },
     /// Makes list thumbnails for a folder's videos, nearest `first_visible`
     /// first, on a low-priority worker that waits for probes and playback.
@@ -329,17 +334,46 @@ fn parse_subtitles(bytes: &[u8]) -> anyhow::Result<Vec<crate::subtitles::Cue>> {
     Ok(cues)
 }
 
-/// Judges how well the file at `path` will play, from its headers, and
-/// detects its layout (a format the user picked for it wins).
-fn probe(
-    server: &Server,
-    share: &str,
+/// What the headers of the file at `path` say about its video.
+fn probe_info(
     path: &Path,
     reader: impl crate::media::Source + 'static,
-) -> Result<Probed, String> {
+) -> Result<Option<VideoInfo>, String> {
     let name = path.last().map_or("", String::as_str);
     let media = Media::open(name, reader).map_err(|e| crate::smb::explain(&e))?;
-    let video = media.info().video.as_ref();
+    Ok(media.info().video.clone())
+}
+
+/// The answer to a probe request that the cache can give without connecting.
+fn answer_from_cache(request: &Request, cache: Option<&mut ProbeCache>) -> Option<Response> {
+    let Request::Probe {
+        generation,
+        server,
+        share,
+        path,
+        size,
+        modified,
+    } = request
+    else {
+        return None;
+    };
+    let video = cache?.get(&file_key(server, share, path), *size, *modified)?;
+    let result = Ok(probed(server, share, path, video.as_ref()));
+    Some(probe_response(*generation, path, result))
+}
+
+fn probe_response(generation: u64, path: &Path, result: Result<Probed, String>) -> Response {
+    Response::Probe {
+        generation,
+        name: path.last().cloned().unwrap_or_default(),
+        result,
+    }
+}
+
+/// How a folder marks the video at `path`, from what its header says (a
+/// layout the user picked for it wins).
+fn probed(server: &Server, share: &str, path: &Path, video: Option<&VideoInfo>) -> Probed {
+    let name = path.last().map_or("", String::as_str);
     let mut layout = vr::detect(name, video);
     if let Some(saved) = config::layout_override(&file_key(server, share, path))
         .ok()
@@ -347,10 +381,10 @@ fn probe(
     {
         saved.apply(&mut layout);
     }
-    Ok(Probed {
+    Probed {
         assessment: playability::assess(Platform::current(), video),
         layout,
-    })
+    }
 }
 
 /// Opens the video at `path` for playback, with its saved layout, picture
@@ -654,7 +688,21 @@ fn smb_path(path: &Path) -> String {
     path.join("\\")
 }
 
-fn handle(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
+/// Counts a probe as done; the last one queued keeps what the run found.
+fn probe_done(queued: &AtomicU64, cache: &mut Option<ProbeCache>) {
+    if queued.fetch_sub(1, Ordering::SeqCst) == 1
+        && let Some(cache) = cache
+    {
+        cache.save();
+    }
+}
+
+fn handle(
+    request: Request,
+    sessions: &Sessions,
+    cache: Option<&mut ProbeCache>,
+    hw: Option<&str>,
+) -> Response {
     let started = std::time::Instant::now();
     let (server, what) = match &request {
         Request::Shares { server, .. } => (server.clone(), "shares"),
@@ -673,7 +721,7 @@ fn handle(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
     let response = if local::is_local(&server) {
         run_local(request, hw)
     } else {
-        run(request, sessions, hw)
+        run(request, sessions, cache, hw)
     };
     let failure = match &response {
         Response::Shares { result: Err(e), .. }
@@ -718,7 +766,12 @@ fn handle(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
     response
 }
 
-fn run(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
+fn run(
+    request: Request,
+    sessions: &Sessions,
+    cache: Option<&mut ProbeCache>,
+    hw: Option<&str>,
+) -> Response {
     let err = |e: anyhow::Error| crate::smb::explain(&e);
     match request {
         Request::Shares { id, server } => Response::Shares {
@@ -748,6 +801,8 @@ fn run(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
             server,
             share,
             path,
+            size,
+            modified,
         } => {
             // Header probes read little: small blocks, shallow read-ahead.
             let probe = ReadAhead {
@@ -757,13 +812,17 @@ fn run(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
             };
             let result = with_session(sessions, &server, Purpose::Probe, |s| {
                 let reader = s.open_in(&share, &smb_path(&path), probe).map_err(err)?;
-                self::probe(&server, &share, &path, reader)
+                probe_info(&path, reader)
             });
-            Response::Probe {
-                generation,
-                name: path.last().cloned().unwrap_or_default(),
-                result,
-            }
+            // Facts are kept, never errors: a broken read may work next time.
+            let result = result.map(|video| {
+                let marks = probed(&server, &share, &path, video.as_ref());
+                if let Some(cache) = cache {
+                    cache.insert(file_key(&server, &share, &path), size, modified, video);
+                }
+                marks
+            });
+            probe_response(generation, &path, result)
         }
         Request::Open {
             id,
@@ -896,13 +955,14 @@ fn run_local(request: Request, hw: Option<&str>) -> Response {
             server,
             share,
             path,
-        } => Response::Probe {
-            generation,
-            name: path.last().cloned().unwrap_or_default(),
-            result: local::open(&share, &path)
+            ..
+        } => {
+            let result = local::open(&share, &path)
                 .map_err(err)
-                .and_then(|reader| probe(&server, &share, &path, reader)),
-        },
+                .and_then(|reader| probe_info(&path, reader))
+                .map(|video| probed(&server, &share, &path, video.as_ref()));
+            probe_response(generation, &path, result)
+        }
         Request::Open {
             id,
             server,
@@ -1491,7 +1551,7 @@ impl Library {
         let queued = Arc::new(AtomicU64::new(0));
         let (response_tx, responses) = mpsc::channel();
         let mut senders = Vec::new();
-        for name in ["library", "probe"] {
+        for (name, keeps_cache) in [("library", false), ("probe", true)] {
             let (tx, rx) = mpsc::channel::<Request>();
             let (sessions, out) = (sessions.clone(), response_tx.clone());
             let current = probe_generation.clone();
@@ -1499,24 +1559,31 @@ impl Library {
             std::thread::Builder::new()
                 .name(name.into())
                 .spawn(move || {
+                    // What probes found out, kept across runs; only the probe
+                    // worker uses it. Loaded here: the file can be a few MB.
+                    let mut cache = keeps_cache.then(ProbeCache::load);
                     for request in rx {
                         let probe = matches!(request, Request::Probe { .. });
-                        if let Request::Probe { generation, .. } = &request
+                        let cached = answer_from_cache(&request, cache.as_mut());
+                        if cached.is_none()
+                            && let Request::Probe { generation, .. } = &request
                             && !wait_for_quiet(&current, *generation, &opening)
                         {
-                            queued.fetch_sub(1, Ordering::SeqCst);
+                            probe_done(&queued, &mut cache);
                             continue;
                         }
                         let open = matches!(request, Request::Open { .. });
                         if open {
                             opening.fetch_add(1, Ordering::SeqCst);
                         }
-                        let response = handle(request, &sessions, hw);
+                        let response = cached
+                            .unwrap_or_else(|| handle(request, &sessions, cache.as_mut(), hw));
                         if open {
                             opening.fetch_sub(1, Ordering::SeqCst);
                         }
+                        // When the queue empties, keep what it found.
                         if probe {
-                            queued.fetch_sub(1, Ordering::SeqCst);
+                            probe_done(&queued, &mut cache);
                         }
                         if out.send(response).is_err() {
                             return;
@@ -1730,6 +1797,40 @@ mod tests {
     }
 
     #[test]
+    fn a_probe_is_answered_from_the_cache_unless_the_file_changed() {
+        let server = Server {
+            name: "nas".into(),
+            url: "smb://me@nas".into(),
+            writable: false,
+        };
+        let path: Path = vec!["vr".into(), "a.mp4".into()];
+        let probe = |size, modified| Request::Probe {
+            generation: 3,
+            server: server.clone(),
+            share: "media".into(),
+            path: path.clone(),
+            size,
+            modified,
+        };
+        let mut cache = ProbeCache::default();
+        assert!(answer_from_cache(&probe(100, 7), Some(&mut cache)).is_none());
+        cache.insert(file_key(&server, "media", &path), 100, 7, None);
+        let Some(Response::Probe {
+            generation,
+            name,
+            result,
+        }) = answer_from_cache(&probe(100, 7), Some(&mut cache))
+        else {
+            panic!("not answered from the cache");
+        };
+        assert_eq!((generation, name.as_str()), (3, "a.mp4"));
+        assert!(result.is_ok());
+        // A file rewritten since is read again.
+        assert!(answer_from_cache(&probe(101, 7), Some(&mut cache)).is_none());
+        assert!(answer_from_cache(&probe(100, 8), Some(&mut cache)).is_none());
+    }
+
+    #[test]
     fn probes_are_counted_until_the_worker_takes_them() {
         let (library, requests, _responses) = Library::for_test();
         let server = Server {
@@ -1742,6 +1843,8 @@ mod tests {
             server: server.clone(),
             share: "media".into(),
             path: vec!["a.mp4".into()],
+            size: 1,
+            modified: 1,
         });
         library.send(Request::Shares { id: 1, server });
         assert_eq!(library.queued.load(Ordering::SeqCst), 1, "only probes");

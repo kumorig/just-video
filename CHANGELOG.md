@@ -28,3 +28,4 @@
 - Optional autoplay of the next video.
 - Optional A-B loop button.
 - Tips for hold-to-edit, with Tips and Reset tips in Settings.
+- Folders seen before are marked at once: what each video's header said is remembered across runs.

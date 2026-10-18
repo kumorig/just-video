@@ -1092,9 +1092,10 @@ impl Navigator {
                 self.dirty = true;
             }
         }
-        // Thumbnails arriving together (a cached folder's come all at once)
-        // make one rebuild.
+        // Marks and thumbnails arriving together (a cached folder's come all
+        // at once) make one rebuild.
         let mut thumbnails = false;
+        let mut marked = false;
         while let Some(response) = self.library.try_recv() {
             match response {
                 Response::Shares { id, result } if Some(id) == self.pending => {
@@ -1152,7 +1153,13 @@ impl Navigator {
                                 .collect();
                             let mut sent = 0;
                             for item in &self.items {
-                                if let Item::Video { name, .. } = item {
+                                if let Item::Video {
+                                    name,
+                                    size,
+                                    modified,
+                                    ..
+                                } = item
+                                {
                                     let mut file = path.clone();
                                     file.push(name.clone());
                                     self.library.send(Request::Probe {
@@ -1160,6 +1167,8 @@ impl Navigator {
                                         server: server.clone(),
                                         share: share.clone(),
                                         path: file,
+                                        size: *size,
+                                        modified: *modified,
                                     });
                                     sent += 1;
                                 }
@@ -1206,10 +1215,7 @@ impl Navigator {
                             }
                         }
                     }
-                    self.rebuild_rows();
-                    // The layout decides the crop, so a video is handed to
-                    // the thumbnail worker once its mark has landed.
-                    self.request_thumbnails();
+                    marked = true;
                 }
                 Response::Thumbnail {
                     generation,
@@ -1237,6 +1243,9 @@ impl Navigator {
                                 Some((opened.server.clone(), opened.share.clone()));
                             self.subtitle_request = None;
                             self.subtitle_result = None;
+                            if marked {
+                                self.rebuild_rows();
+                            }
                             return Some(opened);
                         }
                         Err(e) => self.dialog("Can't open this video", vec![e]),
@@ -1298,8 +1307,13 @@ impl Navigator {
                 _ => {} // stale response for a place we already left
             }
         }
-        if thumbnails {
+        if marked || thumbnails {
             self.rebuild_rows();
+        }
+        if marked {
+            // The layout decides the crop, so a video is handed to the
+            // thumbnail worker once its mark has landed.
+            self.request_thumbnails();
         }
         None
     }

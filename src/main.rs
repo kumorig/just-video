@@ -555,7 +555,7 @@ fn bench_thumbnails(a: BenchThumbnailsArgs) -> anyhow::Result<()> {
     };
     anyhow::ensure!(!listed.is_empty(), "No videos");
     library.set_probe_generation(0);
-    for (name, _, _) in &listed {
+    for (name, size, modified) in &listed {
         let mut file = path.clone();
         file.push(name.clone());
         library.send(Request::Probe {
@@ -563,6 +563,8 @@ fn bench_thumbnails(a: BenchThumbnailsArgs) -> anyhow::Result<()> {
             server: server.clone(),
             share: a.share.clone(),
             path: file,
+            size: *size,
+            modified: *modified,
         });
     }
     let started = Instant::now();
@@ -972,18 +974,18 @@ fn main() -> anyhow::Result<()> {
             let Response::List { result, .. } = wait("list")? else {
                 anyhow::bail!("unexpected")
             };
-            let videos: Vec<String> = result
+            let videos: Vec<(String, u64, u64)> = result
                 .map_err(anyhow::Error::msg)?
                 .into_iter()
                 .filter(|e| !e.is_dir && just_video::ui::navigator::is_video(&e.name))
-                .map(|e| e.name)
+                .map(|e| (e.name, e.size, e.modified))
                 .collect();
             anyhow::ensure!(!videos.is_empty(), "No videos in that folder");
             for round in 0..rounds {
-                let name = &videos[round % videos.len()];
+                let name = &videos[round % videos.len()].0;
                 eprintln!("round {round}: {name}");
                 library.set_probe_generation(round as u64);
-                for v in &videos {
+                for (v, size, modified) in &videos {
                     let mut file = path.clone();
                     file.push(v.clone());
                     library.send(Request::Probe {
@@ -991,6 +993,8 @@ fn main() -> anyhow::Result<()> {
                         server: index.clone(),
                         share: share.clone(),
                         path: file,
+                        size: *size,
+                        modified: *modified,
                     });
                 }
                 let mut file = path.clone();
