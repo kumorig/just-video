@@ -3,6 +3,7 @@
 ## 0.2.0 (2026-10-20)
 
 - Equirectangular files with square eyes and no bounds are treated as VR180, not squished 360.
+- Install: wait for a newly added Steam entry before installing its library art.
 
 ## 0.1.0 (2026-10-18)
 
