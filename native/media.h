@@ -93,6 +93,11 @@ JVDecoder *jv_decoder_open(JVMedia *media, const char *hw_backend, int allow_sof
 // unsupported pixel format, other negative AVERROR on failure.
 int jv_decoder_next(JVDecoder *decoder, JVFrame *frame);
 int jv_decoder_seek(JVDecoder *decoder, double seconds);
+// Replaces the video codec context with a fresh one (audio and subtitles stay),
+// for a hardware session the driver refused to restart. Seek afterwards. The
+// stats tell which decoder came back (the CPU one if allowed and the hardware
+// one won't open). On failure the decoder returns errors until closed.
+int jv_decoder_reset_video(JVDecoder *decoder, JVDecodeStats *stats);
 // While catching up after a seek, skip non-reference frames of packets before
 // `seconds` (they would be discarded anyway); <= 0 turns it off. Ends by
 // itself once a packet reaches `seconds`. Hardware (V4L2) decoders ignore it.

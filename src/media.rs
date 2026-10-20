@@ -440,6 +440,7 @@ unsafe extern "C" {
     ) -> *mut RawDecoder;
     fn jv_decoder_next(decoder: *mut RawDecoder, frame: *mut RawFrame) -> c_int;
     fn jv_decoder_seek(decoder: *mut RawDecoder, seconds: f64) -> c_int;
+    fn jv_decoder_reset_video(decoder: *mut RawDecoder, stats: *mut RawStats) -> c_int;
     fn jv_decoder_skip_nonref_until(decoder: *mut RawDecoder, seconds: f64);
     fn jv_decoder_first_picture(decoder: *mut RawDecoder);
     fn jv_frame_release(handle: *mut c_void);
@@ -818,6 +819,41 @@ impl VideoDecoder {
             0 => Ok(()),
             code => bail!("Seek failed (FFmpeg error {code})"),
         }
+    }
+
+    /// Keeps `HARDWARE_DECODERS` in step with whether this decoder holds the hardware.
+    fn set_hardware(&mut self, hardware: bool) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if hardware && !self.hardware {
+            HARDWARE_DECODERS.fetch_add(1, SeqCst);
+        } else if !hardware && self.hardware {
+            HARDWARE_DECODERS.fetch_sub(1, SeqCst);
+        }
+        self.hardware = hardware;
+    }
+
+    /// Whether this decoder runs on the hardware (V4L2) decoder.
+    pub fn hardware(&self) -> bool {
+        self.hardware
+    }
+
+    /// Opens the video decoder again, for a hardware session the driver
+    /// refused to restart after a seek ("current session not supported").
+    /// Seek afterwards: the picture in flight is lost. Falls back to the CPU
+    /// if the hardware decoder won't open again.
+    pub fn reset(&mut self) -> anyhow::Result<()> {
+        let mut raw = std::mem::MaybeUninit::<RawStats>::zeroed();
+        let ret = unsafe { jv_decoder_reset_video(self.raw, raw.as_mut_ptr()) };
+        let s = unsafe { raw.assume_init() };
+        let hardware = ret >= 0 && optional(&s.hw_backend).is_some();
+        self.set_hardware(hardware);
+        if ret < 0 {
+            bail!("{}", text(&s.error));
+        }
+        self.stats.decoder = text(&s.decoder);
+        self.stats.hw_backend = optional(&s.hw_backend);
+        self.stats.note = optional(&s.note);
+        Ok(())
     }
 }
 
