@@ -495,6 +495,12 @@ void jv_decoder_close(JVDecoder *d) {
 // at 1080p. The decoder hands packets back as it parses them, so 6 keep it fed.
 #define OUTPUT_BUFFERS 6
 
+// Pictures of the hardware decoder still held by the application. Each one
+// keeps the V4L2 session it came from open (FFmpeg frees the device only with
+// the last buffer), so a decoder reopened while one is held runs beside its
+// own predecessor and the driver refuses the second session.
+static int live_frames;
+
 // Buffer counts for the V4L2 decoder. FFmpeg's default of 20 capture buffers
 // fails to allocate at 8K.
 static void set_v4l2_buffers(AVDictionary **options, const AVCodecParameters *par) {
@@ -503,19 +509,26 @@ static void set_v4l2_buffers(AVDictionary **options, const AVCodecParameters *pa
     av_dict_set_int(options, "num_output_buffers", OUTPUT_BUFFERS, 0);
 }
 
-JVDecoder *jv_decoder_open(JVMedia *media, const char *hw_backend, int allow_software,
-                           const char *decoder_options, JVDecodeStats *s) {
-    memset(s, 0, sizeof(*s));
-    JVDecoder *d = av_mallocz(sizeof(*d));
+// Builds the video codec context in `d` (any earlier one is freed first, so a
+// hardware session it held is gone before the next one asks for its share).
+// On failure `s->error` says why and `d->ctx` is NULL.
+static int open_video(JVDecoder *d, const char *hw_backend, int allow_software,
+                      const char *decoder_options, JVDecodeStats *s) {
+    JVMedia *media = d->media;
     AVDictionary *open_options = NULL;
     int ret = AVERROR(ENOMEM);
-    if (!d) goto fail;
-    d->media = media;
-    d->subtitle_stream = -1;
-    d->skip_until = AV_NOPTS_VALUE;
-    d->packet = av_packet_alloc();
-    d->transfer = av_frame_alloc();
-    if (!d->packet || !d->transfer) goto fail;
+    if (d->choice.hardware_wrapper) {
+        // Wait for the application to let go of earlier pictures (see live_frames).
+        int64_t began = av_gettime_relative();
+        int held;
+        while ((held = __atomic_load_n(&live_frames, __ATOMIC_SEQ_CST)) > 0 &&
+               av_gettime_relative() - began < 2000000)
+            av_usleep(5000);
+        if (held > 0)
+            av_log(NULL, AV_LOG_WARNING, "Pictures of the old hardware session are still held\n");
+    }
+    avcodec_free_context(&d->ctx);
+    av_buffer_unref(&d->device);
     d->choice = (FormatChoice){ AV_PIX_FMT_NONE, allow_software, 0 };
     if (media->video_stream < 0) { ret = AVERROR_STREAM_NOT_FOUND; set_error(s->error, sizeof(s->error), "Find video stream", ret); goto fail; }
     AVStream *video = media->format->streams[media->video_stream];
@@ -604,6 +617,7 @@ reopen:
         // Device missing, busy or its firmware recovering: never fail playback
         // over it when the CPU can decode instead.
         set_error(s->note, sizeof(s->note), "Hardware decoder failed to open", ret);
+        av_log(NULL, AV_LOG_ERROR, "Hardware decoder refused after retries; decoding on the CPU\n");
         d->choice.hardware_wrapper = 0;
         s->hw_backend[0] = '\0';
         av_dict_free(&open_options);
@@ -612,10 +626,29 @@ reopen:
     }
     if (ret < 0) { set_error(s->error, sizeof(s->error), "Open decoder", ret); goto fail; }
     av_dict_free(&open_options);
-    return d;
+    return 0;
 fail:
     if (!s->error[0]) set_error(s->error, sizeof(s->error), "Open decoder", ret);
     av_dict_free(&open_options);
+    avcodec_free_context(&d->ctx);
+    return ret;
+}
+
+JVDecoder *jv_decoder_open(JVMedia *media, const char *hw_backend, int allow_software,
+                           const char *decoder_options, JVDecodeStats *s) {
+    memset(s, 0, sizeof(*s));
+    JVDecoder *d = av_mallocz(sizeof(*d));
+    if (d) {
+        d->media = media;
+        d->subtitle_stream = -1;
+        d->skip_until = AV_NOPTS_VALUE;
+        d->packet = av_packet_alloc();
+        d->transfer = av_frame_alloc();
+        if (d->packet && d->transfer &&
+            open_video(d, hw_backend, allow_software, decoder_options, s) >= 0)
+            return d;
+    }
+    if (!s->error[0]) set_error(s->error, sizeof(s->error), "Open decoder", AVERROR(ENOMEM));
     jv_decoder_close(d);
     return NULL;
 }
@@ -645,6 +678,10 @@ static int describe_frame(JVDecoder *d, AVFrame *frame, JVFrame *out) {
     default: return AVERROR_PATCHWELCOME;
     }
     out->handle = frame;
+    if (d->choice.hardware_wrapper) {
+        frame->opaque = (void *)1;
+        __atomic_add_fetch(&live_frames, 1, __ATOMIC_SEQ_CST);
+    }
     out->width = frame->width;
     out->height = frame->height;
     out->plane_count = out->layout == JV_LAYOUT_PLANAR ? 3 : 2;
@@ -770,6 +807,7 @@ static int64_t take_earliest(JVDecoder *d) {
 #define HARDWARE_STALL_US 3000000
 
 int jv_decoder_next(JVDecoder *d, JVFrame *out) {
+    if (!d->ctx) return AVERROR(EIO);  // a failed jv_decoder_reset_video
     AVFrame *frame = av_frame_alloc();
     if (!frame) return AVERROR(ENOMEM);
     // Time spent waiting in the hardware decoder for a picture (reading and
@@ -858,6 +896,7 @@ int jv_decoder_next(JVDecoder *d, JVFrame *out) {
 
 void jv_frame_release(void *handle) {
     AVFrame *frame = handle;
+    if (frame->opaque) __atomic_sub_fetch(&live_frames, 1, __ATOMIC_SEQ_CST);
     av_frame_free(&frame);
 }
 
@@ -869,6 +908,7 @@ static int64_t video_ts(const JVDecoder *d, double seconds) {
 }
 
 int jv_decoder_seek(JVDecoder *d, double seconds) {
+    if (!d->ctx) return AVERROR(EIO);
     int ret = av_seek_frame(d->media->format, d->media->video_stream, video_ts(d, seconds),
                             AVSEEK_FLAG_BACKWARD);
     if (ret < 0) return ret;
@@ -900,13 +940,29 @@ int jv_decoder_seek(JVDecoder *d, double seconds) {
 }
 
 void jv_decoder_first_picture(JVDecoder *d) {
+    if (!d->ctx) return;
     d->one_shot = 1;
     d->ctx->skip_frame = AVDISCARD_NONKEY;
 }
 
 void jv_decoder_skip_nonref_until(JVDecoder *d, double seconds) {
+    if (!d->ctx) return;
     d->skip_until = seconds > 0 ? video_ts(d, seconds) : AV_NOPTS_VALUE;
     if (d->skip_until == AV_NOPTS_VALUE) d->ctx->skip_frame = AVDISCARD_DEFAULT;
+}
+
+int jv_decoder_reset_video(JVDecoder *d, JVDecodeStats *s) {
+    memset(s, 0, sizeof(*s));
+    if (d->packet_held) {
+        av_packet_unref(d->packet);
+        d->packet_held = 0;
+    }
+    d->stale = d->sent = d->received = 0;
+    d->pending_count = 0;
+    d->flushing = 0;
+    d->one_shot = 0;
+    d->skip_until = AV_NOPTS_VALUE;
+    return open_video(d, d->choice.hardware_wrapper ? "v4l2m2m" : NULL, d->choice.allow_software, "", s);
 }
 
 int jv_media_decode(JVMedia *media, const char *hw_backend, int allow_software,

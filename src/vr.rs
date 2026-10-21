@@ -204,12 +204,22 @@ pub fn detect(name: &str, video: Option<&VideoInfo>) -> Layout {
             stereo_from: Evidence::Aspect,
         };
     }
-    Layout {
+    let mut layout = Layout {
         projection,
         stereo,
         projection_from,
         stereo_from,
+    };
+    // A full sphere needs a 2:1 eye. Some VR180 files carry an equirectangular
+    // tag without bounds, which reads as 360 but has square eyes.
+    if layout.projection == Projection::Equirect360
+        && layout.projection_from == Evidence::Metadata
+        && let Some(v) = video
+        && eye_aspect(v.width, v.height, &layout) < 1.5
+    {
+        layout.projection = Projection::Equirect180;
     }
+    layout
 }
 
 #[cfg(test)]
@@ -269,6 +279,29 @@ mod tests {
             projection: projection.map(Into::into),
             horizontal_degrees: degrees,
         }
+    }
+
+    #[test]
+    fn unbounded_equirect_with_square_eyes_is_vr180() {
+        let v = video(Some("equirectangular"), Some(360.0), Some("side by side"));
+        let l = detect("clip.mp4", Some(&v));
+        assert_eq!(
+            (l.projection, l.stereo),
+            (Projection::Equirect180, Stereo::SideBySide)
+        );
+        let tb = VideoInfo {
+            height: 8192,
+            ..video(Some("equirectangular"), Some(360.0), Some("top and bottom"))
+        };
+        assert_eq!(
+            detect("clip.mp4", Some(&tb)).projection,
+            Projection::Equirect360
+        );
+        let mono = video(Some("equirectangular"), Some(360.0), None);
+        assert_eq!(
+            detect("clip.mp4", Some(&mono)).projection,
+            Projection::Equirect360
+        );
     }
 
     #[test]

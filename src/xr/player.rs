@@ -145,6 +145,21 @@ pub struct PlayOptions {
 
 #[cfg(test)]
 mod tests {
+    use super::samples_to_skip;
+
+    #[test]
+    fn a_restart_skips_the_sound_already_sent() {
+        let (rate, ch) = (crate::audio::RATE as f64, crate::audio::CHANNELS as usize);
+        let chunk = 1024 * ch;
+        // After a restart the chunk at 11.26 s comes again, but sound was sent up to 12.2 s.
+        let skip = samples_to_skip(12.2, 11.26, 100 * chunk);
+        assert_eq!(skip % ch, 0);
+        assert!((skip as f64 / ch as f64 / rate - 0.94).abs() < 0.001);
+        // A chunk that ends before that is dropped whole; a later one is kept whole.
+        assert_eq!(samples_to_skip(12.2, 11.26, chunk), chunk);
+        assert_eq!(samples_to_skip(12.2, 12.2, chunk), 0);
+        assert_eq!(samples_to_skip(12.2, 12.5, chunk), 0);
+    }
     use super::*;
 
     /// Runs `AudioSync` at 60 Hz for `seconds` against an audio clock that
@@ -444,6 +459,12 @@ fn spawn_audio(
         .expect("spawn audio thread");
 }
 
+/// Interleaved samples at the start of a chunk (at `pts`) that come before `from`.
+fn samples_to_skip(from: f64, pts: f64, samples: usize) -> usize {
+    let frames = ((from - pts) * crate::audio::RATE as f64).max(0.0) as usize;
+    (frames * crate::audio::CHANNELS as usize).min(samples)
+}
+
 /// A seek: generation, target seconds and how it lands.
 type SeekCommand = (u64, f64, Landing);
 
@@ -461,6 +482,9 @@ struct DecodeThread {
     frames: mpsc::Receiver<Decoded>,
     control: mpsc::Sender<SeekCommand>,
     requested: Arc<AtomicU64>,
+    /// Set while the decoder is reopened: the player lets go of every picture
+    /// (the one on screen stays), as they keep the old hardware session open.
+    release_held: Arc<AtomicBool>,
     /// Which embedded subtitle track to decode (None: none).
     subtitle_track: mpsc::Sender<Option<usize>>,
     /// Which audio track to play (a seek follows).
@@ -481,6 +505,8 @@ fn spawn_decoder(
     let (control, commands) = mpsc::channel::<SeekCommand>();
     let requested = Arc::new(AtomicU64::new(0));
     let pending = requested.clone();
+    let release_held = Arc::new(AtomicBool::new(false));
+    let release_request = release_held.clone();
     std::thread::Builder::new()
         .name("decode".into())
         .spawn(move || {
@@ -503,6 +529,12 @@ fn spawn_decoder(
             // of ending the video.
             let mut last_pts = start;
             let mut restarted_at: Option<f64> = None;
+            // Set once the hardware decoder was opened anew after refusing a
+            // restart; cleared when a picture comes out of it.
+            let mut reopened = false;
+            // Where the sound already sent ends: a restart decodes it again
+            // from the keyframe, and the repeat would play behind the picture.
+            let mut audio_sent_to = f64::NEG_INFINITY;
             'decode: loop {
                 // Before seeks: the seek that follows a switch restarts the new track.
                 while let Ok(track) = audio_changes.try_recv() {
@@ -515,6 +547,7 @@ fn spawn_decoder(
                         eprintln!("Seek to {t:.1}s failed: {e:#}");
                     }
                     (generation, start) = (g, t);
+                    audio_sent_to = f64::NEG_INFINITY;
                     landing = match how {
                         Landing::Keyframe { from } => Some((t, from)),
                         Landing::Exact => {
@@ -532,6 +565,7 @@ fn spawn_decoder(
                 if stop.load(Ordering::Relaxed) {
                     return;
                 }
+                let failed = |e: anyhow::Error| Decoded::Failed(generation, format!("{e:#}"));
                 let message = match decoder.next_frame() {
                     Ok(Some(frame)) => Decoded::Frame(generation, frame),
                     Ok(None) => Decoded::End(generation),
@@ -540,16 +574,40 @@ fn spawn_decoder(
                             && restarted_at.is_none_or(|t| last_pts > t + 10.0) =>
                     {
                         eprintln!("{e:#}; restarting it at {last_pts:.1}s");
+                        release_request.store(true, Ordering::Relaxed);
                         restarted_at = Some(last_pts);
-                        match decoder.seek(last_pts) {
+                        let seeked = decoder.seek(last_pts);
+                        release_request.store(false, Ordering::Relaxed);
+                        match seeked {
                             Ok(()) => {
                                 landing = Some((last_pts, None));
                                 continue 'decode;
                             }
-                            Err(e) => Decoded::Failed(generation, format!("{e:#}")),
+                            Err(e) => failed(e),
                         }
                     }
-                    Err(e) => Decoded::Failed(generation, format!("{e:#}")),
+                    Err(e)
+                        if decoder.hardware()
+                            && !reopened
+                            && e.downcast_ref::<crate::media::DecoderStalled>().is_none() =>
+                    {
+                        // Pick up where the seek was aimed, if no picture has
+                        // arrived since, else where playback was.
+                        let resume = landing.map_or(last_pts, |(target, _)| target);
+                        eprintln!("{e:#}; opening the decoder again at {resume:.1}s");
+                        reopened = true;
+                        release_request.store(true, Ordering::Relaxed);
+                        let reopened_at = decoder.reset().and_then(|()| decoder.seek(resume));
+                        release_request.store(false, Ordering::Relaxed);
+                        match reopened_at {
+                            Ok(()) => {
+                                landing.get_or_insert((resume, None));
+                                continue 'decode;
+                            }
+                            Err(e) => failed(e),
+                        }
+                    }
+                    Err(e) => failed(e),
                 };
                 // Seeking lands on a keyframe before the target. Show from
                 // there at once rather than decoding (and dropping) up to the
@@ -573,15 +631,19 @@ fn spawn_decoder(
                 }
                 if let Some(audio) = &audio {
                     while let Some((samples, pts)) = decoder.take_audio(crate::audio::CHANNELS) {
-                        let pts = pts.unwrap_or(start);
-                        // After a seek, skip sound from before the target.
-                        let skip = (((start - pts) * crate::audio::RATE as f64).max(0.0) as usize
-                            * crate::audio::CHANNELS as usize)
-                            .min(samples.len());
+                        let pts = pts.unwrap_or(if audio_sent_to.is_finite() {
+                            audio_sent_to
+                        } else {
+                            start
+                        });
+                        // Skip sound from before the target, and what was sent already.
+                        let skip = samples_to_skip(start.max(audio_sent_to), pts, samples.len());
                         if skip < samples.len() {
+                            let frames = (samples.len() - skip) / crate::audio::CHANNELS as usize;
                             let pts = pts
                                 + (skip / crate::audio::CHANNELS as usize) as f64
                                     / crate::audio::RATE as f64;
+                            audio_sent_to = pts + frames as f64 / crate::audio::RATE as f64;
                             let _ = audio.send(AudioChunk {
                                 generation,
                                 pts,
@@ -600,6 +662,7 @@ fn spawn_decoder(
                     && let Some(t) = frame.pts()
                 {
                     last_pts = t;
+                    reopened = false;
                 }
                 let finished = !matches!(message, Decoded::Frame(..));
                 let mut message = Some(message);
@@ -635,6 +698,7 @@ fn spawn_decoder(
         frames,
         control,
         requested,
+        release_held,
         subtitle_track,
         audio_track,
     }
@@ -702,6 +766,8 @@ pub struct Playback {
     stop: Arc<AtomicBool>,
     generation: u64,
     current: Option<Frame>,
+    /// A picture has been shown (it stays on screen after `current` is released).
+    shown: bool,
     next: Option<Frame>,
     ended: bool,
     pub error: Option<String>,
@@ -881,6 +947,7 @@ impl Playback {
             stop,
             generation: 0,
             current: None,
+            shown: false,
             next: None,
             ended: false,
             error: None,
@@ -1162,8 +1229,14 @@ impl Playback {
         }
     }
 
+    /// The picture `advance` last made current, until the next seek drops it.
     pub fn current(&self) -> Option<&Frame> {
         self.current.as_ref()
+    }
+
+    /// Whether a picture is on screen.
+    pub fn shown(&self) -> bool {
+        self.shown
     }
 
     /// Waiting for the first picture after opening or seeking.
@@ -1239,6 +1312,8 @@ impl Playback {
         };
         let _ = self.decode.control.send((self.generation, target, landing));
         self.next = None;
+        // Drop the held frame: it keeps a hardware session open across the restart.
+        self.current = None;
         self.ended = false;
         self.error = None;
         self.clock_start = None;
@@ -1250,6 +1325,13 @@ impl Playback {
     /// Moves to the newest decoded frame due at `now`; true if it changed.
     pub fn advance(&mut self, now: i64) -> bool {
         if self.paused() && self.clock_start.is_some() {
+            return false;
+        }
+        if self.decode.release_held.load(Ordering::Relaxed) {
+            // The picture stays on screen (see `shown`).
+            self.current = None;
+            self.next = None;
+            while self.decode.frames.try_recv().is_ok() {}
             return false;
         }
         self.sync_to_audio(now);
@@ -1291,6 +1373,7 @@ impl Playback {
             }
             self.last_pts = pts;
             self.current = self.next.take();
+            self.shown = true;
             changed = true;
             if self.paused() {
                 break; // paused after a seek: show just the target frame
