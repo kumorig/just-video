@@ -482,6 +482,9 @@ struct DecodeThread {
     frames: mpsc::Receiver<Decoded>,
     control: mpsc::Sender<SeekCommand>,
     requested: Arc<AtomicU64>,
+    /// Set while the decoder is reopened: the player lets go of every picture
+    /// (the one on screen stays), as they keep the old hardware session open.
+    release_held: Arc<AtomicBool>,
     /// Which embedded subtitle track to decode (None: none).
     subtitle_track: mpsc::Sender<Option<usize>>,
     /// Which audio track to play (a seek follows).
@@ -502,6 +505,8 @@ fn spawn_decoder(
     let (control, commands) = mpsc::channel::<SeekCommand>();
     let requested = Arc::new(AtomicU64::new(0));
     let pending = requested.clone();
+    let release_held = Arc::new(AtomicBool::new(false));
+    let release_request = release_held.clone();
     std::thread::Builder::new()
         .name("decode".into())
         .spawn(move || {
@@ -569,8 +574,11 @@ fn spawn_decoder(
                             && restarted_at.is_none_or(|t| last_pts > t + 10.0) =>
                     {
                         eprintln!("{e:#}; restarting it at {last_pts:.1}s");
+                        release_request.store(true, Ordering::Relaxed);
                         restarted_at = Some(last_pts);
-                        match decoder.seek(last_pts) {
+                        let seeked = decoder.seek(last_pts);
+                        release_request.store(false, Ordering::Relaxed);
+                        match seeked {
                             Ok(()) => {
                                 landing = Some((last_pts, None));
                                 continue 'decode;
@@ -588,7 +596,10 @@ fn spawn_decoder(
                         let resume = landing.map_or(last_pts, |(target, _)| target);
                         eprintln!("{e:#}; opening the decoder again at {resume:.1}s");
                         reopened = true;
-                        match decoder.reset().and_then(|()| decoder.seek(resume)) {
+                        release_request.store(true, Ordering::Relaxed);
+                        let reopened_at = decoder.reset().and_then(|()| decoder.seek(resume));
+                        release_request.store(false, Ordering::Relaxed);
+                        match reopened_at {
                             Ok(()) => {
                                 landing.get_or_insert((resume, None));
                                 continue 'decode;
@@ -687,6 +698,7 @@ fn spawn_decoder(
         frames,
         control,
         requested,
+        release_held,
         subtitle_track,
         audio_track,
     }
@@ -754,6 +766,8 @@ pub struct Playback {
     stop: Arc<AtomicBool>,
     generation: u64,
     current: Option<Frame>,
+    /// A picture has been shown (it stays on screen after `current` is released).
+    shown: bool,
     next: Option<Frame>,
     ended: bool,
     pub error: Option<String>,
@@ -933,6 +947,7 @@ impl Playback {
             stop,
             generation: 0,
             current: None,
+            shown: false,
             next: None,
             ended: false,
             error: None,
@@ -1214,8 +1229,14 @@ impl Playback {
         }
     }
 
+    /// The picture `advance` last made current, until the next seek drops it.
     pub fn current(&self) -> Option<&Frame> {
         self.current.as_ref()
+    }
+
+    /// Whether a picture is on screen.
+    pub fn shown(&self) -> bool {
+        self.shown
     }
 
     /// Waiting for the first picture after opening or seeking.
@@ -1291,6 +1312,8 @@ impl Playback {
         };
         let _ = self.decode.control.send((self.generation, target, landing));
         self.next = None;
+        // Drop the held frame: it keeps a hardware session open across the restart.
+        self.current = None;
         self.ended = false;
         self.error = None;
         self.clock_start = None;
@@ -1302,6 +1325,13 @@ impl Playback {
     /// Moves to the newest decoded frame due at `now`; true if it changed.
     pub fn advance(&mut self, now: i64) -> bool {
         if self.paused() && self.clock_start.is_some() {
+            return false;
+        }
+        if self.decode.release_held.load(Ordering::Relaxed) {
+            // The picture stays on screen (see `shown`).
+            self.current = None;
+            self.next = None;
+            while self.decode.frames.try_recv().is_ok() {}
             return false;
         }
         self.sync_to_audio(now);
@@ -1343,6 +1373,7 @@ impl Playback {
             }
             self.last_pts = pts;
             self.current = self.next.take();
+            self.shown = true;
             changed = true;
             if self.paused() {
                 break; // paused after a seek: show just the target frame

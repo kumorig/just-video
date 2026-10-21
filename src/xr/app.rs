@@ -491,7 +491,9 @@ fn save_resume(
 ) -> Option<ResumeSaved> {
     let key = key.cloned()?;
     // Nothing shown yet: the position is still the saved one, not a new place.
-    playback.current()?;
+    if !playback.shown() {
+        return None;
+    }
     let (position, duration) = (playback.position(), playback.duration);
     let _ = std::thread::Builder::new()
         .name("save resume".into())
@@ -2280,7 +2282,7 @@ pub fn run(
                     mark += Duration::from_secs_f64(renderer.copy_ms / 1e3);
                     playback.stats.uploaded_frames += 1;
                 }
-                let show = playback.current().is_some();
+                let show = playback.shown();
                 if show {
                     playback.stats.displayed_frames += 1;
                 }
@@ -2557,7 +2559,7 @@ pub fn run(
     if let Mode::Playing(playback) = mode {
         // Written here, not in the background: the app is about to exit.
         if let Some(key) = &playing_key
-            && playback.current().is_some()
+            && playback.shown()
             && let Err(e) = crate::config::save_stop(key, playback.position(), playback.duration)
         {
             eprintln!("Can't save where the video was left: {e:#}");

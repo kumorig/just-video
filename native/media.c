@@ -495,6 +495,12 @@ void jv_decoder_close(JVDecoder *d) {
 // at 1080p. The decoder hands packets back as it parses them, so 6 keep it fed.
 #define OUTPUT_BUFFERS 6
 
+// Pictures of the hardware decoder still held by the application. Each one
+// keeps the V4L2 session it came from open (FFmpeg frees the device only with
+// the last buffer), so a decoder reopened while one is held runs beside its
+// own predecessor and the driver refuses the second session.
+static int live_frames;
+
 // Buffer counts for the V4L2 decoder. FFmpeg's default of 20 capture buffers
 // fails to allocate at 8K.
 static void set_v4l2_buffers(AVDictionary **options, const AVCodecParameters *par) {
@@ -511,6 +517,16 @@ static int open_video(JVDecoder *d, const char *hw_backend, int allow_software,
     JVMedia *media = d->media;
     AVDictionary *open_options = NULL;
     int ret = AVERROR(ENOMEM);
+    if (d->choice.hardware_wrapper) {
+        // Wait for the application to let go of earlier pictures (see live_frames).
+        int64_t began = av_gettime_relative();
+        int held;
+        while ((held = __atomic_load_n(&live_frames, __ATOMIC_SEQ_CST)) > 0 &&
+               av_gettime_relative() - began < 2000000)
+            av_usleep(5000);
+        if (held > 0)
+            av_log(NULL, AV_LOG_WARNING, "Pictures of the old hardware session are still held\n");
+    }
     avcodec_free_context(&d->ctx);
     av_buffer_unref(&d->device);
     d->choice = (FormatChoice){ AV_PIX_FMT_NONE, allow_software, 0 };
@@ -601,6 +617,7 @@ reopen:
         // Device missing, busy or its firmware recovering: never fail playback
         // over it when the CPU can decode instead.
         set_error(s->note, sizeof(s->note), "Hardware decoder failed to open", ret);
+        av_log(NULL, AV_LOG_ERROR, "Hardware decoder refused after retries; decoding on the CPU\n");
         d->choice.hardware_wrapper = 0;
         s->hw_backend[0] = '\0';
         av_dict_free(&open_options);
@@ -661,6 +678,10 @@ static int describe_frame(JVDecoder *d, AVFrame *frame, JVFrame *out) {
     default: return AVERROR_PATCHWELCOME;
     }
     out->handle = frame;
+    if (d->choice.hardware_wrapper) {
+        frame->opaque = (void *)1;
+        __atomic_add_fetch(&live_frames, 1, __ATOMIC_SEQ_CST);
+    }
     out->width = frame->width;
     out->height = frame->height;
     out->plane_count = out->layout == JV_LAYOUT_PLANAR ? 3 : 2;
@@ -875,6 +896,7 @@ int jv_decoder_next(JVDecoder *d, JVFrame *out) {
 
 void jv_frame_release(void *handle) {
     AVFrame *frame = handle;
+    if (frame->opaque) __atomic_sub_fetch(&live_frames, 1, __ATOMIC_SEQ_CST);
     av_frame_free(&frame);
 }
 

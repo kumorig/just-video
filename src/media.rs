@@ -815,6 +815,11 @@ impl VideoDecoder {
     }
 
     pub fn seek(&mut self, seconds: f64) -> anyhow::Result<()> {
+        // The driver counts a restarting session on top of the one it still
+        // holds, which a big stream's share can't pay for twice.
+        if self.hardware && self.video_load().is_some_and(session_needs_closing) {
+            self.reset()?;
+        }
         match unsafe { jv_decoder_seek(self.raw, seconds.max(0.0)) } {
             0 => Ok(()),
             code => bail!("Seek failed (FFmpeg error {code})"),
@@ -830,6 +835,12 @@ impl VideoDecoder {
             HARDWARE_DECODERS.fetch_sub(1, SeqCst);
         }
         self.hardware = hardware;
+    }
+
+    /// Macroblocks per second the driver would count for this video.
+    fn video_load(&self) -> Option<u64> {
+        let v = self.media.info().video.as_ref()?;
+        Some(macroblock_rate(v.width, v.height, v.fps))
     }
 
     /// Whether this decoder runs on the hardware (V4L2) decoder.
@@ -867,6 +878,24 @@ impl Drop for VideoDecoder {
             OPEN_DECODERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
+}
+
+/// Macroblocks per second the `iris` driver counts for a decoder session:
+/// 16x16 blocks per frame times the frame rate, at least 30.
+fn macroblock_rate(width: u32, height: u32, fps: f64) -> u64 {
+    let blocks = u64::from(width.div_ceil(16)) * u64::from(height.div_ceil(16));
+    blocks * fps.max(30.0).round() as u64
+}
+
+/// The driver's limit on the sum over all sessions.
+const IRIS_MACROBLOCKS_PER_SECOND: u64 = 7_833_600;
+
+/// Whether a video's hardware session should be closed and opened anew on a
+/// seek, rather than flushed: a flushed session counts twice, and Steam's
+/// web helper holds a third, so anything over a third of the limit is refused
+/// ("current session not supported") about half the time (8K at 60 fps).
+fn session_needs_closing(macroblocks_per_second: u64) -> bool {
+    macroblocks_per_second * 3 > IRIS_MACROBLOCKS_PER_SECOND
 }
 
 /// Video decoders not yet closed (something is playing or about to).
@@ -1559,5 +1588,17 @@ mod thumb_tests {
             assert_eq!((t.width, t.height), (w, h));
             assert_eq!(t.rgba.len(), (w * h * 4) as usize);
         }
+    }
+
+    #[test]
+    fn only_big_streams_get_a_new_session_on_seek() {
+        // 8192x4096 at 59.94 fps: 131072 blocks, 7.86M per second.
+        assert_eq!(macroblock_rate(8192, 4096, 59.94), 131072 * 60);
+        assert!(session_needs_closing(macroblock_rate(8192, 4096, 59.94)));
+        assert!(session_needs_closing(macroblock_rate(6144, 3072, 60.0)));
+        // Rates under 30 fps count as 30.
+        assert_eq!(macroblock_rate(1920, 1080, 24.0), 8160 * 30);
+        assert!(!session_needs_closing(macroblock_rate(3840, 2160, 60.0)));
+        assert!(!session_needs_closing(macroblock_rate(1920, 1080, 24.0)));
     }
 }
