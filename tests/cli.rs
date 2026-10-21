@@ -192,3 +192,52 @@ fn decoder_yields_frames_with_planes_and_pts() {
         assert!(decoder.next_frame().unwrap().is_some());
     }
 }
+
+/// After the hardware decoder refuses to restart (seen on the Steam Frame with
+/// 8K 60 fps video after a seek), the player opens the decoder again and
+/// seeks. The CPU decoder takes the same path, so a short generated clip with
+/// keyframes 4 s apart (needs the ffmpeg command) stands in for it.
+#[cfg(feature = "decode")]
+#[test]
+fn decoder_reset_then_seek_resumes_at_the_target() {
+    use just_video::media::Media;
+    let dir = std::env::temp_dir().join(format!("just-video-reset-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let clip = dir.join("clip.mp4");
+    let made = Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+        .arg("testsrc=size=160x96:rate=30:duration=12")
+        .args(["-c:v", "libx264", "-g", "120", "-keyint_min", "120"])
+        .args(["-sc_threshold", "0", "-pix_fmt", "yuv420p"])
+        .arg(&clip)
+        .status();
+    if !made.is_ok_and(|s| s.success()) {
+        eprintln!("skipping: needs the ffmpeg command with libx264");
+        return;
+    }
+    let media = Media::open("clip.mp4", std::fs::File::open(&clip).unwrap()).unwrap();
+    let mut decoder = media.into_decoder(None, true, "").unwrap();
+    for _ in 0..10 {
+        decoder.next_frame().unwrap().unwrap();
+    }
+    decoder.reset().unwrap();
+    assert!(!decoder.hardware());
+    // Keyframes are at 0, 4 and 8 s: a jump to 6 s lands on the one at 4 s.
+    decoder.seek(6.0).unwrap();
+    let first = decoder.next_frame().unwrap().unwrap().pts().unwrap();
+    assert!((first - 4.0).abs() < 0.05, "first picture at {first}");
+    let mut last = first;
+    let mut count = 1;
+    while let Some(frame) = decoder.next_frame().unwrap() {
+        let pts = frame.pts().unwrap();
+        assert!(pts > last, "pts {pts} after {last}");
+        last = pts;
+        count += 1;
+    }
+    assert_eq!(count, 240, "4 s to the end at 30 fps");
+    // Resetting at the end and seeking back works too.
+    decoder.reset().unwrap();
+    decoder.seek(0.0).unwrap();
+    assert!(decoder.next_frame().unwrap().is_some());
+    std::fs::remove_dir_all(&dir).ok();
+}

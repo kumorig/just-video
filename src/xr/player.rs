@@ -145,6 +145,21 @@ pub struct PlayOptions {
 
 #[cfg(test)]
 mod tests {
+    use super::samples_to_skip;
+
+    #[test]
+    fn a_restart_skips_the_sound_already_sent() {
+        let (rate, ch) = (crate::audio::RATE as f64, crate::audio::CHANNELS as usize);
+        let chunk = 1024 * ch;
+        // After a restart the chunk at 11.26 s comes again, but sound was sent up to 12.2 s.
+        let skip = samples_to_skip(12.2, 11.26, 100 * chunk);
+        assert_eq!(skip % ch, 0);
+        assert!((skip as f64 / ch as f64 / rate - 0.94).abs() < 0.001);
+        // A chunk that ends before that is dropped whole; a later one is kept whole.
+        assert_eq!(samples_to_skip(12.2, 11.26, chunk), chunk);
+        assert_eq!(samples_to_skip(12.2, 12.2, chunk), 0);
+        assert_eq!(samples_to_skip(12.2, 12.5, chunk), 0);
+    }
     use super::*;
 
     /// Runs `AudioSync` at 60 Hz for `seconds` against an audio clock that
@@ -444,6 +459,12 @@ fn spawn_audio(
         .expect("spawn audio thread");
 }
 
+/// Interleaved samples at the start of a chunk (at `pts`) that come before `from`.
+fn samples_to_skip(from: f64, pts: f64, samples: usize) -> usize {
+    let frames = ((from - pts) * crate::audio::RATE as f64).max(0.0) as usize;
+    (frames * crate::audio::CHANNELS as usize).min(samples)
+}
+
 /// A seek: generation, target seconds and how it lands.
 type SeekCommand = (u64, f64, Landing);
 
@@ -503,6 +524,12 @@ fn spawn_decoder(
             // of ending the video.
             let mut last_pts = start;
             let mut restarted_at: Option<f64> = None;
+            // Set once the hardware decoder was opened anew after refusing a
+            // restart; cleared when a picture comes out of it.
+            let mut reopened = false;
+            // Where the sound already sent ends: a restart decodes it again
+            // from the keyframe, and the repeat would play behind the picture.
+            let mut audio_sent_to = f64::NEG_INFINITY;
             'decode: loop {
                 // Before seeks: the seek that follows a switch restarts the new track.
                 while let Ok(track) = audio_changes.try_recv() {
@@ -515,6 +542,7 @@ fn spawn_decoder(
                         eprintln!("Seek to {t:.1}s failed: {e:#}");
                     }
                     (generation, start) = (g, t);
+                    audio_sent_to = f64::NEG_INFINITY;
                     landing = match how {
                         Landing::Keyframe { from } => Some((t, from)),
                         Landing::Exact => {
@@ -532,6 +560,7 @@ fn spawn_decoder(
                 if stop.load(Ordering::Relaxed) {
                     return;
                 }
+                let failed = |e: anyhow::Error| Decoded::Failed(generation, format!("{e:#}"));
                 let message = match decoder.next_frame() {
                     Ok(Some(frame)) => Decoded::Frame(generation, frame),
                     Ok(None) => Decoded::End(generation),
@@ -546,10 +575,28 @@ fn spawn_decoder(
                                 landing = Some((last_pts, None));
                                 continue 'decode;
                             }
-                            Err(e) => Decoded::Failed(generation, format!("{e:#}")),
+                            Err(e) => failed(e),
                         }
                     }
-                    Err(e) => Decoded::Failed(generation, format!("{e:#}")),
+                    Err(e)
+                        if decoder.hardware()
+                            && !reopened
+                            && e.downcast_ref::<crate::media::DecoderStalled>().is_none() =>
+                    {
+                        // Pick up where the seek was aimed, if no picture has
+                        // arrived since, else where playback was.
+                        let resume = landing.map_or(last_pts, |(target, _)| target);
+                        eprintln!("{e:#}; opening the decoder again at {resume:.1}s");
+                        reopened = true;
+                        match decoder.reset().and_then(|()| decoder.seek(resume)) {
+                            Ok(()) => {
+                                landing.get_or_insert((resume, None));
+                                continue 'decode;
+                            }
+                            Err(e) => failed(e),
+                        }
+                    }
+                    Err(e) => failed(e),
                 };
                 // Seeking lands on a keyframe before the target. Show from
                 // there at once rather than decoding (and dropping) up to the
@@ -573,15 +620,19 @@ fn spawn_decoder(
                 }
                 if let Some(audio) = &audio {
                     while let Some((samples, pts)) = decoder.take_audio(crate::audio::CHANNELS) {
-                        let pts = pts.unwrap_or(start);
-                        // After a seek, skip sound from before the target.
-                        let skip = (((start - pts) * crate::audio::RATE as f64).max(0.0) as usize
-                            * crate::audio::CHANNELS as usize)
-                            .min(samples.len());
+                        let pts = pts.unwrap_or(if audio_sent_to.is_finite() {
+                            audio_sent_to
+                        } else {
+                            start
+                        });
+                        // Skip sound from before the target, and what was sent already.
+                        let skip = samples_to_skip(start.max(audio_sent_to), pts, samples.len());
                         if skip < samples.len() {
+                            let frames = (samples.len() - skip) / crate::audio::CHANNELS as usize;
                             let pts = pts
                                 + (skip / crate::audio::CHANNELS as usize) as f64
                                     / crate::audio::RATE as f64;
+                            audio_sent_to = pts + frames as f64 / crate::audio::RATE as f64;
                             let _ = audio.send(AudioChunk {
                                 generation,
                                 pts,
@@ -600,6 +651,7 @@ fn spawn_decoder(
                     && let Some(t) = frame.pts()
                 {
                     last_pts = t;
+                    reopened = false;
                 }
                 let finished = !matches!(message, Decoded::Frame(..));
                 let mut message = Some(message);

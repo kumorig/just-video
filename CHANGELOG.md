@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.0 (2026-10-20)
+
+- Equirectangular files with square eyes and no bounds are treated as VR180, not squished 360.
+- Install: wait for a newly added Steam entry before installing its library art.
+- Seeking no longer ends playback when the hardware decoder refuses to restart: it is opened again, without replaying sound.
+
 ## 0.1.0 (2026-10-18)
 
 - Thumbnails are on by default; the Settings row is gone (the button in a folder's header stays).

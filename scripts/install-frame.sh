@@ -35,11 +35,20 @@ dir=$(dirname "$0")
 exec "$dir/just-video" "$@" 2>>"$dir/just-video.log"
 SH
 chmod +x "$launcher" "$dir/just-video"
-if grep -rqs --text "Applications/JustVideo/Just Video" ~/.local/share/Steam/userdata/*/config/shortcuts.vdf; then
+has_entry() {
+    grep -rqs --text "Applications/JustVideo/Just Video" ~/.local/share/Steam/userdata/*/config/shortcuts.vdf
+}
+if has_entry; then
     echo "Updated Just Video (already in the Steam library)."
 else
     steamos-add-to-steam "$launcher"
     echo "Added Just Video to the Steam library (Non-Steam)."
+    # Steam writes the new entry (and its app id) a moment later. The art is
+    # keyed by that id, so wait for it or the art step below finds nothing.
+    for _ in $(seq 30); do
+        has_entry && break
+        sleep 1
+    done
 fi
 
 # Mark the entry as a VR app (OpenVR = 1). Prints the value it found.
